@@ -1,28 +1,36 @@
+---
 type: action
 definition:
+  name: list_incidents
+  namespace: tools.crowdstrike
   title: List incidents
   description: Query for Crowdstrike incidents via the Falcon SIEM API.
   display_group: CrowdStrike
   doc_url: https://falconpy.io/Service-Collections/Incidents.html
-  namespace: tools.crowdstrike
-  name: list_incidents
+  author: null
+  deprecated: null
+  secrets: null
   expects:
-    start_time:
-      type: datetime
-      description: Start time for the query (inclusive).
-    end_time:
-      type: datetime
-      description: End time for the query (exclusive).
-    query:
-      type: str | None
-      description: >
-        Falcon Query Language (FQL) filter to apply to cases.
-        If specified, overrides `start_time` and `end_time`.
-      default: null
     limit:
       type: int
       description: Maximum number of incidents to return.
       default: 100
+    query:
+      type: str| None
+      description: >
+        Falcon Query Language (FQL) filter to apply to cases. If specified,
+        overrides `start_time` and `end_time`.
+      default: null
+    start_time:
+      type: str
+      description: Start time for the query (inclusive). ISO 8601 format (e.g.,
+        '2024-01-01T00:00:00Z').
+      default: null
+    end_time:
+      type: str
+      description: End time for the query (exclusive). ISO 8601 format (e.g.,
+        '2024-01-31T23:59:59Z').
+      default: null
     member_cid:
       type: str | None
       description: Crowdstrike member CID.
@@ -35,26 +43,41 @@ definition:
           query: ${{ inputs.query }}
           start_time: ${{ inputs.start_time }}
           end_time: ${{ inputs.end_time }}
-        script: |
+        script: >
+          from datetime import datetime
+
           def main(query, start_time, end_time):
               if query:
                   return query
-              else:
-                  return f"created_date:>='{start_time.isoformat()}' + created_date:<'{end_time.isoformat()}'"
+
+              # Handle None values
+              if not start_time or not end_time:
+                  raise ValueError("start_time and end_time are required when query is not provided")
+
+              # Strip any extra quotes that might be present
+              start_time = start_time.strip('"').strip("'")
+              end_time = end_time.strip('"').strip("'")
+
+              # Convert string inputs to datetime objects
+              start_dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+              end_dt = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
+
+              return f"created_date:>='{start_dt.isoformat()}' + created_date:<'{end_dt.isoformat()}'"
     - ref: query_incidents
       action: tools.falconpy.call_command
       args:
-        operation_id: QueryIncidents
         member_cid: ${{ inputs.member_cid }}
+        operation_id: QueryIncidents
         params:
-          filter: ${{ steps.build_filter.result }}
           limit: ${{ inputs.limit }}
+          filter: ${{ steps.build_filter.result }}
     - ref: get_incidents
       action: tools.falconpy.call_command
       args:
-        operation_id: GetIncidents
         member_cid: ${{ inputs.member_cid }}
+        operation_id: GetIncidents
         params:
           body:
             ids: ${{ steps.query_incidents.result.body.resources }}
   returns: ${{ steps.get_incidents.result.data }}
+

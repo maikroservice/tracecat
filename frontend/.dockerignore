@@ -3,6 +3,9 @@
 build
 node_modules
 tests
+package-lock.json
+pnpm-lock.yaml
+
 # Ignore Dockerfiles
 Dockerfile.prod
 Dockerfile

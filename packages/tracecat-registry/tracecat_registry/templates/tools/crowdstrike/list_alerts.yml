@@ -8,11 +8,13 @@ definition:
   name: list_alerts
   expects:
     start_time:
-      type: datetime
-      description: Start time for the query (inclusive).
-    end_time:
-      type: datetime
-      description: End time for the query (exclusive).
+      type: str | None
+      description: Start time for the query (inclusive). ISO 8601 format (e.g., '2024-01-01T00:00:00Z')   
+      default: null
+      end_time:
+      type: str | None
+      description: End time for the query (exclusive). ISO 8601 form at (e.g., '2024-01-01T00:00:00Z') - defaults to now.
+      default: null
     query:
       type: str | None
       description: >
@@ -36,11 +38,22 @@ definition:
           start_time: ${{ inputs.start_time }}
           end_time: ${{ inputs.end_time }}
         script: |
+          from datetime import datetime
+
           def main(query, start_time, end_time):
               if query:
                   return query
-              else:
-                  return f"created_timestamp:>='{start_time.isoformat()}' + created_timestamp:<'{end_time.isoformat()}'"
+
+              if not end_time:
+                  end_time = datetime.now(timezone.utc).isoformat()
+
+              start_time_strip = start_time.strip('"').strip("'")
+              end_time_strip = end_time.strip('"').strip("'")
+
+              start_dt = datetime.fromisoformat(start_time_strip.replace('Z', '+00:00'))
+              end_dt = datetime.fromisoformat(end_time_strip.replace('Z', '+00:00'))
+              
+              return f"created_timestamp:>='{start_dt.isoformat()}' + created_timestamp:<'{end_dt.isoformat()}'"
     - ref: query_alerts
       action: tools.falconpy.call_command
       args:

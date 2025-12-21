@@ -49,12 +49,12 @@ definition:
               if query:
                   return query
 
-              if not start_time or not end_time:
-                  raise ValueError("start_time and end_time are required when query is not provided")
-              
               if not end_time:
                   end_time = datetime.now(timezone.utc).isoformat()
 
+              if not start_time:
+                  raise ValueError("start_time is required when query is not provided")
+              
               # Strip any extra quotes that might be present from the nextjs inputs
               start_time_strip = start_time.strip('"').strip("'")
               end_time_strip = end_time.strip('"').strip("'")

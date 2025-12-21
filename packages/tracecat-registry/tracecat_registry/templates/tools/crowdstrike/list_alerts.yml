@@ -47,6 +47,9 @@ definition:
               if not end_time:
                   end_time = datetime.now(timezone.utc).isoformat()
 
+              if not start_time:
+                  raise ValueError("start_time is required when query is not provided")
+              
               start_time_strip = start_time.strip('"').strip("'")
               end_time_strip = end_time.strip('"').strip("'")
 

@@ -1,11 +1,14 @@
 """Generic interface to FalconPy Uber class."""
 
+import logging
 from typing import Annotated, Any
 
 from falconpy import APIHarnessV2
 from pydantic import Field
 
 from tracecat_registry import RegistrySecret, registry, secrets
+
+logging.basicConfig(level=logging.DEBUG)
 
 crowdstrike_secret = RegistrySecret(
     name="crowdstrike",
@@ -53,9 +56,7 @@ async def call_command(
     }
 
     kwargs = {
-    "client_id": secrets.get("CROWDSTRIKE_CLIENT_ID"),
-    "client_secret": secrets.get("CROWDSTRIKE_CLIENT_SECRET"),
-    "member_cid": member_cid,
+    "debug"=True,
     }
 
     if base_url := secrets.get("CROWDSTRIKE_CLIENT_BASE_URL"):

@@ -56,7 +56,7 @@ async def call_command(
     }
 
     kwargs = {
-    "debug"=True,
+    "debug": True,
     }
 
     if base_url := secrets.get("CROWDSTRIKE_CLIENT_BASE_URL"):

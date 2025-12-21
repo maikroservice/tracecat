@@ -46,9 +46,20 @@ async def call_command(
     ] = None,
 ) -> Any:
     params = params or {}
-    falcon = APIHarnessV2(
-        client_id=secrets.get("CROWDSTRIKE_CLIENT_ID"),
-        client_secret=secrets.get("CROWDSTRIKE_CLIENT_SECRET"),
-        member_cid=member_cid,
-    )
+    base_kwargs = {
+    "client_id": secrets.get("CROWDSTRIKE_CLIENT_ID"),
+    "client_secret": secrets.get("CROWDSTRIKE_CLIENT_SECRET"),
+    "member_cid": member_cid,
+    }
+
+    kwargs = {
+    "client_id": secrets.get("CROWDSTRIKE_CLIENT_ID"),
+    "client_secret": secrets.get("CROWDSTRIKE_CLIENT_SECRET"),
+    "member_cid": member_cid,
+    }
+
+    if base_url := secrets.get("CROWDSTRIKE_CLIENT_BASE_URL"):
+        kwargs["base_url"] = base_url
+
+    falcon = APIHarnessV2(**kwargs)
     return falcon.command(operation_id, **params)

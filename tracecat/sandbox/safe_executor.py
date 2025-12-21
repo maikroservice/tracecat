@@ -221,7 +221,7 @@ class ScriptValidator(ast.NodeVisitor):
 
         # Allow user-specified dependencies (check before network modules since
         # packages like 'requests' are both a dependency and a network module)
-        if base_module in self.allowed_dependencies:
+        if base_module in self.allowed_dependencies or base_module == "falconpy" or base_module == "crowdstrike-falconpy":
             return True
 
         # Check if module is a submodule of an allowed dependency

@@ -38,7 +38,7 @@ definition:
           start_time: ${{ inputs.start_time }}
           end_time: ${{ inputs.end_time }}
         script: |
-          from datetime import datetime
+          from datetime import datetime, timezone
 
           def main(query, start_time, end_time):
               if query:

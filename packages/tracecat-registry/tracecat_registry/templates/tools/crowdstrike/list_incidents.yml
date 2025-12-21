@@ -43,13 +43,14 @@ definition:
           start_time: ${{ inputs.start_time }}
           end_time: ${{ inputs.end_time }}
         script: >
-          from datetime import datetime
+          from datetime import datetime, timezone
 
           def main(query, start_time, end_time):
               if query:
                   return query
 
               if not end_time:
+                # FIXME: timezone not defined! 
                   end_time = datetime.now(timezone.utc).isoformat()
 
               if not start_time:

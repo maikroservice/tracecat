@@ -39,14 +39,63 @@ const SEARCH_KEYS = [
   "action",
   "default_title",
   "display_group",
-] as (keyof RegistryActionReadMinimal)[]
+] as const satisfies readonly (keyof RegistryActionReadMinimal)[]
+
+// Map key names to their index in SEARCH_KEYS for resilient result access
+const SEARCH_KEY_INDEX: Record<(typeof SEARCH_KEYS)[number], number> =
+  SEARCH_KEYS.reduce(
+    (acc, key, index) => {
+      acc[key] = index
+      return acc
+    },
+    {} as Record<(typeof SEARCH_KEYS)[number], number>
+  )
 
 function filterActions(actions: RegistryActionReadMinimal[], search: string) {
   const results = fuzzysort.go<RegistryActionReadMinimal>(search, actions, {
     all: true,
-    keys: SEARCH_KEYS,
+    keys: SEARCH_KEYS as unknown as (keyof RegistryActionReadMinimal)[],
   })
   return results
+}
+
+/**
+ * Safely renders highlighted text using fuzzysort indexes.
+ * Avoids dangerouslySetInnerHTML to prevent XSS vulnerabilities.
+ * Uses code-unit based slicing to correctly handle emoji/combining characters.
+ */
+function HighlightedText({
+  result,
+  text,
+}: {
+  result: Fuzzysort.Result | null
+  text: string
+}) {
+  if (!result || !result.indexes || result.indexes.length === 0) {
+    return <>{text}</>
+  }
+
+  // Sort indexes and build segments using code-unit positions
+  const sortedIndexes = [...result.indexes].sort((a, b) => a - b)
+  const segments: React.ReactNode[] = []
+  let lastEnd = 0
+
+  for (const idx of sortedIndexes) {
+    // Add non-highlighted segment before this match
+    if (idx > lastEnd) {
+      segments.push(text.slice(lastEnd, idx))
+    }
+    // Add highlighted character
+    segments.push(<b key={idx}>{text[idx]}</b>)
+    lastEnd = idx + 1
+  }
+
+  // Add remaining non-highlighted segment
+  if (lastEnd < text.length) {
+    segments.push(text.slice(lastEnd))
+  }
+
+  return <>{segments}</>
 }
 
 export type SelectorNodeData = {
@@ -219,12 +268,37 @@ function ActionCommandGroup({
   registryActions: RegistryActionReadMinimal[]
   inputValue: string
 }) {
-  const { workspaceId, workflowId, reactFlow } = useWorkflowBuilder()
+  const {
+    workspaceId,
+    workflowId,
+    reactFlow,
+    setSelectedNodeId,
+    actionPanelRef,
+  } = useWorkflowBuilder()
   const { getNode, getEdges, setNodes, setEdges } = reactFlow
   const { data: graphData } = useGraph(workspaceId, workflowId ?? "")
   const { applyGraphOperations, refetchGraph } = useGraphOperations(
     workspaceId,
     workflowId ?? ""
+  )
+
+  const openActionPanelForNode = useCallback(
+    (actionId?: string) => {
+      if (!actionId) {
+        return
+      }
+
+      setSelectedNodeId(actionId)
+      const panelHandle = actionPanelRef.current
+      if (panelHandle) {
+        if (panelHandle.setOpen) {
+          panelHandle.setOpen(true)
+        } else {
+          panelHandle.expand?.()
+        }
+      }
+    },
+    [actionPanelRef, setSelectedNodeId]
   )
 
   // Move sortedActions and filterResults logic here
@@ -269,9 +343,13 @@ function ActionCommandGroup({
         })
 
         // Identify the new node by diffing ids
-        const previousIds = new Set((graphData?.nodes ?? []).map((n) => n.id))
-        const newNode = graphAfterAdd.nodes.find((n) => !previousIds.has(n.id))
-        const newNodeId = newNode?.id
+        const previousIds = new Set(
+          (graphData?.nodes ?? []).map((n) => String(n.id))
+        )
+        const newNode = graphAfterAdd.nodes.find(
+          (n) => !previousIds.has(String(n.id))
+        )
+        const newNodeId = newNode?.id as string | undefined
 
         // Step 2: connect incoming edge to the new node
         if (incomingEdge && newNodeId) {
@@ -300,6 +378,7 @@ function ActionCommandGroup({
         setEdges((prevEdges) =>
           prevEdges.filter((edge) => edge.target !== nodeId)
         )
+        openActionPanelForNode(newNodeId)
       } catch (error) {
         const apiError = error as { status?: number }
         if (apiError.status === 409) {
@@ -321,12 +400,12 @@ function ActionCommandGroup({
             })
 
             const previousIds = new Set(
-              (latestGraph.nodes ?? []).map((n) => n.id)
+              (latestGraph.nodes ?? []).map((n) => String(n.id))
             )
             const newNode = graphAfterAdd.nodes.find(
-              (n) => !previousIds.has(n.id)
+              (n) => !previousIds.has(String(n.id))
             )
-            const newNodeId = newNode?.id
+            const newNodeId = newNode?.id as string | undefined
 
             if (incomingEdge && newNodeId) {
               const isTrigger = incomingEdge.source.startsWith("trigger")
@@ -353,6 +432,7 @@ function ActionCommandGroup({
             setEdges((prevEdges) =>
               prevEdges.filter((edge) => edge.target !== nodeId)
             )
+            openActionPanelForNode(newNodeId)
           } catch (retryError) {
             console.error("Failed to persist node after retry:", retryError)
             toast({
@@ -380,6 +460,7 @@ function ActionCommandGroup({
       applyGraphOperations,
       refetchGraph,
       graphData?.version,
+      openActionPanelForNode,
     ]
   )
 
@@ -389,14 +470,9 @@ function ActionCommandGroup({
         const action = result.obj
 
         if (highlight) {
-          const highlighted = SEARCH_KEYS.reduce(
-            (acc, key, index) => {
-              const currRes = result[index]
-              acc[key] = currRes.highlight() || String(action[key])
-              return acc
-            },
-            {} as Record<keyof RegistryActionReadMinimal, string>
-          )
+          // Get fuzzysort results by key name (resilient to SEARCH_KEYS reordering)
+          const actionResult = result[SEARCH_KEY_INDEX.action]
+          const titleResult = result[SEARCH_KEY_INDEX.default_title]
 
           return (
             <CommandItem
@@ -409,19 +485,16 @@ function ActionCommandGroup({
                   {getIcon(action.action, {
                     className: "size-5 mr-2",
                   })}
-                  <span
-                    className="text-xs"
-                    dangerouslySetInnerHTML={{
-                      __html: highlighted.default_title,
-                    }}
-                  />
+                  <span className="text-xs">
+                    <HighlightedText
+                      result={titleResult}
+                      text={action.default_title ?? action.action}
+                    />
+                  </span>
                 </div>
-                <span
-                  className="text-xs text-muted-foreground"
-                  dangerouslySetInnerHTML={{
-                    __html: highlighted.action,
-                  }}
-                />
+                <span className="text-xs text-muted-foreground">
+                  <HighlightedText result={actionResult} text={action.action} />
+                </span>
               </div>
             </CommandItem>
           )

@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -10,12 +11,14 @@ from pydantic import BaseModel
 from pydantic_core import to_jsonable_python
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from tracecat_ee.agent.router import router as ee_agent_router
+from tracecat_ee.admin.router import router as admin_router
+from tracecat_ee.agent.approvals.router import router as approvals_router
 
 from tracecat import __version__ as APP_VERSION
 from tracecat import config
 from tracecat.agent.preset.router import router as agent_preset_router
 from tracecat.agent.router import router as agent_router
+from tracecat.agent.session.router import router as agent_session_router
 from tracecat.api.common import (
     add_temporal_search_attributes,
     bootstrap_role,
@@ -35,21 +38,37 @@ from tracecat.auth.users import (
     auth_backend,
     fastapi_users,
 )
+from tracecat.cases.attachments.internal_router import (
+    router as internal_case_attachments_router,
+)
 from tracecat.cases.attachments.router import router as case_attachments_router
 from tracecat.cases.durations.router import router as case_durations_router
+from tracecat.cases.internal_router import (
+    comments_router as internal_comments_router,
+)
+from tracecat.cases.internal_router import (
+    router as internal_cases_router,
+)
 from tracecat.cases.router import case_fields_router as case_fields_router
 from tracecat.cases.router import cases_router as cases_router
+from tracecat.cases.tag_definitions.internal_router import (
+    router as internal_case_tag_definitions_router,
+)
 from tracecat.cases.tag_definitions.router import (
     router as case_tag_definitions_router,
 )
+from tracecat.cases.tags.internal_router import router as internal_case_tags_router
 from tracecat.cases.tags.router import router as case_tags_router
-from tracecat.chat.router import router as chat_router
 from tracecat.contexts import ctx_role
 from tracecat.db.dependencies import AsyncDBSession
 from tracecat.db.engine import get_async_session_context_manager
 from tracecat.editor.router import router as editor_router
 from tracecat.exceptions import TracecatException
-from tracecat.feature_flags import FeatureFlag, feature_flag_dep
+from tracecat.feature_flags import (
+    FeatureFlag,
+    FlagLike,
+    is_feature_enabled,
+)
 from tracecat.feature_flags.router import router as feature_flags_router
 from tracecat.integrations.router import (
     integrations_router,
@@ -70,7 +89,8 @@ from tracecat.secrets.router import org_router as org_secrets_router
 from tracecat.secrets.router import router as secrets_router
 from tracecat.settings.router import router as org_settings_router
 from tracecat.settings.service import SettingsService, get_setting_override
-from tracecat.storage.blob import ensure_bucket_exists
+from tracecat.storage.blob import configure_bucket_lifecycle, ensure_bucket_exists
+from tracecat.tables.internal_router import router as internal_tables_router
 from tracecat.tables.router import router as tables_router
 from tracecat.tags.router import router as tags_router
 from tracecat.variables.router import router as variables_router
@@ -109,6 +129,15 @@ async def lifespan(app: FastAPI):
 
     # Storage
     await ensure_bucket_exists(config.TRACECAT__BLOB_STORAGE_BUCKET_ATTACHMENTS)
+    await ensure_bucket_exists(config.TRACECAT__BLOB_STORAGE_BUCKET_REGISTRY)
+
+    # Workflow bucket with lifecycle expiration
+    await ensure_bucket_exists(config.TRACECAT__BLOB_STORAGE_BUCKET_WORKFLOW)
+    if config.TRACECAT__WORKFLOW_ARTIFACT_RETENTION_DAYS > 0:
+        await configure_bucket_lifecycle(
+            bucket=config.TRACECAT__BLOB_STORAGE_BUCKET_WORKFLOW,
+            expiration_days=config.TRACECAT__WORKFLOW_ARTIFACT_RETENTION_DAYS,
+        )
 
     # App
     role = bootstrap_role()
@@ -187,6 +216,20 @@ def fastapi_users_auth_exception_handler(request: Request, exc: FastAPIUsersExce
     return ORJSONResponse(status_code=status_code, content={"detail": msg})
 
 
+def feature_flag_dep(flag: FlagLike) -> Callable[..., None]:
+    """Check if a feature flag is enabled."""
+
+    def _is_feature_enabled() -> None:
+        if not is_feature_enabled(flag):
+            logger.debug("Feature flag is not enabled", flag=flag)
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Feature not enabled"
+            )
+        logger.debug("Feature flag is enabled", flag=flag)
+
+    return _is_feature_enabled
+
+
 def create_app(**kwargs) -> FastAPI:
     if config.TRACECAT__ALLOW_ORIGINS is not None:
         allow_origins = config.TRACECAT__ALLOW_ORIGINS.split(",")
@@ -194,10 +237,7 @@ def create_app(**kwargs) -> FastAPI:
         allow_origins = ["*"]
     app = FastAPI(
         title="Tracecat API",
-        description=(
-            "Tracecat is the open source Tines / Splunk SOAR alternative."
-            " You can operate Tracecat in headless mode by using the API to create, manage, and run workflows."
-        ),
+        description=("Tracecat is the open source automation platform for enterprise."),
         summary="Tracecat API",
         version="1",
         terms_of_service="https://docs.google.com/document/d/e/2PACX-1vQvDe3SoVAPoQc51MgfGCP71IqFYX_rMVEde8zC4qmBCec5f8PLKQRdxa6tsUABT8gWAR9J-EVs2CrQ/pub",
@@ -246,7 +286,9 @@ def create_app(**kwargs) -> FastAPI:
         agent_preset_router,
         dependencies=[Depends(feature_flag_dep(FeatureFlag.AGENT_PRESETS))],
     )
-    app.include_router(ee_agent_router)
+    app.include_router(agent_session_router)
+    app.include_router(approvals_router)
+    app.include_router(admin_router)
     app.include_router(editor_router)
     app.include_router(registry_repos_router)
     app.include_router(registry_actions_router)
@@ -262,7 +304,6 @@ def create_app(**kwargs) -> FastAPI:
         case_durations_router,
         dependencies=[Depends(feature_flag_dep(FeatureFlag.CASE_DURATIONS))],
     )
-    app.include_router(chat_router)
     app.include_router(workflow_folders_router)
     app.include_router(integrations_router)
     app.include_router(providers_router)
@@ -277,6 +318,13 @@ def create_app(**kwargs) -> FastAPI:
         prefix="/users",
         tags=["users"],
     )
+    # Internal routers
+    app.include_router(internal_case_attachments_router)
+    app.include_router(internal_cases_router)
+    app.include_router(internal_comments_router)
+    app.include_router(internal_case_tags_router)
+    app.include_router(internal_case_tag_definitions_router)
+    app.include_router(internal_tables_router)
 
     if AuthType.BASIC in config.TRACECAT__AUTH_TYPES:
         app.include_router(
@@ -369,9 +417,13 @@ def create_app(**kwargs) -> FastAPI:
 app = create_app()
 
 
+class HealthResponse(BaseModel):
+    status: str
+
+
 @app.get("/", include_in_schema=False)
-def root() -> dict[str, str]:
-    return {"message": "Hello world. I am the API."}
+def root() -> HealthResponse:
+    return HealthResponse(status="ok")
 
 
 class AppInfo(BaseModel):
@@ -405,12 +457,12 @@ async def info(session: AsyncDBSession) -> AppInfo:
 
 
 @app.get("/health", tags=["public"])
-def check_health() -> dict[str, str]:
-    return {"message": "Hello world. I am the API. This is the health endpoint."}
+def check_health() -> HealthResponse:
+    return HealthResponse(status="ok")
 
 
 @app.get("/ready", tags=["public"])
-def check_ready() -> dict[str, str]:
+def check_ready() -> HealthResponse:
     """Readiness check - returns 200 only after startup is complete.
 
     Use this endpoint for Docker healthchecks to ensure the API has finished
@@ -421,4 +473,4 @@ def check_ready() -> dict[str, str]:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="API is not ready yet",
         )
-    return {"status": "ready"}
+    return HealthResponse(status="ready")

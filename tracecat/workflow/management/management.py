@@ -3,16 +3,17 @@ from __future__ import annotations
 import re
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, cast
 
 import sqlalchemy as sa
 import yaml
 from pydantic import ValidationError
-from sqlalchemy import and_, cast, select
+from sqlalchemy import and_, select
 from sqlalchemy.orm import selectinload
 from temporalio import activity
 
 from tracecat.audit.logger import audit_log
+from tracecat.contexts import ctx_logical_time
 from tracecat.db.models import (
     Action,
     Tag,
@@ -21,13 +22,19 @@ from tracecat.db.models import (
     WorkflowDefinition,
     WorkflowTag,
 )
-from tracecat.dsl.common import DSLEntrypoint, DSLInput, build_action_statements
-from tracecat.dsl.schemas import DSLConfig
+from tracecat.dsl.action import materialize_context
+from tracecat.dsl.common import (
+    DSLEntrypoint,
+    DSLInput,
+    build_action_statements_from_actions,
+)
+from tracecat.dsl.schemas import DSLConfig, ExecutionContext, RunContext
 from tracecat.dsl.view import RFGraph
 from tracecat.exceptions import (
     TracecatAuthorizationError,
     TracecatValidationError,
 )
+from tracecat.expressions.eval import eval_templated_object
 from tracecat.identifiers import WorkflowID
 from tracecat.identifiers.workflow import (
     LEGACY_WF_ID_PATTERN,
@@ -39,6 +46,7 @@ from tracecat.pagination import (
     CursorPaginatedResponse,
     CursorPaginationParams,
 )
+from tracecat.registry.lock.service import RegistryLockService
 from tracecat.service import BaseService
 from tracecat.validation.schemas import (
     DSLValidationResult,
@@ -46,7 +54,9 @@ from tracecat.validation.schemas import (
     ValidationResult,
 )
 from tracecat.validation.service import validate_dsl
-from tracecat.workflow.actions.schemas import ActionControlFlow
+from tracecat.workflow.actions.schemas import ActionControlFlow, ActionEdge
+from tracecat.workflow.executions.enums import ExecutionType
+from tracecat.workflow.management.definitions import WorkflowDefinitionsService
 from tracecat.workflow.management.schemas import (
     ExternalWorkflowDefinition,
     GetErrorHandlerWorkflowIDActivityInputs,
@@ -83,7 +93,7 @@ class WorkflowsManagementService(BaseService):
                 WorkflowDefinition.workflow_id,
                 sa.func.max(WorkflowDefinition.version).label("latest_version"),
             )
-            .group_by(cast(WorkflowDefinition.workflow_id, sa.UUID))
+            .group_by(sa.cast(WorkflowDefinition.workflow_id, sa.UUID))
             .subquery()
         )
 
@@ -98,7 +108,7 @@ class WorkflowsManagementService(BaseService):
             .where(Workflow.workspace_id == self.role.workspace_id)
             .outerjoin(
                 latest_defn_subq,
-                cast(Workflow.id, sa.UUID) == latest_defn_subq.c.workflow_id,
+                sa.cast(Workflow.id, sa.UUID) == latest_defn_subq.c.workflow_id,
             )
             .outerjoin(
                 WorkflowDefinition,
@@ -125,7 +135,8 @@ class WorkflowsManagementService(BaseService):
             # Join through the WorkflowTag link table to Tag table
             stmt = (
                 stmt.join(
-                    WorkflowTag, cast(Workflow.id, sa.UUID) == WorkflowTag.workflow_id
+                    WorkflowTag,
+                    sa.cast(Workflow.id, sa.UUID) == WorkflowTag.workflow_id,
                 )
                 .join(Tag, and_(Tag.id == WorkflowTag.tag_id, Tag.name.in_(tag_set)))
                 # Ensure we get distinct workflows when multiple tags match
@@ -168,7 +179,7 @@ class WorkflowsManagementService(BaseService):
                 WorkflowDefinition.workflow_id,
                 sa.func.max(WorkflowDefinition.version).label("latest_version"),
             )
-            .group_by(cast(WorkflowDefinition.workflow_id, sa.UUID))
+            .group_by(sa.cast(WorkflowDefinition.workflow_id, sa.UUID))
             .subquery()
         )
 
@@ -183,7 +194,7 @@ class WorkflowsManagementService(BaseService):
             .where(Workflow.workspace_id == self.role.workspace_id)
             .outerjoin(
                 latest_defn_subq,
-                cast(Workflow.id, sa.UUID) == latest_defn_subq.c.workflow_id,
+                sa.cast(Workflow.id, sa.UUID) == latest_defn_subq.c.workflow_id,
             )
             .outerjoin(
                 WorkflowDefinition,
@@ -199,7 +210,8 @@ class WorkflowsManagementService(BaseService):
             tag_set = set(tags)
             stmt = (
                 stmt.join(
-                    WorkflowTag, cast(Workflow.id, sa.UUID) == WorkflowTag.workflow_id
+                    WorkflowTag,
+                    sa.cast(Workflow.id, sa.UUID) == WorkflowTag.workflow_id,
                 )
                 .join(Tag, and_(Tag.id == WorkflowTag.tag_id, Tag.name.in_(tag_set)))
                 .distinct()
@@ -335,13 +347,92 @@ class WorkflowsManagementService(BaseService):
             )
         )
         result = await self.session.execute(statement)
-        return result.scalar_one_or_none()
+        workflow = result.scalar_one_or_none()
+        if workflow:
+            await self._reconcile_graph_object_with_actions(workflow)
+        return workflow
 
-    async def resolve_workflow_alias(self, alias: str) -> WorkflowID | None:
-        statement = select(Workflow.id).where(
-            Workflow.workspace_id == self.role.workspace_id,
-            Workflow.alias == alias,
-        )
+    async def _reconcile_graph_object_with_actions(self, workflow: Workflow) -> bool:
+        """Remove stale upstream edge references from actions.
+
+        The graph layout is stored in action.upstream_edges and workflow trigger
+        coordinates. When actions are deleted out-of-band (e.g. manual DB edits),
+        their IDs may remain in upstream_edges of other actions. This method
+        normalizes the edge lists by removing references to non-existent actions
+        and invalid trigger IDs.
+
+        Returns:
+            bool: True if any changes were persisted, False otherwise.
+        """
+
+        await self.session.refresh(workflow, ["actions"])
+
+        if not workflow.actions:
+            return False
+
+        valid_action_ids = {str(action.id) for action in workflow.actions}
+        trigger_id = f"trigger-{workflow.id}"
+        changed = False
+
+        for action in workflow.actions:
+            edges = action.upstream_edges or []
+            filtered_edges: list[dict[str, Any]] = []
+
+            for edge in edges:
+                source_id = str(edge.get("source_id", ""))
+                source_type = edge.get("source_type", "udf")
+
+                if source_type == "trigger":
+                    if source_id != trigger_id:
+                        changed = True
+                        continue
+                elif source_type == "udf":
+                    if source_id not in valid_action_ids:
+                        changed = True
+                        continue
+                else:
+                    changed = True
+                    continue
+
+                filtered_edges.append(edge)
+
+            if filtered_edges != edges:
+                action.upstream_edges = filtered_edges
+                self.session.add(action)
+
+        if changed:
+            await self.session.commit()
+            await self.session.refresh(workflow, ["actions"])
+
+        return changed
+
+    async def resolve_workflow_alias(
+        self, alias: str, *, use_committed: bool = True
+    ) -> WorkflowID | None:
+        """Resolve a workflow alias to a workflow ID.
+
+        Args:
+            alias: The workflow alias to resolve.
+            use_committed: If True, resolve from committed WorkflowDefinition aliases.
+                           If False, resolve from draft Workflow aliases (for draft executions).
+        """
+        if use_committed:
+            # For published executions: resolve from the latest committed definition with this alias
+            statement = (
+                select(WorkflowDefinition.workflow_id)
+                .where(
+                    WorkflowDefinition.workspace_id == self.role.workspace_id,
+                    WorkflowDefinition.alias == alias,
+                )
+                .order_by(WorkflowDefinition.version.desc())
+                .limit(1)
+            )
+        else:
+            # For draft executions: resolve from draft Workflow table
+            statement = select(Workflow.id).where(
+                Workflow.workspace_id == self.role.workspace_id,
+                Workflow.alias == alias,
+            )
         result = await self.session.execute(statement)
         res = result.scalar_one_or_none()
         return WorkflowUUID.new(res) if res else None
@@ -422,8 +513,11 @@ class WorkflowsManagementService(BaseService):
         title = params.title or now
         description = params.description or f"New workflow created {now}"
 
+        # registry_lock will be resolved when workflow is committed with actions
         workflow = Workflow(
-            title=title, description=description, workspace_id=self.role.workspace_id
+            title=title,
+            description=description,
+            workspace_id=self.role.workspace_id,
         )
         # When we create a workflow, we automatically create a webhook
         # Add the Workflow to the session first to generate an ID
@@ -482,7 +576,7 @@ class WorkflowsManagementService(BaseService):
                 self.logger.info("Validation errors", errors=val_errors)
                 return WorkflowDSLCreateResponse(errors=list(val_errors))
 
-        self.logger.info("Creating workflow from DSL", dsl=dsl)
+        self.logger.debug("Creating workflow from DSL", dsl=dsl)
         try:
             workflow = await self.create_db_workflow_from_dsl(dsl)
             return WorkflowDSLCreateResponse(workflow=workflow)
@@ -502,13 +596,7 @@ class WorkflowsManagementService(BaseService):
             raise TracecatValidationError(
                 "Workflow has no actions. Please add an action to the workflow before saving."
             )
-        # Build graph from Actions as the source of truth
-        graph = RFGraph.from_actions(workflow, actions)
-        if not graph.entrypoints:
-            raise TracecatValidationError(
-                "Workflow has no entrypoints. Please add an action to the workflow before saving."
-            )
-        action_statements = build_action_statements(graph, actions)
+        action_statements = build_action_statements_from_actions(actions)
         return DSLInput(
             title=workflow.title,
             description=workflow.description,
@@ -559,6 +647,13 @@ class WorkflowsManagementService(BaseService):
         self.logger.info("Creating workflow from DSL", dsl=dsl)
         if self.role.workspace_id is None:
             raise TracecatAuthorizationError("Workspace ID is required")
+
+        # Resolve registry_lock with action bindings from the DSL
+        action_names = {action.action for action in dsl.actions}
+        lock_service = RegistryLockService(self.session, self.role)
+        resolved_lock = await lock_service.resolve_lock_with_bindings(action_names)
+        registry_lock = resolved_lock.model_dump()
+
         entrypoint = dsl.entrypoint.model_dump()
         workflow_kwargs = {
             "title": dsl.title,
@@ -567,6 +662,7 @@ class WorkflowsManagementService(BaseService):
             "returns": dsl.returns,
             "config": dsl.config.model_dump(),
             "expects": entrypoint.get("expects"),
+            "registry_lock": registry_lock,
         }
         if workflow_id:
             workflow_kwargs["id"] = workflow_id
@@ -578,8 +674,10 @@ class WorkflowsManagementService(BaseService):
             workflow_kwargs["alias"] = workflow_alias
         workflow = Workflow(**workflow_kwargs)
 
-        # Add the Workflow to the session first to generate an ID
+        # Add the Workflow to the session first and flush to ensure ID is persisted
         self.session.add(workflow)
+        await self.session.flush()
+        self.logger.debug("Workflow created", workflow_id=workflow.id)
 
         # Create and associate Webhook with the Workflow
         webhook = Webhook(
@@ -589,8 +687,29 @@ class WorkflowsManagementService(BaseService):
         self.session.add(webhook)
         workflow.webhook = webhook
 
-        # Create and associate Actions with the Workflow
+        # Create actions from DSL (actions have workflow_id set, relationship managed by FK)
+        await self.create_actions_from_dsl(dsl, workflow.id)
+
+        # Commit the transaction
+        if commit:
+            await self.session.commit()
+            await self.session.refresh(workflow)
+        return workflow
+
+    async def create_actions_from_dsl(
+        self, dsl: DSLInput, workflow_id: uuid.UUID
+    ) -> list[Action]:
+        """Create Action entities from DSL and add to session.
+
+        Builds upstream_edges from depends_on relationships.
+        For root actions (no depends_on), creates trigger->action edge.
+        """
+        if self.role.workspace_id is None:
+            raise TracecatAuthorizationError("Workspace ID is required")
+
+        # Create all actions and build ref->action mapping
         actions: list[Action] = []
+        ref_to_action: dict[str, Action] = {}
         for act_stmt in dsl.actions:
             control_flow = ActionControlFlow(
                 run_if=act_stmt.run_if,
@@ -601,8 +720,9 @@ class WorkflowsManagementService(BaseService):
                 join_strategy=act_stmt.join_strategy,
             )
             new_action = Action(
+                id=uuid.uuid4(),
                 workspace_id=self.role.workspace_id,
-                workflow_id=workflow.id,
+                workflow_id=workflow_id,
                 type=act_stmt.action,
                 inputs=yaml.dump(act_stmt.args),
                 title=act_stmt.title,
@@ -610,23 +730,63 @@ class WorkflowsManagementService(BaseService):
                 control_flow=control_flow.model_dump(),
             )
             actions.append(new_action)
-            self.session.add(new_action)
+            ref_to_action[act_stmt.ref] = new_action
 
-        workflow.actions = actions  # Associate actions with the workflow
+        # Build upstream_edges (separate loop handles forward references in depends_on)
+        trigger_id = f"trigger-{workflow_id}"
+        for act_stmt in dsl.actions:
+            action = ref_to_action[act_stmt.ref]
+            upstream_edges: list[ActionEdge] = []
 
-        # Commit the transaction
-        if commit:
-            await self.session.commit()
-            await self.session.refresh(workflow)
-        return workflow
+            if act_stmt.depends_on:
+                for dep_ref in act_stmt.depends_on:
+                    if dep_action := ref_to_action.get(dep_ref):
+                        upstream_edges.append(
+                            ActionEdge(
+                                source_id=str(dep_action.id),
+                                source_type="udf",
+                                source_handle="success",
+                            )
+                        )
+            else:
+                upstream_edges.append(
+                    ActionEdge(
+                        source_id=trigger_id,
+                        source_type="trigger",
+                    )
+                )
+            action.upstream_edges = cast(list[dict[str, Any]], upstream_edges)
+
+        for action in actions:
+            self.session.add(action)
+        await self.session.flush()
+        return actions
 
     @staticmethod
     @activity.defn
     async def resolve_workflow_alias_activity(
+        ctx: RunContext,
+        operand: ExecutionContext,
         input: ResolveWorkflowAliasActivityInputs,
     ) -> WorkflowID | None:
+        # Resolve expr
+        # Materialize any StoredObjects in operand before evaluation
+        materialized = await materialize_context(operand)
+        token = ctx_logical_time.set(ctx.logical_time)
+        try:
+            evaluated_alias = eval_templated_object(
+                input.workflow_alias, operand=materialized
+            )
+        finally:
+            ctx_logical_time.reset(token)
+        if not isinstance(evaluated_alias, str):
+            raise TypeError(
+                f"Workflow alias expression must evaluate to a string. Got {type(evaluated_alias).__name__}"
+            )
         async with WorkflowsManagementService.with_session(input.role) as service:
-            return await service.resolve_workflow_alias(input.workflow_alias)
+            return await service.resolve_workflow_alias(
+                evaluated_alias, use_committed=input.use_committed
+            )
 
     @staticmethod
     @activity.defn
@@ -635,38 +795,45 @@ class WorkflowsManagementService(BaseService):
     ) -> WorkflowID | None:
         args = input.args
         id_or_alias = None
-        async with WorkflowsManagementService.with_session(role=args.role) as service:
-            if args.dsl:
-                # 1. If a DSL was provided, we must use its error handler
-                if not args.dsl.error_handler:
-                    activity.logger.info("DSL has no error handler")
-                    return None
-                id_or_alias = args.dsl.error_handler
-            else:
-                # 2. Otherwise, use the error handler defined in the workflow
-                workflow = await service.get_workflow(args.wf_id)
-                if not workflow or not workflow.error_handler:
-                    activity.logger.info("No workflow or error handler found")
-                    return None
-                id_or_alias = workflow.error_handler
+        if args.dsl:
+            # 1. If a DSL was provided, we must use its error handler
+            if not args.dsl.error_handler:
+                activity.logger.info("DSL has no error handler")
+                return None
+            id_or_alias = args.dsl.error_handler
+        else:
+            # 2. Otherwise, get error handler from the committed definition
+            # This ensures schedules use the committed error handler
+            async with WorkflowDefinitionsService.with_session(
+                role=args.role
+            ) as defn_service:
+                defn = await defn_service.get_definition_by_workflow_id(args.wf_id)
+            if not defn:
+                activity.logger.info("No committed definition found")
+                return None
+            dsl = defn.content
+            if not dsl or not dsl.get("error_handler"):
+                activity.logger.info("Committed definition has no error handler")
+                return None
+            id_or_alias = dsl["error_handler"]
 
-            # 3. Convert the error handler to an ID
-            if re.match(LEGACY_WF_ID_PATTERN, id_or_alias):
-                # TODO: Legacy workflow ID for backwards compatibility. Slowly deprecate.
-                handler_wf_id = WorkflowUUID.from_legacy(id_or_alias)
-            elif re.match(WF_ID_SHORT_PATTERN, id_or_alias):
-                # Short workflow ID
-                handler_wf_id = WorkflowUUID.new(id_or_alias)
-            if re.match(LEGACY_WF_ID_PATTERN, id_or_alias):
-                # TODO: Legacy workflow ID for backwards compatibility. Slowly deprecate.
-                handler_wf_id = WorkflowUUID.from_legacy(id_or_alias)
-            elif re.match(WF_ID_SHORT_PATTERN, id_or_alias):
-                # Short workflow ID
-                handler_wf_id = WorkflowUUID.new(id_or_alias)
-            else:
-                handler_wf_id = await service.resolve_workflow_alias(id_or_alias)
-                if not handler_wf_id:
-                    raise RuntimeError(
-                        f"Couldn't find matching workflow for alias {id_or_alias!r}"
-                    )
-            return handler_wf_id
+        # 3. Convert the error handler to an ID
+        if re.match(LEGACY_WF_ID_PATTERN, id_or_alias):
+            # TODO: Legacy workflow ID for backwards compatibility. Slowly deprecate.
+            handler_wf_id = WorkflowUUID.from_legacy(id_or_alias)
+        elif re.match(WF_ID_SHORT_PATTERN, id_or_alias):
+            # Short workflow ID
+            handler_wf_id = WorkflowUUID.new(id_or_alias)
+        else:
+            use_committed = args.execution_type == ExecutionType.PUBLISHED
+            async with WorkflowsManagementService.with_session(
+                role=args.role
+            ) as service:
+                handler_wf_id = await service.resolve_workflow_alias(
+                    id_or_alias, use_committed=use_committed
+                )
+            if not handler_wf_id:
+                raise RuntimeError(
+                    f"Couldn't find matching workflow for alias {id_or_alias!r}"
+                )
+        return handler_wf_id

@@ -12,7 +12,7 @@ from collections.abc import Callable
 from pathlib import Path
 from timeit import default_timer
 from types import ModuleType
-from typing import Annotated, Any, Literal, cast, get_args, get_origin
+from typing import Annotated, Any, Literal, cast, get_args, get_origin, get_type_hints
 
 from pydantic import (
     BaseModel,
@@ -37,7 +37,8 @@ from tracecat.expressions.validation import TemplateValidator
 from tracecat.git.utils import GitUrl, get_git_repository_sha, parse_git_url
 from tracecat.logger import logger
 from tracecat.parse import safe_url
-from tracecat.registry.actions.schemas import BoundRegistryAction, TemplateAction
+from tracecat.registry.actions.bound import BoundRegistryAction
+from tracecat.registry.actions.schemas import TemplateAction
 from tracecat.registry.constants import (
     DEFAULT_LOCAL_REGISTRY_ORIGIN,
     DEFAULT_REGISTRY_ORIGIN,
@@ -59,6 +60,41 @@ from tracecat.ssh import SshEnv, ssh_context
 
 ArgsClsT = type[BaseModel]
 type F = Callable[..., Any]
+
+
+def get_custom_registry_target() -> Path:
+    """Get the target directory for installing custom registry packages.
+
+    This directory is used to isolate custom registry dependencies from the
+    main tracecat virtual environment, preventing dependency conflicts.
+    The directory is automatically added to sys.path so imports work.
+
+    Returns:
+        Path to the target directory for custom registry packages.
+    """
+    # Use PYTHONUSERBASE if set (production), otherwise ~/.local
+    base = os.getenv("PYTHONUSERBASE") or Path.home().joinpath(".local").as_posix()
+    return Path(base)
+
+
+def ensure_custom_registry_path() -> None:
+    """Ensure the custom registry target directory is in sys.path.
+
+    This must be called before importing any custom registry modules to ensure
+    packages installed via --target are discoverable.
+
+    Uses site.addsitedir() instead of sys.path.insert() to properly process
+    .pth files from editable installs (uv pip install --editable).
+    """
+    import site
+
+    target = get_custom_registry_target()
+    target_str = str(target)
+    if target_str not in sys.path:
+        # Use addsitedir to process .pth files from editable installs
+        # This is required for local registries installed with --editable
+        site.addsitedir(target_str)
+        logger.debug("Added custom registry path via site.addsitedir", path=target_str)
 
 
 def iter_valid_files(
@@ -173,10 +209,16 @@ class Repository:
     3. Serve function execution requests from a registry manager
     """
 
-    def __init__(self, origin: str = DEFAULT_REGISTRY_ORIGIN, role: Role | None = None):
+    def __init__(
+        self,
+        origin: str = DEFAULT_REGISTRY_ORIGIN,
+        role: Role | None = None,
+        package_name_override: str | None = None,
+    ):
         self._store: dict[str, BoundRegistryAction[ArgsClsT]] = {}
         self._is_initialized: bool = False
         self._origin = origin
+        self._package_name_override = package_name_override
         self.role = role or ctx_role.get()
 
     def __contains__(self, name: str) -> bool:
@@ -394,19 +436,21 @@ class Repository:
                     "Local repository is not a git repository, skipping commit SHA"
                 )
 
-            # Install the package in editable mode
-            extra_args = []
-            if config.TRACECAT__APP_ENV == "production":
-                # We set PYTHONUSERBASE in the prod Dockerfile
-                # Otherwise default to the user's home dir at ~/.local
-                python_user_base = (
-                    os.getenv("PYTHONUSERBASE")
-                    or Path.home().joinpath(".local").as_posix()
-                )
-                logger.debug(
-                    "Installing to PYTHONUSERBASE", python_user_base=python_user_base
-                )
-                extra_args = ["--target", python_user_base]
+            # Install the package in editable mode to the custom registry target.
+            # We use --target to isolate custom registry dependencies from the
+            # main tracecat venv, and --python to ensure compatibility with the
+            # current interpreter.
+            target_dir = get_custom_registry_target()
+            extra_args = [
+                "--python",
+                sys.executable,
+                "--target",
+                str(target_dir),
+            ]
+            logger.debug(
+                "Installing local repository to target",
+                target=str(target_dir),
+            )
 
             cmd = ["uv", "pip", "install", "--refresh", "--editable"]
             process = await asyncio.create_subprocess_exec(
@@ -468,7 +512,9 @@ class Repository:
                     "Invalid Git repository URL. Please provide a valid Git SSH URL (git+ssh)."
                 ) from e
             package_name = (
-                await get_setting("git_repo_package_name", role=self.role) or repo_name
+                self._package_name_override
+                or await get_setting("git_repo_package_name", role=self.role)
+                or repo_name
             )
             logger.debug(
                 "Parsed Git repository URL",
@@ -522,6 +568,11 @@ class Repository:
         Raises:
             ImportError: If there is an error importing the module
         """
+        # Ensure the custom registry target is in sys.path before importing.
+        # This is required because packages are installed to --target dir,
+        # which is separate from the main tracecat venv.
+        ensure_custom_registry_path()
+
         try:
             logger.info("Importing repository module", module_name=module_name)
             # We only need to call this at the root level because
@@ -774,22 +825,11 @@ def import_and_reload(module_name: str) -> ModuleType:
                     loaded_module = importlib.reload(module)
                 except (ImportError, ValueError) as e:
                     logger.warning(
-                        "Reload failed, trying fresh import",
+                        "Reload failed, keeping existing module",
                         module_name=module_name,
                         error=e,
                     )
-                    # Try fresh import, but keep the old module as fallback
-                    sys.modules.pop(module_name, None)
-                    try:
-                        loaded_module = importlib.import_module(module_name)
-                    except (ImportError, ValueError):
-                        # Restore the original working module
-                        sys.modules[module_name] = module
-                        loaded_module = module
-                        logger.warning(
-                            "Fresh import also failed, keeping existing module",
-                            module_name=module_name,
-                        )
+                    loaded_module = module
         sys.modules[module_name] = loaded_module
         return loaded_module
 
@@ -842,13 +882,28 @@ def generate_model_from_function(
 ) -> tuple[type[BaseModel], Any, TypeAdapter]:
     # Get the signature of the function
     sig = inspect.signature(func)
+    # Get the function's module globals for resolving forward references
+    func_module = sys.modules.get(func.__module__)
+    func_globals = getattr(func_module, "__dict__", {}) if func_module else {}
+    # Resolve all type hints upfront to handle ForwardRefs from `from __future__ import annotations`
+    # include_extras=True preserves Annotated metadata like Doc()
+    try:
+        resolved_hints = get_type_hints(
+            func, globalns=func_globals, localns=func_globals, include_extras=True
+        )
+    except Exception:
+        resolved_hints = {}
     # Create a dictionary to hold field definitions
     fields = {}
     for name, param in sig.parameters.items():
-        # Use the annotation and default value of the parameter to define the model field
-        field_annotation = param.annotation
-        # Handle both Annotated types and raw types
-        raw_field_type: type = getattr(field_annotation, "__origin__", field_annotation)
+        # Use resolved type hint if available, otherwise fall back to raw annotation
+        field_annotation = resolved_hints.get(name, param.annotation)
+        # Extract base type from Annotated[T, ...] -> T, preserve other types as-is
+        origin = get_origin(field_annotation)
+        if origin is Annotated:
+            raw_field_type: type = get_args(field_annotation)[0]
+        else:
+            raw_field_type = field_annotation
         field_info_kwargs = {}
         # Get the default UI for the field
         non_null_field_type = type_drop_null(raw_field_type)
@@ -863,6 +918,13 @@ def generate_model_from_function(
                     # Only set the component if no default UI is provided
                     case Component():
                         manually_set_components.append(meta)
+                    # `tracecat_registry` (and sandboxed `registry-client` mode) provides
+                    # lightweight dataclass component definitions that are not instances
+                    # of `tracecat.registry.fields.Component`. These still need to
+                    # propagate to JSONSchema via `x-tracecat-component` so the frontend
+                    # can render specialized editors (code, textarea, etc).
+                    case _ if isinstance(getattr(meta, "component_id", None), str):
+                        manually_set_components.append(meta)
 
         final_components = manually_set_components or components
         if final_components:
@@ -875,9 +937,6 @@ def generate_model_from_function(
         field_info = Field(default=default, **field_info_kwargs)
         fields[name] = (field_annotation, field_info)
     # Dynamically create and return the Pydantic model class
-    # Pass the function's module so Pydantic can resolve type aliases (e.g., OutputTypeLiteral)
-    func_module = sys.modules.get(func.__module__)
-    func_globals = getattr(func_module, "__dict__", {}) if func_module else {}
     input_model = create_model(
         _udf_slug_camelcase(func, udf_kwargs.namespace),
         __config__=ConfigDict(extra="forbid"),
@@ -887,8 +946,10 @@ def generate_model_from_function(
     )
     # Rebuild the model with the function's global namespace to resolve forward references
     input_model.model_rebuild(_types_namespace=func_globals)
-    # Capture the return type of the function
-    rtype = sig.return_annotation if sig.return_annotation is not sig.empty else Any
+    # Get return type from resolved hints, fallback to signature annotation
+    rtype = resolved_hints.get("return", Any)
+    if rtype is Any and sig.return_annotation is not sig.empty:
+        rtype = sig.return_annotation
     rtype_adapter = TypeAdapter(rtype)
 
     return input_model, rtype, rtype_adapter
@@ -982,10 +1043,30 @@ async def ensure_base_repository(
 async def install_remote_repository(
     repo_url: str, commit_sha: str, env: SshEnv
 ) -> None:
+    """Install a remote repository to the custom registry target directory.
+
+    Uses `uv pip install --target` instead of `uv add` to isolate custom
+    registry dependencies from the main tracecat virtual environment.
+    This prevents dependency conflicts between tracecat and user repositories.
+    """
     logger.info("Loading remote repository", url=repo_url, commit_sha=commit_sha)
 
-    cmd = ["uv", "add", "--refresh", f"{repo_url}@{commit_sha}"]
-    logger.debug("Installation command", cmd=cmd)
+    target_dir = get_custom_registry_target()
+    cmd = [
+        "uv",
+        "pip",
+        "install",
+        "--python",
+        sys.executable,
+        "--target",
+        str(target_dir),
+        "--refresh",
+        f"{repo_url}@{commit_sha}",
+    ]
+    logger.debug(
+        "Installation command",
+        cmd=cmd,
+    )
     try:
         process = await asyncio.create_subprocess_exec(
             *cmd,

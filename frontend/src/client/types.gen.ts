@@ -202,15 +202,27 @@ export type ActionValidationResult = {
 
 export type status = "success" | "error"
 
-export type AgentApprovalSubmission = {
-  approvals: ApprovalMap
+/**
+ * Admin view of a user.
+ */
+export type AdminUserRead = {
+  id: string
+  email: string
+  first_name?: string | null
+  last_name?: string | null
+  role: UserRole
+  is_active: boolean
+  is_superuser: boolean
+  is_verified: boolean
+  last_login_at?: string | null
+  created_at: string
 }
 
 export type AgentOutput = {
   output: unknown
-  message_history?: Array<ModelRequest | ModelResponse> | null
+  message_history?: Array<ChatMessage> | null
   duration: number
-  usage: RunUsage
+  usage?: RunUsage | null
   session_id: string
 }
 
@@ -298,19 +310,143 @@ export type AgentPresetUpdate = {
   retries?: number | null
 }
 
+/**
+ * Request schema for creating an agent session.
+ */
+export type AgentSessionCreate = {
+  /**
+   * Session ID. If not provided, service generates one.
+   */
+  id?: string | null
+  /**
+   * Human-readable title for the session
+   */
+  title?: string
+  /**
+   * User who created this session
+   */
+  created_by?: string | null
+  /**
+   * Type of entity this session is associated with
+   */
+  entity_type: AgentSessionEntity
+  /**
+   * ID of the associated entity
+   */
+  entity_id: string
+  /**
+   * Tools available to the agent for this session
+   */
+  tools?: Array<string> | null
+  /**
+   * Agent preset used for this session (if any)
+   */
+  agent_preset_id?: string | null
+  /**
+   * Agent harness type
+   */
+  harness_type?: HarnessType
+}
+
+/**
+ * The type of entity associated with an agent session.
+ *
+ * Determines the context and behavior of the session:
+ * - CASE: Chat attached to a Case entity for investigation
+ * - AGENT_PRESET: Live chat testing a preset configuration
+ * - AGENT_PRESET_BUILDER: Builder chat for editing/configuring a preset
+ * - COPILOT: Workspace-level copilot assistant
+ * - WORKFLOW: Workflow-initiated agent run (from action)
+ */
+export type AgentSessionEntity =
+  | "case"
+  | "agent_preset"
+  | "agent_preset_builder"
+  | "copilot"
+  | "workflow"
+
+/**
+ * Response schema for agent session.
+ */
 export type AgentSessionRead = {
   id: string
+  workspace_id: string
+  title: string
+  created_by: string | null
+  entity_type: string
+  entity_id: string
+  tools: Array<string> | null
+  agent_preset_id: string | null
+  harness_type: string | null
+  last_stream_id?: string | null
   created_at: string
-  parent_id?: string | null
-  parent_run_id: string | null
-  root_id?: string | null
-  root_run_id?: string | null
-  status?: WorkflowExecutionStatus | null
-  approvals?: Array<ApprovalRead>
-  parent_workflow?: WorkflowSummary | null
-  root_workflow?: WorkflowSummary | null
-  action_ref?: string | null
-  action_title?: string | null
+  updated_at: string
+}
+
+/**
+ * Response schema for agent session with Vercel format messages.
+ */
+export type AgentSessionReadVercel = {
+  id: string
+  workspace_id: string
+  title: string
+  created_by: string | null
+  entity_type: string
+  entity_id: string
+  tools: Array<string> | null
+  agent_preset_id: string | null
+  harness_type: string | null
+  last_stream_id?: string | null
+  created_at: string
+  updated_at: string
+  /**
+   * Session messages in Vercel UI format
+   */
+  messages?: Array<UIMessage>
+}
+
+/**
+ * Response schema for agent session with message history.
+ */
+export type AgentSessionReadWithMessages = {
+  id: string
+  workspace_id: string
+  title: string
+  created_by: string | null
+  entity_type: string
+  entity_id: string
+  tools: Array<string> | null
+  agent_preset_id: string | null
+  harness_type: string | null
+  last_stream_id?: string | null
+  created_at: string
+  updated_at: string
+  /**
+   * Session messages
+   */
+  messages?: Array<unknown>
+}
+
+/**
+ * Request schema for updating an agent session.
+ */
+export type AgentSessionUpdate = {
+  /**
+   * Session title
+   */
+  title?: string | null
+  /**
+   * Tools available to the agent
+   */
+  tools?: Array<string> | null
+  /**
+   * Agent preset to use for this session
+   */
+  agent_preset_id?: string | null
+  /**
+   * Agent harness type
+   */
+  harness_type?: HarnessType | null
 }
 
 export type AgentSettingsRead = {
@@ -432,34 +568,39 @@ export type ApprovalMap = {
 }
 
 /**
- * Serialized approval record.
+ * Response schema for approval data in chat timeline.
  */
 export type ApprovalRead = {
   id: string
-  session_id: string
   tool_call_id: string
   tool_name: string
-  status: ApprovalStatus
-  reason: string | null
-  tool_call_args: {
+  tool_call_args?: {
     [key: string]: unknown
   } | null
-  decision:
+  status: ApprovalStatus
+  reason?: string | null
+  decision?:
     | boolean
     | {
         [key: string]: unknown
       }
     | null
-  approved_by?: UserReadMinimal | null
-  approved_at: string | null
+  approved_by?: string | null
+  approved_at?: string | null
   created_at: string
-  updated_at: string
 }
 
 /**
  * Possible states for a deferred tool approval.
  */
 export type ApprovalStatus = "pending" | "approved" | "rejected"
+
+/**
+ * Request model for submitting approval decisions.
+ */
+export type ApprovalSubmission = {
+  approvals: ApprovalMap
+}
 
 /**
  * Event for when a case assignee is changed.
@@ -480,6 +621,20 @@ export type AssigneeChangedEventRead = {
    * The timestamp of the event.
    */
   created_at: string
+}
+
+export type AssistantMessage = {
+  content: Array<TextBlock | ThinkingBlock | ToolUseBlock | ToolResultBlock>
+  model: string
+  parent_tool_use_id?: string | null
+  error?:
+    | "authentication_failed"
+    | "billing_error"
+    | "rate_limit"
+    | "invalid_request"
+    | "server_error"
+    | "unknown"
+    | null
 }
 
 /**
@@ -705,52 +860,6 @@ export type Body_workflows_create_workflow = {
    */
   use_workflow_id?: boolean
   file?: (Blob | File) | null
-}
-
-/**
- * @deprecated
- */
-export type BuiltinToolCallEvent = {
-  part: BuiltinToolCallPart
-  event_kind?: "builtin_tool_call"
-}
-
-export type BuiltinToolCallPart = {
-  tool_name: string
-  args?:
-    | string
-    | {
-        [key: string]: unknown
-      }
-    | null
-  tool_call_id?: string
-  id?: string | null
-  provider_details?: {
-    [key: string]: unknown
-  } | null
-  provider_name?: string | null
-  part_kind?: "builtin-tool-call"
-}
-
-/**
- * @deprecated
- */
-export type BuiltinToolResultEvent = {
-  result: BuiltinToolReturnPart
-  event_kind?: "builtin_tool_result"
-}
-
-export type BuiltinToolReturnPart = {
-  tool_name: string
-  content: unknown
-  tool_call_id?: string
-  metadata?: unknown
-  timestamp?: string
-  provider_name?: string | null
-  provider_details?: {
-    [key: string]: unknown
-  } | null
-  part_kind?: "builtin-tool-return"
 }
 
 export type CachePoint = {
@@ -1306,52 +1415,36 @@ export type CaseViewedEventRead = {
 }
 
 /**
- * Request model for creating a new chat.
- */
-export type ChatCreate = {
-  /**
-   * Human-readable title for the chat
-   */
-  title: string
-  /**
-   * Type of entity this chat is associated with
-   */
-  entity_type: ChatEntity
-  /**
-   * ID of the associated entity
-   */
-  entity_id: string
-  /**
-   * Tools available to the agent for this chat
-   */
-  tools?: Array<string> | null
-  /**
-   * Optional agent preset to use for the chat session
-   */
-  agent_preset_id?: string | null
-}
-
-/**
- * The type of entity associated with a chat.
- */
-export type ChatEntity =
-  | "case"
-  | "agent_preset"
-  | "agent_preset_builder"
-  | "copilot"
-
-/**
- * Model for chat metadata with a single message.
+ * Model for a chat message with typed message payload.
+ *
+ * This model supports both regular messages and approval bubbles:
+ * - kind=CHAT_MESSAGE: Contains message field with user/assistant content
+ * - kind=APPROVAL_REQUEST/APPROVAL_DECISION: Contains approval field with approval data
  */
 export type ChatMessage = {
   /**
-   * Unique chat identifier
+   * Unique message identifier
    */
   id: string
   /**
-   * The message from the chat
+   * Message kind for rendering
    */
-  message: ModelRequest | ModelResponse
+  kind?: MessageKind
+  /**
+   * The deserialized message (for kind=CHAT_MESSAGE)
+   */
+  message?:
+    | unknown
+    | UserMessage
+    | AssistantMessage
+    | SystemMessage
+    | ResultMessage
+    | StreamEvent
+    | null
+  /**
+   * Approval data for approval bubble rendering (for kind=APPROVAL_REQUEST/APPROVAL_DECISION)
+   */
+  approval?: ApprovalRead | null
 }
 
 /**
@@ -1383,7 +1476,7 @@ export type ChatRead = {
    */
   tools: Array<string>
   /**
-   * Agent preset associated with the chat, if any
+   * Agent preset used for this chat, if any
    */
   agent_preset_id?: string | null
   /**
@@ -1399,6 +1492,10 @@ export type ChatRead = {
    */
   last_stream_id?: string | null
   /**
+   * Whether this chat is read-only (legacy chats cannot be modified)
+   */
+  is_readonly?: boolean
+  /**
    * Chat messages from Redis stream
    */
   messages?: Array<ChatMessage>
@@ -1406,6 +1503,8 @@ export type ChatRead = {
 
 /**
  * Model for chat metadata without messages.
+ *
+ * Note: Legacy Chat records are read-only (is_readonly=True).
  */
 export type ChatReadMinimal = {
   /**
@@ -1433,7 +1532,7 @@ export type ChatReadMinimal = {
    */
   tools: Array<string>
   /**
-   * Agent preset associated with the chat, if any
+   * Agent preset used for this chat, if any
    */
   agent_preset_id?: string | null
   /**
@@ -1448,6 +1547,10 @@ export type ChatReadMinimal = {
    * Last processed Redis stream ID for this chat
    */
   last_stream_id?: string | null
+  /**
+   * Whether this chat is read-only (legacy chats cannot be modified)
+   */
+  is_readonly?: boolean
 }
 
 /**
@@ -1479,7 +1582,7 @@ export type ChatReadVercel = {
    */
   tools: Array<string>
   /**
-   * Agent preset associated with the chat, if any
+   * Agent preset used for this chat, if any
    */
   agent_preset_id?: string | null
   /**
@@ -1495,27 +1598,13 @@ export type ChatReadVercel = {
    */
   last_stream_id?: string | null
   /**
+   * Whether this chat is read-only (legacy chats cannot be modified)
+   */
+  is_readonly?: boolean
+  /**
    * Chat messages from Redis stream
    */
   messages?: Array<UIMessage>
-}
-
-/**
- * Request model for updating chat properties.
- */
-export type ChatUpdate = {
-  /**
-   * Tools available to the agent
-   */
-  tools?: Array<string> | null
-  /**
-   * Chat title
-   */
-  title?: string | null
-  /**
-   * Agent preset to use for the chat session (set to null for default instructions)
-   */
-  agent_preset_id?: string | null
 }
 
 /**
@@ -1545,6 +1634,10 @@ export type Code = {
 }
 
 export type lang = "yaml" | "python"
+
+export type CollectionObject = {
+  [key: string]: unknown
+}
 
 /**
  * Payload to continue a CE run after collecting approvals.
@@ -1733,6 +1826,20 @@ export type DSLEntrypoint = {
 }
 
 /**
+ * DSL Environment context. Has metadata about the workflow.
+ */
+export type DSLEnvironment = {
+  workflow?: {
+    [key: string]: unknown
+  }
+  environment?: string
+  variables?: {
+    [key: string]: unknown
+  }
+  registry_version?: string
+}
+
+/**
  * DSL definition for a workflow.
  *
  * The difference between this and a normal workflow engine is that here,
@@ -1763,7 +1870,7 @@ export type DSLRunArgs = {
   role: Role
   dsl?: DSLInput | null
   wf_id: string
-  trigger_inputs?: unknown | null
+  trigger_inputs?: InlineObject | ExternalObject | CollectionObject | null
   parent_run_context?: RunContext | null
   /**
    * Runtime configuration that can be set on workflow entry. Note that this can override the default config in DSLInput.
@@ -1777,6 +1884,18 @@ export type DSLRunArgs = {
    * The schedule ID that triggered this workflow, if any. Auto-converts from legacy 'sch-<hex>' format.
    */
   schedule_id?: string | null
+  /**
+   * Execution type (draft or published). Draft executions use draft aliases for child workflows.
+   */
+  execution_type?: ExecutionType
+  /**
+   * The workflow's logical time anchor for FN.now() and related functions. If not provided, computed from TemporalScheduledStartTime (for schedules) or workflow start_time (for other triggers). Stored as UTC.
+   */
+  time_anchor?: string | null
+  /**
+   * Registry version lock for action execution. Contains origins (origin -> version) and actions (action_name -> origin) mappings.
+   */
+  registry_lock?: RegistryLock | null
 }
 
 /**
@@ -1964,25 +2083,41 @@ export type EventGroup_TypeVar_ = {
   related_wf_exec_id?: string | null
 }
 
+/**
+ * Workflow execution context with typed fields.
+ *
+ * ACTIONS and TRIGGER are always present. Other fields are optional since
+ * contexts may be built incrementally during workflow execution.
+ */
+export type ExecutionContext = {
+  ACTIONS: {
+    [key: string]: TaskResult
+  }
+  TRIGGER: InlineObject | ExternalObject | CollectionObject | null
+  ENV?: DSLEnvironment
+  SECRETS?: {
+    [key: string]: unknown
+  }
+  VARS?: {
+    [key: string]: unknown
+  }
+  var?: {
+    [key: string]: unknown
+  }
+}
+
+/**
+ * Execution type for a workflow execution.
+ *
+ * Distinguishes between draft (development) and published (production) executions.
+ */
+export type ExecutionType = "draft" | "published"
+
 export type ExpectedField = {
   type: string
   description?: string | null
   default?: unknown | null
 }
-
-/**
- * Expression contexts.
- */
-export type ExprContext =
-  | "ACTIONS"
-  | "SECRETS"
-  | "VARS"
-  | "FN"
-  | "ENV"
-  | "TRIGGER"
-  | "var"
-  | "inputs"
-  | "steps"
 
 export type ExprType =
   | "generic"
@@ -2024,6 +2159,10 @@ export type ExpressionValidationResponse = {
   tokens?: Array<SyntaxToken>
 }
 
+export type ExternalObject = {
+  [key: string]: unknown
+}
+
 /**
  * Feature flag enum.
  */
@@ -2033,6 +2172,8 @@ export type FeatureFlag =
   | "agent-presets"
   | "case-durations"
   | "case-tasks"
+  | "executor-auth"
+  | "registry-client"
   | "registry-sync-v2"
 
 /**
@@ -2068,16 +2209,6 @@ export type FieldDiff = {
   new: unknown
 }
 
-export type FilePart = {
-  content: BinaryContent
-  id?: string | null
-  provider_name?: string | null
-  provider_details?: {
-    [key: string]: unknown
-  } | null
-  part_kind?: "file"
-}
-
 /**
  * A file part of a message.
  */
@@ -2091,12 +2222,6 @@ export type FileUIPart = {
       [key: string]: unknown
     }
   }
-}
-
-export type FinalResultEvent = {
-  tool_name: string | null
-  tool_call_id: string | null
-  event_kind?: "final_result"
 }
 
 export type Float = {
@@ -2115,28 +2240,6 @@ export type FolderDirectoryItem = {
   updated_at: string
   type: "folder"
   num_items: number
-}
-
-export type FunctionToolCallEvent = {
-  part: ToolCallPart
-  event_kind?: "function_tool_call"
-}
-
-export type FunctionToolResultEvent = {
-  result: ToolReturnPart | RetryPromptPart
-  content?:
-    | string
-    | Array<
-        | string
-        | ImageUrl
-        | AudioUrl
-        | DocumentUrl
-        | VideoUrl
-        | BinaryContent
-        | CachePoint
-      >
-    | null
-  event_kind?: "function_tool_result"
 }
 
 export type GetWorkflowDefinitionActivityInputs = {
@@ -2338,6 +2441,15 @@ export type HTTPValidationError = {
   detail?: Array<ValidationError>
 }
 
+/**
+ * Supported agent harnesses.
+ */
+export type HarnessType = "pydantic-ai" | "claude_code"
+
+export type HealthResponse = {
+  status: string
+}
+
 export type ImageUrl = {
   url: string
   force_download?: boolean
@@ -2381,6 +2493,10 @@ export type InferredColumn = {
    * Inferred SQL type for the column
    */
   field_type: SqlType
+}
+
+export type InlineObject = {
+  [key: string]: unknown
 }
 
 export type Integer = {
@@ -2655,14 +2771,39 @@ export type MCPIntegrationUpdate = {
 }
 
 /**
- * Configuration for an MCP server.
+ * Configuration for a user-defined MCP server.
+ *
+ * Users can connect custom MCP servers to their agents - whether running as
+ * Docker containers, local processes, or remote services. The server must
+ * expose an HTTP or SSE endpoint.
+ *
+ * Example:
+ * {
+ * "name": "internal-tools",
+ * "url": "http://host.docker.internal:8080",
+ * "transport": "http",
+ * "headers": {"Authorization": "Bearer ${{ SECRETS.internal.API_KEY }}"}
+ * }
  */
 export type MCPServerConfig = {
+  name: string
   url: string
-  headers: {
+  headers?: {
     [key: string]: string
   }
+  transport?: "http" | "sse"
 }
+
+export type transport = "http" | "sse"
+
+/**
+ * The type/kind of message stored in the chat.
+ */
+export type MessageKind =
+  | "chat-message"
+  | "approval-request"
+  | "approval-decision"
+  | "internal"
 
 export type ModelConfig = {
   /**
@@ -2708,49 +2849,6 @@ export type ModelCredentialUpdate = {
   }
 }
 
-export type ModelRequest = {
-  parts: Array<
-    SystemPromptPart | UserPromptPart | ToolReturnPart | RetryPromptPart
-  >
-  instructions?: string | null
-  kind?: "request"
-  run_id?: string | null
-  metadata?: {
-    [key: string]: unknown
-  } | null
-}
-
-export type ModelResponse = {
-  parts: Array<
-    | TextPart
-    | ToolCallPart
-    | BuiltinToolCallPart
-    | BuiltinToolReturnPart
-    | ThinkingPart
-    | FilePart
-  >
-  usage?: RequestUsage
-  model_name?: string | null
-  timestamp?: string
-  kind?: "response"
-  provider_name?: string | null
-  provider_details?: {
-    [key: string]: unknown
-  } | null
-  provider_response_id?: string | null
-  finish_reason?:
-    | "stop"
-    | "length"
-    | "content_filter"
-    | "tool_call"
-    | "error"
-    | null
-  run_id?: string | null
-  metadata?: {
-    [key: string]: unknown
-  } | null
-}
-
 export type ModelSecretConfig = {
   required?: Array<string>
   optional?: Array<string>
@@ -2782,6 +2880,14 @@ export type OAuthSettingsUpdate = {
   oauth_google_enabled?: boolean
 }
 
+/**
+ * Create organization request.
+ */
+export type OrgCreate = {
+  name: string
+  slug: string
+}
+
 export type OrgMemberRead = {
   user_id: string
   first_name: string | null
@@ -2792,6 +2898,27 @@ export type OrgMemberRead = {
   is_superuser: boolean
   is_verified: boolean
   last_login_at: string | null
+}
+
+/**
+ * Organization response.
+ */
+export type OrgRead = {
+  id: string
+  name: string
+  slug: string
+  is_active: boolean
+  created_at: string
+  updated_at?: string | null
+}
+
+/**
+ * Update organization request.
+ */
+export type OrgUpdate = {
+  name?: string | null
+  slug?: string | null
+  is_active?: boolean | null
 }
 
 /**
@@ -2825,52 +2952,6 @@ export type OutputType =
       [key: string]: unknown
     }
 
-export type PartDeltaEvent = {
-  index: number
-  delta: TextPartDelta | ThinkingPartDelta | ToolCallPartDelta
-  event_kind?: "part_delta"
-}
-
-export type PartEndEvent = {
-  index: number
-  part:
-    | TextPart
-    | ToolCallPart
-    | BuiltinToolCallPart
-    | BuiltinToolReturnPart
-    | ThinkingPart
-    | FilePart
-  next_part_kind?:
-    | "text"
-    | "thinking"
-    | "tool-call"
-    | "builtin-tool-call"
-    | "builtin-tool-return"
-    | "file"
-    | null
-  event_kind?: "part_end"
-}
-
-export type PartStartEvent = {
-  index: number
-  part:
-    | TextPart
-    | ToolCallPart
-    | BuiltinToolCallPart
-    | BuiltinToolReturnPart
-    | ThinkingPart
-    | FilePart
-  previous_part_kind?:
-    | "text"
-    | "thinking"
-    | "tool-call"
-    | "builtin-tool-call"
-    | "builtin-tool-return"
-    | "file"
-    | null
-  event_kind?: "part_start"
-}
-
 /**
  * Event for when a case payload is changed.
  */
@@ -2888,6 +2969,24 @@ export type PayloadChangedEventRead = {
    * The timestamp of the event.
    */
   created_at: string
+}
+
+/**
+ * Platform registry settings response.
+ */
+export type PlatformRegistrySettingsRead = {
+  git_repo_url?: string | null
+  git_repo_package_name?: string | null
+  git_allowed_domains?: Array<string> | null
+}
+
+/**
+ * Update platform registry settings.
+ */
+export type PlatformRegistrySettingsUpdate = {
+  git_repo_url?: string | null
+  git_repo_package_name?: string | null
+  git_allowed_domains?: Array<string> | null
 }
 
 export type Position = {
@@ -2993,10 +3092,6 @@ export type ProviderMetadata = {
    * Whether this provider requires additional configuration
    */
   requires_config?: boolean
-  /**
-   * Step-by-step instructions for setting up the provider
-   */
-  setup_steps?: Array<string>
   /**
    * Whether this provider is available for use
    */
@@ -3397,6 +3492,24 @@ export type RegistryActionValidationErrorInfo = {
 }
 
 /**
+ * Registry version lock with action-level bindings for O(1) resolution.
+ *
+ * Attributes:
+ * origins: Maps repository origin to pinned version string.
+ * Example: {"tracecat_registry": "2024.12.10.123456"}
+ * actions: Maps action name to its source origin.
+ * Example: {"core.transform.reshape": "tracecat_registry"}
+ */
+export type RegistryLock = {
+  origins: {
+    [key: string]: string
+  }
+  actions: {
+    [key: string]: string
+  }
+}
+
+/**
  * OAuth secret for a provider.
  */
 export type RegistryOAuthSecret_Input = {
@@ -3443,6 +3556,7 @@ export type RegistryRepositoryRead = {
   origin: string
   last_synced_at: string | null
   commit_sha: string | null
+  current_version_id?: string | null
   actions: Array<RegistryActionRead>
 }
 
@@ -3451,6 +3565,7 @@ export type RegistryRepositoryReadMinimal = {
   origin: string
   last_synced_at: string | null
   commit_sha: string | null
+  current_version_id?: string | null
 }
 
 /**
@@ -3492,6 +3607,47 @@ export type RegistrySecretType_Output =
   | RegistryOAuthSecret_Output
 
 /**
+ * Registry health status.
+ */
+export type RegistryStatusResponse = {
+  total_repositories: number
+  last_sync_at: string | null
+  repositories: Array<RepositoryStatus>
+}
+
+/**
+ * Response from sync operation.
+ */
+export type RegistrySyncResponse = {
+  success: boolean
+  synced_at: string
+  repositories: Array<RepositorySyncResult>
+}
+
+/**
+ * Response model for version promotion.
+ */
+export type RegistryVersionPromoteResponse = {
+  repository_id: string
+  origin: string
+  previous_version_id: string | null
+  current_version_id: string
+  version: string
+}
+
+/**
+ * Registry version details.
+ */
+export type RegistryVersionRead = {
+  id: string
+  repository_id: string
+  version: string
+  commit_sha: string | null
+  tarball_uri: string | null
+  created_at: string
+}
+
+/**
  * Event for when a case is reopened.
  */
 export type ReopenedEventRead = {
@@ -3512,17 +3668,27 @@ export type ReopenedEventRead = {
   created_at: string
 }
 
-export type RequestUsage = {
-  input_tokens?: number
-  cache_write_tokens?: number
-  cache_read_tokens?: number
-  output_tokens?: number
-  input_audio_tokens?: number
-  cache_audio_read_tokens?: number
-  output_audio_tokens?: number
-  details?: {
-    [key: string]: number
-  }
+/**
+ * Status of a single repository.
+ */
+export type RepositoryStatus = {
+  id: string
+  name: string
+  origin: string
+  last_synced_at: string | null
+  commit_sha: string | null
+}
+
+/**
+ * Result of syncing a single repository.
+ */
+export type RepositorySyncResult = {
+  repository_id: string
+  repository_name: string
+  success: boolean
+  error?: string | null
+  version?: string | null
+  actions_count?: number | null
 }
 
 /**
@@ -3534,6 +3700,21 @@ export type ResponseInteraction = {
    * The timeout for the interaction in seconds.
    */
   timeout?: number | null
+}
+
+export type ResultMessage = {
+  subtype: string
+  duration_ms: number
+  duration_api_ms: number
+  is_error: boolean
+  num_turns: number
+  session_id: string
+  total_cost_usd?: number | null
+  usage?: {
+    [key: string]: unknown
+  } | null
+  result?: string | null
+  structured_output?: unknown
 }
 
 export type RetryPromptPart = {
@@ -3582,6 +3763,9 @@ export type Role = {
     | "tracecat-bootstrap"
     | "tracecat-cli"
     | "tracecat-executor"
+    | "tracecat-agent-executor"
+    | "tracecat-llm-gateway"
+    | "tracecat-mcp"
     | "tracecat-runner"
     | "tracecat-schedule-runner"
     | "tracecat-service"
@@ -3595,6 +3779,9 @@ export type service_id =
   | "tracecat-bootstrap"
   | "tracecat-cli"
   | "tracecat-executor"
+  | "tracecat-agent-executor"
+  | "tracecat-llm-gateway"
+  | "tracecat-mcp"
   | "tracecat-runner"
   | "tracecat-schedule-runner"
   | "tracecat-service"
@@ -3605,13 +3792,12 @@ export type service_id =
  */
 export type RunActionInput = {
   task: ActionStatement
-  exec_context: {
-    [key: string]: unknown
-  }
+  exec_context: ExecutionContext
   run_context: RunContext
   interaction_context?: InteractionContext | null
   stream_id?: string
   session_id?: string | null
+  registry_lock: RegistryLock
 }
 
 /**
@@ -3622,21 +3808,17 @@ export type RunContext = {
   wf_exec_id: string
   wf_run_id: string
   environment: string
+  logical_time: string
 }
 
+/**
+ * LLM usage associated with an agent run.
+ */
 export type RunUsage = {
-  input_tokens?: number
-  cache_write_tokens?: number
-  cache_read_tokens?: number
-  output_tokens?: number
-  input_audio_tokens?: number
-  cache_audio_read_tokens?: number
-  output_audio_tokens?: number
-  details?: {
-    [key: string]: number
-  }
   requests?: number
   tool_calls?: number
+  input_tokens?: number
+  output_tokens?: number
 }
 
 export type SAMLDatabaseLoginResponse = {
@@ -3752,6 +3934,8 @@ export type ScheduleUpdate = {
  * - `custom`: Arbitrary user-defined types
  * - `token`: A token, e.g. API Key, JWT Token (TBC)
  * - `oauth2`: OAuth2 Client Credentials (TBC)
+ * - `mtls`: TLS client certificate and key
+ * - `ca-cert`: Certificate authority bundle
  */
 export type SecretCreate = {
   type?: SecretType
@@ -3762,6 +3946,18 @@ export type SecretCreate = {
     [key: string]: string
   } | null
   environment?: string
+}
+
+/**
+ * Aggregated secret definition from registry actions.
+ */
+export type SecretDefinition = {
+  name: string
+  keys: Array<string>
+  optional_keys?: Array<string> | null
+  optional?: boolean
+  actions: Array<string>
+  action_count: number
 }
 
 export type SecretKeyValue = {
@@ -3799,7 +3995,12 @@ export type SecretReadMinimal = {
 /**
  * The type of a secret.
  */
-export type SecretType = "custom" | "ssh-key" | "github-app"
+export type SecretType =
+  | "custom"
+  | "ssh-key"
+  | "mtls"
+  | "ca-cert"
+  | "github-app"
 
 /**
  * Update a secret.
@@ -3809,6 +4010,8 @@ export type SecretType = "custom" | "ssh-key" | "github-app"
  * - `custom`: Arbitrary user-defined types
  * - `token`: A token, e.g. API Key, JWT Token (TBC)
  * - `oauth2`: OAuth2 Client Credentials (TBC)
+ * - `mtls`: TLS client certificate and key
+ * - `ca-cert`: Certificate authority bundle
  */
 export type SecretUpdate = {
   type?: SecretType | null
@@ -3962,6 +4165,15 @@ export type StepStartUIPart = {
   type: "step-start"
 }
 
+export type StreamEvent = {
+  uuid: string
+  session_id: string
+  event: {
+    [key: string]: unknown
+  }
+  parent_tool_use_id?: string | null
+}
+
 export type SyntaxToken = {
   type: string
   value: string
@@ -3969,11 +4181,11 @@ export type SyntaxToken = {
   end: number
 }
 
-export type SystemPromptPart = {
-  content: string
-  timestamp?: string
-  dynamic_ref?: string | null
-  part_kind?: "system-prompt"
+export type SystemMessage = {
+  subtype: string
+  data: {
+    [key: string]: unknown
+  }
 }
 
 /**
@@ -4295,6 +4507,24 @@ export type TaskPriorityChangedEventRead = {
 }
 
 /**
+ * Result of executing a DSL node.
+ *
+ * With uniform envelope design, `result` is always a StoredObject:
+ * - InlineObject when data is small or externalization is disabled
+ * - ExternalObject when data is large and externalization is enabled
+ */
+export type TaskResult = {
+  result: InlineObject | ExternalObject | CollectionObject
+  result_typename: string
+  error?: unknown | null
+  error_typename?: string | null
+  interaction?: unknown | null
+  interaction_id?: string | null
+  interaction_type?: string | null
+  collection_index?: number | null
+}
+
+/**
  * Event for when a task status is changed.
  */
 export type TaskStatusChangedEventRead = {
@@ -4497,21 +4727,8 @@ export type TextArea = {
   placeholder?: string
 }
 
-export type TextPart = {
-  content: string
-  id?: string | null
-  provider_details?: {
-    [key: string]: unknown
-  } | null
-  part_kind?: "text"
-}
-
-export type TextPartDelta = {
-  content_delta: string
-  provider_details?: {
-    [key: string]: unknown
-  } | null
-  part_delta_kind?: "text"
+export type TextBlock = {
+  text: string
 }
 
 /**
@@ -4528,25 +4745,9 @@ export type TextUIPart = {
   }
 }
 
-export type ThinkingPart = {
-  content: string
-  id?: string | null
-  signature?: string | null
-  provider_name?: string | null
-  provider_details?: {
-    [key: string]: unknown
-  } | null
-  part_kind?: "thinking"
-}
-
-export type ThinkingPartDelta = {
-  content_delta?: string | null
-  signature_delta?: string | null
-  provider_name?: string | null
-  provider_details?: {
-    [key: string]: unknown
-  } | null
-  part_delta_kind?: "thinking"
+export type ThinkingBlock = {
+  thinking: string
+  signature: string
 }
 
 export type Toggle = {
@@ -4562,40 +4763,20 @@ export type ToolApproved = {
   kind?: "tool-approved"
 }
 
-export type ToolCallPart = {
-  tool_name: string
-  args?:
-    | string
-    | {
-        [key: string]: unknown
-      }
-    | null
-  tool_call_id?: string
-  id?: string | null
-  provider_details?: {
-    [key: string]: unknown
-  } | null
-  part_kind?: "tool-call"
-}
-
-export type ToolCallPartDelta = {
-  tool_name_delta?: string | null
-  args_delta?:
-    | string
-    | {
-        [key: string]: unknown
-      }
-    | null
-  tool_call_id?: string | null
-  provider_details?: {
-    [key: string]: unknown
-  } | null
-  part_delta_kind?: "tool_call"
-}
-
 export type ToolDenied = {
   message?: string
   kind?: "tool-denied"
+}
+
+export type ToolResultBlock = {
+  tool_use_id: string
+  content?:
+    | string
+    | Array<{
+        [key: string]: unknown
+      }>
+    | null
+  is_error?: boolean | null
 }
 
 export type ToolReturn = {
@@ -4614,15 +4795,6 @@ export type ToolReturn = {
     | null
   metadata?: unknown
   kind?: "tool-return"
-}
-
-export type ToolReturnPart = {
-  tool_name: string
-  content: unknown
-  tool_call_id?: string
-  metadata?: unknown
-  timestamp?: string
-  part_kind?: "tool-return"
 }
 
 export type ToolUIPartInputAvailable = {
@@ -4679,6 +4851,14 @@ export type ToolUIPartOutputError = {
     [key: string]: {
       [key: string]: unknown
     }
+  }
+}
+
+export type ToolUseBlock = {
+  id: string
+  name: string
+  input: {
+    [key: string]: unknown
   }
 }
 
@@ -4758,20 +4938,12 @@ export type UserCreate = {
   last_name?: string | null
 }
 
-export type UserPromptPart = {
+export type UserMessage = {
   content:
     | string
-    | Array<
-        | string
-        | ImageUrl
-        | AudioUrl
-        | DocumentUrl
-        | VideoUrl
-        | BinaryContent
-        | CachePoint
-      >
-  timestamp?: string
-  part_kind?: "user-prompt"
+    | Array<TextBlock | ThinkingBlock | ToolUseBlock | ToolResultBlock>
+  uuid?: string | null
+  parent_tool_use_id?: string | null
 }
 
 export type UserRead = {
@@ -4786,14 +4958,6 @@ export type UserRead = {
   settings: {
     [key: string]: unknown
   }
-}
-
-export type UserReadMinimal = {
-  id: string
-  email: string
-  role: UserRole
-  first_name?: string | null
-  last_name?: string | null
 }
 
 export type UserRole = "basic" | "admin"
@@ -5087,6 +5251,10 @@ export type WorkflowEventType =
 export type WorkflowExecutionCreate = {
   workflow_id: string
   inputs?: unknown | null
+  /**
+   * Override the workflow's time anchor for FN.now() and related functions. If not provided, computed from TemporalScheduledStartTime (for schedules) or workflow start_time (for other triggers).
+   */
+  time_anchor?: string | null
 }
 
 export type WorkflowExecutionCreateResponse = {
@@ -5181,6 +5349,10 @@ export type WorkflowExecutionRead = {
   parent_wf_exec_id?: string | null
   trigger_type: TriggerType
   /**
+   * Execution type (draft or published). Draft uses the draft workflow graph.
+   */
+  execution_type?: ExecutionType
+  /**
    * The events in the workflow execution
    */
   events: Array<WorkflowExecutionEvent>
@@ -5237,6 +5409,10 @@ export type WorkflowExecutionReadCompact_Any__Union_AgentOutput__Any___Any_ = {
   parent_wf_exec_id?: string | null
   trigger_type: TriggerType
   /**
+   * Execution type (draft or published). Draft uses the draft workflow graph.
+   */
+  execution_type?: ExecutionType
+  /**
    * Compact events in the workflow execution
    */
   events: Array<WorkflowExecutionEventCompact_Any__Union_AgentOutput__Any___Any_>
@@ -5283,6 +5459,10 @@ export type WorkflowExecutionReadMinimal = {
   history_length: number
   parent_wf_exec_id?: string | null
   trigger_type: TriggerType
+  /**
+   * Execution type (draft or published). Draft uses the draft workflow graph.
+   */
+  execution_type?: ExecutionType
 }
 
 /**
@@ -5373,12 +5553,6 @@ export type WorkflowReadMinimal = {
   folder_id?: string | null
 }
 
-export type WorkflowSummary = {
-  id: string
-  title: string
-  alias?: string | null
-}
-
 /**
  * Request model for pulling workflows from a Git repository.
  */
@@ -5422,7 +5596,7 @@ export type WorkflowUpdate = {
 export type WorkspaceCreate = {
   name: string
   settings?: WorkspaceSettingsUpdate | null
-  organization_id?: string
+  organization_id?: string | null
 }
 
 export type WorkspaceMember = {
@@ -5560,6 +5734,14 @@ export type PublicIncomingWebhookWaitData = {
 }
 
 export type PublicIncomingWebhookWaitResponse = unknown
+
+export type PublicIncomingWebhookDraftData = {
+  contentType?: string | null
+  secret: string
+  workflowId: string
+}
+
+export type PublicIncomingWebhookDraftResponse = unknown
 
 export type PublicReceiveInteractionData = {
   category: InteractionCategory
@@ -5848,6 +6030,14 @@ export type WorkflowExecutionsGetWorkflowExecutionCompactData = {
 export type WorkflowExecutionsGetWorkflowExecutionCompactResponse =
   WorkflowExecutionReadCompact_Any__Union_AgentOutput__Any___Any_
 
+export type WorkflowExecutionsCreateDraftWorkflowExecutionData = {
+  requestBody: WorkflowExecutionCreate
+  workspaceId: string
+}
+
+export type WorkflowExecutionsCreateDraftWorkflowExecutionResponse =
+  WorkflowExecutionCreateResponse
+
 export type WorkflowExecutionsCancelWorkflowExecutionData = {
   executionId: string
   workspaceId: string
@@ -5997,6 +6187,12 @@ export type SecretsCreateSecretData = {
 }
 
 export type SecretsCreateSecretResponse = unknown
+
+export type SecretsListSecretDefinitionsData = {
+  workspaceId: string
+}
+
+export type SecretsListSecretDefinitionsResponse = Array<SecretDefinition>
 
 export type SecretsGetSecretByNameData = {
   secretName: string
@@ -6284,31 +6480,164 @@ export type AgentPresetsGetAgentPresetBySlugData = {
 
 export type AgentPresetsGetAgentPresetBySlugResponse = AgentPresetRead
 
-export type AgentListAgentSessionsData = {
+export type AgentSessionsCreateSessionData = {
+  requestBody: AgentSessionCreate
   workspaceId: string
 }
 
-export type AgentListAgentSessionsResponse = Array<AgentSessionRead>
+export type AgentSessionsCreateSessionResponse = AgentSessionRead
 
-export type AgentStreamAgentSessionData = {
+export type AgentSessionsListSessionsData = {
+  /**
+   * Filter by entity ID
+   */
+  entityId?: string | null
+  /**
+   * Filter by entity type
+   */
+  entityType?: AgentSessionEntity | null
+  /**
+   * Maximum number of sessions to return
+   */
+  limit?: number
+  workspaceId: string
+}
+
+export type AgentSessionsListSessionsResponse = Array<
+  AgentSessionRead | ChatReadMinimal
+>
+
+export type AgentSessionsGetSessionData = {
+  sessionId: string
+  workspaceId: string
+}
+
+export type AgentSessionsGetSessionResponse =
+  | AgentSessionReadWithMessages
+  | ChatRead
+
+export type AgentSessionsUpdateSessionData = {
+  requestBody: AgentSessionUpdate
+  sessionId: string
+  workspaceId: string
+}
+
+export type AgentSessionsUpdateSessionResponse = AgentSessionRead
+
+export type AgentSessionsDeleteSessionData = {
+  sessionId: string
+  workspaceId: string
+}
+
+export type AgentSessionsDeleteSessionResponse = void
+
+export type AgentSessionsGetSessionVercelData = {
+  sessionId: string
+  workspaceId: string
+}
+
+export type AgentSessionsGetSessionVercelResponse =
+  | AgentSessionReadVercel
+  | ChatReadVercel
+
+export type AgentSessionsSendMessageData = {
+  requestBody: VercelChatRequest | ContinueRunRequest
+  sessionId: string
+  workspaceId: string
+}
+
+export type AgentSessionsSendMessageResponse = unknown
+
+export type AgentSessionsStreamSessionEventsData = {
   /**
    * Streaming format (e.g. 'vercel')
    */
   format?: "vercel" | "basic"
-  lastEventId?: string
   sessionId: string
   workspaceId: string
 }
 
-export type AgentStreamAgentSessionResponse = unknown
+export type AgentSessionsStreamSessionEventsResponse = unknown
 
-export type AgentSubmitAgentApprovalsData = {
-  requestBody: AgentApprovalSubmission
+export type ApprovalsSubmitApprovalsData = {
+  requestBody: ApprovalSubmission
   sessionId: string
   workspaceId: string
 }
 
-export type AgentSubmitAgentApprovalsResponse = void
+export type ApprovalsSubmitApprovalsResponse = void
+
+export type AdminListOrganizationsResponse = Array<OrgRead>
+
+export type AdminCreateOrganizationData = {
+  requestBody: OrgCreate
+}
+
+export type AdminCreateOrganizationResponse = OrgRead
+
+export type AdminGetOrganizationData = {
+  orgId: string
+}
+
+export type AdminGetOrganizationResponse = OrgRead
+
+export type AdminUpdateOrganizationData = {
+  orgId: string
+  requestBody: OrgUpdate
+}
+
+export type AdminUpdateOrganizationResponse = OrgRead
+
+export type AdminDeleteOrganizationData = {
+  orgId: string
+}
+
+export type AdminDeleteOrganizationResponse = void
+
+export type AdminSyncAllRepositoriesResponse = RegistrySyncResponse
+
+export type AdminSyncRepositoryData = {
+  repositoryId: string
+}
+
+export type AdminSyncRepositoryResponse = RegistrySyncResponse
+
+export type AdminGetRegistryStatusResponse = RegistryStatusResponse
+
+export type AdminListRegistryVersionsData = {
+  limit?: number
+  repositoryId?: string | null
+}
+
+export type AdminListRegistryVersionsResponse = Array<RegistryVersionRead>
+
+export type AdminGetRegistrySettingsResponse = PlatformRegistrySettingsRead
+
+export type AdminUpdateRegistrySettingsData = {
+  requestBody: PlatformRegistrySettingsUpdate
+}
+
+export type AdminUpdateRegistrySettingsResponse = PlatformRegistrySettingsRead
+
+export type AdminListUsersResponse = Array<AdminUserRead>
+
+export type AdminGetUserData = {
+  userId: string
+}
+
+export type AdminGetUserResponse = AdminUserRead
+
+export type AdminPromoteToSuperuserData = {
+  userId: string
+}
+
+export type AdminPromoteToSuperuserResponse = AdminUserRead
+
+export type AdminDemoteFromSuperuserData = {
+  userId: string
+}
+
+export type AdminDemoteFromSuperuserResponse = AdminUserRead
 
 export type EditorListFunctionsData = {
   workspaceId: string
@@ -6380,6 +6709,14 @@ export type RegistryRepositoriesListRepositoryCommitsData = {
 
 export type RegistryRepositoriesListRepositoryCommitsResponse =
   Array<GitCommitInfo>
+
+export type RegistryRepositoriesPromoteRegistryVersionData = {
+  repositoryId: string
+  versionId: string
+}
+
+export type RegistryRepositoriesPromoteRegistryVersionResponse =
+  RegistryVersionPromoteResponse
 
 export type RegistryActionsListRegistryActionsResponse =
   Array<RegistryActionReadMinimal>
@@ -7044,81 +7381,6 @@ export type CaseDurationsDeleteCaseDurationData = {
 
 export type CaseDurationsDeleteCaseDurationResponse = void
 
-export type ChatCreateChatData = {
-  requestBody: ChatCreate
-  workspaceId: string
-}
-
-export type ChatCreateChatResponse = ChatReadMinimal
-
-export type ChatListChatsData = {
-  /**
-   * Filter by entity ID
-   */
-  entityId?: string | null
-  /**
-   * Filter by entity type
-   */
-  entityType?: string | null
-  /**
-   * Maximum number of chats to return
-   */
-  limit?: number
-  workspaceId: string
-}
-
-export type ChatListChatsResponse = Array<ChatReadMinimal>
-
-export type ChatGetChatData = {
-  chatId: string
-  workspaceId: string
-}
-
-export type ChatGetChatResponse = ChatRead
-
-export type ChatUpdateChatData = {
-  chatId: string
-  requestBody: ChatUpdate
-  workspaceId: string
-}
-
-export type ChatUpdateChatResponse = ChatReadMinimal
-
-export type ChatGetChatVercelData = {
-  chatId: string
-  workspaceId: string
-}
-
-export type ChatGetChatVercelResponse = ChatReadVercel
-
-export type ChatChatWithVercelStreamingData = {
-  chatId: string
-  requestBody: VercelChatRequest | ContinueRunRequest
-  workspaceId: string
-}
-
-export type ChatChatWithVercelStreamingResponse = unknown
-
-export type ChatStreamChatEventsData = {
-  chatId: string
-  /**
-   * Streaming format (e.g. 'vercel')
-   */
-  format?: "vercel" | "basic"
-  workspaceId: string
-}
-
-export type ChatStreamChatEventsResponse = Array<
-  | PartStartEvent
-  | PartDeltaEvent
-  | PartEndEvent
-  | FinalResultEvent
-  | FunctionToolCallEvent
-  | FunctionToolResultEvent
-  | BuiltinToolCallEvent
-  | BuiltinToolResultEvent
->
-
 export type FoldersGetDirectoryData = {
   /**
    * Folder path
@@ -7425,13 +7687,9 @@ export type AuthSsoAcsData = {
 
 export type AuthSsoAcsResponse = unknown
 
-export type PublicCheckHealthResponse = {
-  [key: string]: string
-}
+export type PublicCheckHealthResponse = HealthResponse
 
-export type PublicCheckReadyResponse = {
-  [key: string]: string
-}
+export type PublicCheckReadyResponse = HealthResponse
 
 export type $OpenApiTs = {
   "/webhooks/{workflow_id}/{secret}": {
@@ -7465,6 +7723,21 @@ export type $OpenApiTs = {
   "/webhooks/{workflow_id}/{secret}/wait": {
     post: {
       req: PublicIncomingWebhookWaitData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: unknown
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/webhooks/{workflow_id}/{secret}/draft": {
+    post: {
+      req: PublicIncomingWebhookDraftData
       res: {
         /**
          * Successful Response
@@ -7997,6 +8270,21 @@ export type $OpenApiTs = {
       }
     }
   }
+  "/workflow-executions/draft": {
+    post: {
+      req: WorkflowExecutionsCreateDraftWorkflowExecutionData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: WorkflowExecutionCreateResponse
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
   "/workflow-executions/{execution_id}/cancel": {
     post: {
       req: WorkflowExecutionsCancelWorkflowExecutionData
@@ -8235,6 +8523,21 @@ export type $OpenApiTs = {
          * Successful Response
          */
         201: unknown
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/secrets/definitions": {
+    get: {
+      req: SecretsListSecretDefinitionsData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: Array<SecretDefinition>
         /**
          * Validation Error
          */
@@ -8837,13 +9140,26 @@ export type $OpenApiTs = {
     }
   }
   "/agent/sessions": {
-    get: {
-      req: AgentListAgentSessionsData
+    post: {
+      req: AgentSessionsCreateSessionData
       res: {
         /**
          * Successful Response
          */
-        200: Array<AgentSessionRead>
+        200: AgentSessionRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+    get: {
+      req: AgentSessionsListSessionsData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: Array<AgentSessionRead | ChatReadMinimal>
         /**
          * Validation Error
          */
@@ -8853,7 +9169,63 @@ export type $OpenApiTs = {
   }
   "/agent/sessions/{session_id}": {
     get: {
-      req: AgentStreamAgentSessionData
+      req: AgentSessionsGetSessionData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: AgentSessionReadWithMessages | ChatRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+    patch: {
+      req: AgentSessionsUpdateSessionData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: AgentSessionRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+    delete: {
+      req: AgentSessionsDeleteSessionData
+      res: {
+        /**
+         * Successful Response
+         */
+        204: void
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/agent/sessions/{session_id}/vercel": {
+    get: {
+      req: AgentSessionsGetSessionVercelData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: AgentSessionReadVercel | ChatReadVercel
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/agent/sessions/{session_id}/messages": {
+    post: {
+      req: AgentSessionsSendMessageData
       res: {
         /**
          * Successful Response
@@ -8866,14 +9238,221 @@ export type $OpenApiTs = {
       }
     }
   }
-  "/agent/sessions/{session_id}/approvals": {
+  "/agent/sessions/{session_id}/stream": {
+    get: {
+      req: AgentSessionsStreamSessionEventsData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: unknown
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/approvals/{session_id}": {
     post: {
-      req: AgentSubmitAgentApprovalsData
+      req: ApprovalsSubmitApprovalsData
       res: {
         /**
          * Successful Response
          */
         204: void
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/admin/organizations": {
+    get: {
+      res: {
+        /**
+         * Successful Response
+         */
+        200: Array<OrgRead>
+      }
+    }
+    post: {
+      req: AdminCreateOrganizationData
+      res: {
+        /**
+         * Successful Response
+         */
+        201: OrgRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/admin/organizations/{org_id}": {
+    get: {
+      req: AdminGetOrganizationData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: OrgRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+    patch: {
+      req: AdminUpdateOrganizationData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: OrgRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+    delete: {
+      req: AdminDeleteOrganizationData
+      res: {
+        /**
+         * Successful Response
+         */
+        204: void
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/admin/registry/sync": {
+    post: {
+      res: {
+        /**
+         * Successful Response
+         */
+        200: RegistrySyncResponse
+      }
+    }
+  }
+  "/admin/registry/sync/{repository_id}": {
+    post: {
+      req: AdminSyncRepositoryData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: RegistrySyncResponse
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/admin/registry/status": {
+    get: {
+      res: {
+        /**
+         * Successful Response
+         */
+        200: RegistryStatusResponse
+      }
+    }
+  }
+  "/admin/registry/versions": {
+    get: {
+      req: AdminListRegistryVersionsData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: Array<RegistryVersionRead>
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/admin/settings/registry": {
+    get: {
+      res: {
+        /**
+         * Successful Response
+         */
+        200: PlatformRegistrySettingsRead
+      }
+    }
+    patch: {
+      req: AdminUpdateRegistrySettingsData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: PlatformRegistrySettingsRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/admin/users": {
+    get: {
+      res: {
+        /**
+         * Successful Response
+         */
+        200: Array<AdminUserRead>
+      }
+    }
+  }
+  "/admin/users/{user_id}": {
+    get: {
+      req: AdminGetUserData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: AdminUserRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/admin/users/{user_id}/promote": {
+    post: {
+      req: AdminPromoteToSuperuserData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: AdminUserRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/admin/users/{user_id}/demote": {
+    post: {
+      req: AdminDemoteFromSuperuserData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: AdminUserRead
         /**
          * Validation Error
          */
@@ -9041,6 +9620,21 @@ export type $OpenApiTs = {
          * Successful Response
          */
         200: Array<GitCommitInfo>
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/registry/repos/{repository_id}/versions/{version_id}/promote": {
+    post: {
+      req: RegistryRepositoriesPromoteRegistryVersionData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: RegistryVersionPromoteResponse
         /**
          * Validation Error
          */
@@ -10130,114 +10724,6 @@ export type $OpenApiTs = {
       }
     }
   }
-  "/chat": {
-    post: {
-      req: ChatCreateChatData
-      res: {
-        /**
-         * Successful Response
-         */
-        200: ChatReadMinimal
-        /**
-         * Validation Error
-         */
-        422: HTTPValidationError
-      }
-    }
-    get: {
-      req: ChatListChatsData
-      res: {
-        /**
-         * Successful Response
-         */
-        200: Array<ChatReadMinimal>
-        /**
-         * Validation Error
-         */
-        422: HTTPValidationError
-      }
-    }
-  }
-  "/chat/{chat_id}": {
-    get: {
-      req: ChatGetChatData
-      res: {
-        /**
-         * Successful Response
-         */
-        200: ChatRead
-        /**
-         * Validation Error
-         */
-        422: HTTPValidationError
-      }
-    }
-    patch: {
-      req: ChatUpdateChatData
-      res: {
-        /**
-         * Successful Response
-         */
-        200: ChatReadMinimal
-        /**
-         * Validation Error
-         */
-        422: HTTPValidationError
-      }
-    }
-  }
-  "/chat/{chat_id}/vercel": {
-    get: {
-      req: ChatGetChatVercelData
-      res: {
-        /**
-         * Successful Response
-         */
-        200: ChatReadVercel
-        /**
-         * Validation Error
-         */
-        422: HTTPValidationError
-      }
-    }
-    post: {
-      req: ChatChatWithVercelStreamingData
-      res: {
-        /**
-         * Successful Response
-         */
-        200: unknown
-        /**
-         * Validation Error
-         */
-        422: HTTPValidationError
-      }
-    }
-  }
-  "/chat/{chat_id}/stream": {
-    get: {
-      req: ChatStreamChatEventsData
-      res: {
-        /**
-         * Successful Response
-         */
-        200: Array<
-          | PartStartEvent
-          | PartDeltaEvent
-          | PartEndEvent
-          | FinalResultEvent
-          | FunctionToolCallEvent
-          | FunctionToolResultEvent
-          | BuiltinToolCallEvent
-          | BuiltinToolResultEvent
-        >
-        /**
-         * Validation Error
-         */
-        422: HTTPValidationError
-      }
-    }
-  }
   "/folders/directory": {
     get: {
       req: FoldersGetDirectoryData
@@ -10953,9 +11439,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        200: {
-          [key: string]: string
-        }
+        200: HealthResponse
       }
     }
   }
@@ -10965,9 +11449,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        200: {
-          [key: string]: string
-        }
+        200: HealthResponse
       }
     }
   }

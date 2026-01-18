@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from collections import deque
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from tempfile import SpooledTemporaryFile
-from typing import Any, Self, cast
+from typing import Any, Literal, NotRequired, Self, TypedDict
 
 import orjson
 import temporalio.api.common.v1
@@ -15,6 +15,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    TypeAdapter,
     ValidationError,
     field_validator,
     model_validator,
@@ -43,8 +44,8 @@ from tracecat.dsl.schemas import (
     ExecutionContext,
     RunContext,
     StreamID,
+    TaskResult,
     Trigger,
-    TriggerInputs,
 )
 from tracecat.dsl.view import (
     NodeVariant,
@@ -65,15 +66,41 @@ from tracecat.expressions.common import ExprContext
 from tracecat.expressions.core import extract_expressions
 from tracecat.expressions.expectations import ExpectedField
 from tracecat.identifiers import ActionID
-from tracecat.identifiers.action import ActionUUID
 from tracecat.identifiers.schedules import ScheduleUUID
 from tracecat.identifiers.workflow import AnyWorkflowID, WorkflowUUID
 from tracecat.interactions.schemas import ActionInteractionValidator
 from tracecat.logger import logger
+from tracecat.registry.lock.types import RegistryLock
+from tracecat.storage.object import CollectionObject, InlineObject, StoredObject
 from tracecat.workflow.actions.schemas import ActionControlFlow
-from tracecat.workflow.executions.enums import TemporalSearchAttr, TriggerType
+from tracecat.workflow.executions.enums import (
+    ExecutionType,
+    TemporalSearchAttr,
+    TriggerType,
+)
 
 _memo_payload_converter = PydanticPayloadConverter()
+
+
+class UpstreamEdgeData(TypedDict):
+    """Type definition for upstream edge data stored in Action.upstream_edges.
+
+    This represents a single edge connecting a source node to a target action.
+    The source_id is required, while source_type and source_handle are optional.
+    """
+
+    source_id: str
+    """The ID of the source node (action UUID or trigger ID)."""
+
+    source_type: NotRequired[Literal["trigger", "udf"]]
+    """The type of the source node."""
+
+    source_handle: NotRequired[Literal["success", "error"]]
+    """The edge type, defaults to 'success' if not specified."""
+
+
+UpstreamEdgeDataValidator = TypeAdapter(UpstreamEdgeData)
+"""TypeAdapter for validating upstream edge data at runtime."""
 
 
 class DSLEntrypoint(BaseModel):
@@ -441,11 +468,28 @@ class DSLInput(BaseModel):
             raise e
 
 
+class SubflowContext(BaseModel):
+    """Shared context for child workflow execution (prepared once).
+
+    Contains workflow definition and execution context that is shared across
+    all iterations in a loop. Per-iteration config (environment, timeout) is
+    resolved separately via ResolvedSubflowBatch.
+    """
+
+    wf_id: WorkflowUUID
+    dsl: DSLInput
+    registry_lock: RegistryLock | None = None
+    run_context: RunContext
+    execution_type: ExecutionType
+    time_anchor: datetime
+    batch_size: int
+
+
 class DSLRunArgs(BaseModel):
     role: Role
     dsl: DSLInput | None = None
     wf_id: WorkflowUUID
-    trigger_inputs: TriggerInputs | None = None
+    trigger_inputs: StoredObject | None = None
     parent_run_context: RunContext | None = None
     runtime_config: DSLConfig = Field(
         default_factory=DSLConfig,
@@ -463,6 +507,22 @@ class DSLRunArgs(BaseModel):
         default=None,
         description="The schedule ID that triggered this workflow, if any. Auto-converts from legacy 'sch-<hex>' format.",
     )
+    execution_type: ExecutionType = Field(
+        default=ExecutionType.PUBLISHED,
+        description="Execution type (draft or published). Draft executions use draft aliases for child workflows.",
+    )
+    time_anchor: datetime | None = Field(
+        default=None,
+        description=(
+            "The workflow's logical time anchor for FN.now() and related functions. "
+            "If not provided, computed from TemporalScheduledStartTime (for schedules) "
+            "or workflow start_time (for other triggers). Stored as UTC."
+        ),
+    )
+    registry_lock: RegistryLock | None = Field(
+        default=None,
+        description="Registry version lock for action execution. Contains origins (origin -> version) and actions (action_name -> origin) mappings.",
+    )
 
     @field_validator("wf_id", mode="before")
     @classmethod
@@ -471,10 +531,9 @@ class DSLRunArgs(BaseModel):
         return WorkflowUUID.new(v)
 
 
-class ExecuteChildWorkflowArgs(BaseModel):
+class _BaseSubflowArgs(BaseModel):
     workflow_id: WorkflowUUID | None = None
     workflow_alias: str | None = None
-    trigger_inputs: TriggerInputs | None = None
     environment: str | None = None
     version: int | None = None
     loop_strategy: LoopStrategy = LoopStrategy.BATCH
@@ -482,6 +541,10 @@ class ExecuteChildWorkflowArgs(BaseModel):
     fail_strategy: FailStrategy = FailStrategy.ISOLATED
     timeout: float | None = None
     wait_strategy: WaitStrategy = WaitStrategy.WAIT
+    time_anchor: datetime | None = Field(
+        default=None,
+        description="Override time anchor for subflow. If None, inherits from parent.",
+    )
 
     @model_validator(mode="after")
     def validate_workflow_id_or_alias(self) -> Self:
@@ -503,6 +566,137 @@ class ExecuteChildWorkflowArgs(BaseModel):
     def validate_workflow_id(cls, v: AnyWorkflowID) -> WorkflowUUID:
         """Convert any valid workflow ID format to WorkflowUUID."""
         return WorkflowUUID.new(v)
+
+
+class ExecuteSubflowArgs(_BaseSubflowArgs):
+    """Action arguments for executing a subflow. Use to validate user-provided subflow arguments."""
+
+    trigger_inputs: Any | None = None
+    """The unresolved trigger inputs for the subflow."""
+
+
+class ResolvedSubflowInput(_BaseSubflowArgs):
+    """Input for executing a subflow."""
+
+    trigger_inputs: StoredObject | None = None
+    ref_index: int | None = None
+
+
+class ResolvedSubflowConfig(BaseModel):
+    """Per-iteration DSL config for subflow execution.
+
+    Contains only the DSL primitives that can be overridden per iteration
+    via var expressions (e.g., environment: ${{ var.item.env }}).
+    """
+
+    environment: str | None = None
+    timeout: float | None = None
+
+
+class ResolvedSubflowBatch(BaseModel):
+    """Per-batch resolved args for looped subflow execution.
+
+    Separates DSL config (small, can be inlined) from trigger_inputs
+    (each stored as individual StoredObject for direct passing to child workflows).
+
+    The configs field is optimized: if all iterations share the same config
+    (no var expressions in DSL primitives), a single config is returned.
+    Otherwise, a list matching trigger_inputs length is returned.
+    """
+
+    configs: ResolvedSubflowConfig | list[ResolvedSubflowConfig]
+    trigger_inputs: list[StoredObject]
+    """Each item is the trigger_inputs for one iteration, stored as StoredObject."""
+
+    @model_validator(mode="after")
+    def validate_configs_length(self) -> Self:
+        if isinstance(self.configs, list):
+            if len(self.configs) != len(self.trigger_inputs):
+                raise ValueError(
+                    f"configs length ({len(self.configs)}) must match "
+                    f"trigger_inputs length ({len(self.trigger_inputs)})"
+                )
+        return self
+
+    def get_config(self, index: int) -> ResolvedSubflowConfig:
+        """Get config for iteration, handling shared vs per-iteration."""
+        if isinstance(self.configs, list):
+            return self.configs[index]
+        return self.configs
+
+    @property
+    def count(self) -> int:
+        """Number of iterations in this batch."""
+        return len(self.trigger_inputs)
+
+
+MAX_LOOP_ITERATIONS = 4096
+
+
+class PreparedSubflowResult(BaseModel):
+    """Result of prepare_subflow_activity containing all data needed to spawn child workflows.
+
+    For single subflows: trigger_inputs/runtime_configs are None, evaluate separately.
+    For looped subflows: trigger_inputs is stored collection, runtime_configs uses T|list[T].
+    """
+
+    wf_id: WorkflowUUID
+    """Resolved workflow ID (from alias or direct)."""
+
+    dsl: DSLInput
+    """Workflow definition."""
+
+    registry_lock: RegistryLock | None = None
+    """Frozen dependency versions. May be None for workflows without locks."""
+
+    trigger_inputs: StoredObject | None = None
+    """For loops: CollectionObject or InlineObject containing trigger_inputs list."""
+
+    runtime_configs: DSLConfig | list[DSLConfig] | None = None
+    """For loops: T|list[T] optimized configs. None for single subflow."""
+
+    @property
+    def count(self) -> int:
+        """Number of iterations (1 for single subflow, N for loops)."""
+        match self.trigger_inputs:
+            case None:
+                return 1
+            case CollectionObject() as col:
+                return col.count
+            case InlineObject(data=data) if isinstance(data, list):
+                return len(data)
+            case _:
+                raise TypeError(
+                    f"Expected CollectionObject or InlineObject with list, "
+                    f"got {type(self.trigger_inputs).__name__}"
+                )
+
+    def get_trigger_input_at(self, index: int) -> StoredObject | None:
+        """Get trigger_inputs for a specific iteration.
+
+        For CollectionObject: returns a handle pointing to the indexed item.
+        For InlineObject: extracts the item and wraps in InlineObject.
+        """
+        match self.trigger_inputs:
+            case None:
+                return None
+            case CollectionObject() as col:
+                return col.at(index)
+            case InlineObject(data=data) if isinstance(data, list):
+                return InlineObject(data=data[index])
+            case _:
+                raise TypeError(
+                    f"Expected CollectionObject or InlineObject with list, "
+                    f"got {type(self.trigger_inputs).__name__}"
+                )
+
+    def get_config(self, index: int) -> DSLConfig:
+        """Get runtime config for iteration, handling T|list[T] optimization."""
+        if self.runtime_configs is None:
+            return self.dsl.config
+        if isinstance(self.runtime_configs, list):
+            return self.runtime_configs[index]
+        return self.runtime_configs
 
 
 class AgentActionMemo(BaseModel):
@@ -611,96 +805,6 @@ def context_locator(
     return f"{ctx}.{stmt.ref} -> {loc}"
 
 
-def _normalize_action_id(raw_id: str | ActionID) -> ActionUUID:
-    """Normalize a raw action ID to an ActionUUID.
-
-    Handles all supported action ID formats:
-    - UUID string: "550e8400-e29b-41d4-a716-446655440000"
-    - Short ID: "act_xxx"
-    - Legacy prefixed: "act-550e8400e29b41d4a716446655440000"
-    - UUID object (ActionID)
-
-    Args:
-        raw_id: The raw action ID from the graph (string or UUID).
-
-    Returns:
-        ActionUUID: The normalized ActionUUID instance.
-
-    Raises:
-        TracecatValidationError: If the ID format is invalid.
-    """
-    try:
-        return ActionUUID.new(raw_id)
-    except ValueError as e:
-        raise TracecatValidationError(
-            f"Invalid action ID in workflow graph: {raw_id!r}"
-        ) from e
-
-
-def build_action_statements(
-    graph: RFGraph, actions: list[Action]
-) -> list[ActionStatement]:
-    """Convert DB Actions into ActionStatements using the graph.
-
-    DEPRECATED: Use build_action_statements_from_actions() instead.
-    This function is kept for backward compatibility during the transition.
-
-    This function handles backward compatibility with different action ID formats
-    that may exist in the workflow graph (UUID strings, short IDs, legacy prefixed IDs).
-    """
-    # Build lookup keyed by canonical ActionUUID for consistent normalization
-    id2action: dict[ActionUUID, Action] = {
-        ActionUUID.from_uuid(action.id): action for action in actions
-    }
-
-    statements = []
-    for node in graph.action_nodes():
-        # Normalize the node ID for DB lookup
-        node_uuid = _normalize_action_id(node.id)
-
-        dependencies: list[str] = []
-        for dep_act_id in graph.dep_list[node.id]:
-            # Normalize the dependency ID for DB lookup
-            dep_uuid = _normalize_action_id(dep_act_id)
-            base_ref = id2action[dep_uuid].ref
-            # Edge comparison uses raw string IDs (graph structure, not DB lookup)
-            for edge in graph.edges:
-                if edge.source != dep_act_id or edge.target != node.id:
-                    continue
-                if edge.source_handle == EdgeType.ERROR:
-                    ref = dep_from_edge_components(base_ref, edge.source_handle)
-                else:
-                    ref = base_ref
-                dependencies.append(ref)
-        dependencies = sorted(dependencies)
-
-        action = id2action[node_uuid]
-        control_flow = ActionControlFlow.model_validate(action.control_flow)
-        args = yaml.safe_load(action.inputs) or {}
-        interaction = (
-            ActionInteractionValidator.validate_python(action.interaction)
-            if action.is_interactive and action.interaction
-            else None
-        )
-        action_stmt = ActionStatement(
-            id=action.id,
-            ref=action.ref,
-            action=action.type,
-            args=args,
-            depends_on=dependencies,
-            run_if=control_flow.run_if,
-            for_each=control_flow.for_each,
-            retry_policy=control_flow.retry_policy,
-            start_delay=control_flow.start_delay,
-            wait_until=control_flow.wait_until,
-            join_strategy=control_flow.join_strategy,
-            interaction=interaction,
-            environment=control_flow.environment,
-        )
-        statements.append(action_stmt)
-    return statements
-
-
 def build_action_statements_from_actions(
     actions: list[Action],
 ) -> list[ActionStatement]:
@@ -717,8 +821,10 @@ def build_action_statements_from_actions(
 
         # Build dependencies from upstream_edges
         for edge_data in action.upstream_edges:
-            source_id_str = edge_data.get("source_id")
-            source_handle = edge_data.get("source_handle", "success")
+            # Validate edge data at runtime using TypeAdapter
+            edge = UpstreamEdgeDataValidator.validate_python(edge_data)
+            source_id_str = edge.get("source_id")
+            source_handle = edge.get("source_handle", "success")
 
             # Convert string source_id to ActionID (UUID) for lookup
             if source_id_str:
@@ -768,17 +874,19 @@ def build_action_statements_from_actions(
 
 
 def create_default_execution_context(
-    ACTIONS: dict[str, Any] | None = None,
-    TRIGGER: dict[str, Any] | None = None,
+    ACTIONS: dict[str, TaskResult] | None = None,
+    TRIGGER: StoredObject | None = None,
     ENV: DSLEnvironment | None = None,
     VARS: dict[str, Any] | None = None,
 ) -> ExecutionContext:
-    return {
-        ExprContext.ACTIONS: ACTIONS or {},
-        ExprContext.TRIGGER: TRIGGER or {},
-        ExprContext.ENV: cast(DSLEnvironment, ENV or {}),
-        ExprContext.VARS: VARS or {},
-    }
+    ctx = ExecutionContext(
+        ACTIONS=ACTIONS or {},
+        TRIGGER=TRIGGER,
+        ENV=ENV or DSLEnvironment(),
+    )
+    if VARS:
+        ctx["VARS"] = VARS
+    return ctx
 
 
 def dsl_execution_error_from_exception(e: BaseException) -> DSLExecutionError:
@@ -805,6 +913,17 @@ def get_trigger_type_from_search_attr(
         )
         return TriggerType.MANUAL
     return TriggerType(trigger_type)
+
+
+def get_execution_type_from_search_attr(
+    search_attributes: TypedSearchAttributes,
+) -> ExecutionType:
+    """Extract execution type from search attributes."""
+    execution_type = search_attributes.get(TemporalSearchAttr.EXECUTION_TYPE.key)
+    if execution_type is None:
+        # Default to published for historical executions without the attribute
+        return ExecutionType.PUBLISHED
+    return ExecutionType(execution_type)
 
 
 NON_RETRYABLE_ERROR_TYPES = [

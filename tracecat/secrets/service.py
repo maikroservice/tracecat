@@ -8,22 +8,17 @@ from sqlalchemy import select
 from sqlalchemy.exc import MultipleResultsFound, NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tracecat import config
 from tracecat.audit.logger import audit_log
 from tracecat.auth.types import Role
 from tracecat.db.models import BaseSecret, OrganizationSecret, Secret
 from tracecat.exceptions import (
     TracecatAuthorizationError,
-    TracecatCredentialsError,
     TracecatCredentialsNotFoundError,
     TracecatNotFoundError,
 )
 from tracecat.identifiers import SecretID
 from tracecat.logger import logger
-from tracecat.registry.constants import (
-    REGISTRY_GIT_SSH_KEY_SECRET_NAME,
-    STORE_GIT_SSH_KEY_SECRET_NAME,
-)
+from tracecat.registry.constants import REGISTRY_GIT_SSH_KEY_SECRET_NAME
 from tracecat.secrets.constants import DEFAULT_SECRETS_ENVIRONMENT
 from tracecat.secrets.encryption import decrypt_keyvalues, encrypt_keyvalues
 from tracecat.secrets.enums import SecretType
@@ -33,6 +28,9 @@ from tracecat.secrets.schemas import (
     SecretSearch,
     SecretUpdate,
     SSHKeyTarget,
+    validate_ca_cert_values,
+    validate_mtls_key_values,
+    validate_ssh_key_values,
 )
 from tracecat.service import BaseService
 
@@ -61,6 +59,38 @@ class SecretsService(BaseService):
 
     async def _update_secret(self, secret: BaseSecret, params: SecretUpdate) -> None:
         """Update a base secret."""
+        existing_type = SecretType(secret.type)
+        if existing_type == SecretType.SSH_KEY:
+            if params.type is not None and SecretType(params.type) != existing_type:
+                raise ValueError(
+                    "SSH key secrets cannot change type. Delete and recreate the secret."
+                )
+            if params.keys is not None:
+                raise ValueError(
+                    "SSH key secrets are write-once. Delete and recreate to rotate the key."
+                )
+        elif existing_type == SecretType.MTLS:
+            if params.type is not None and SecretType(params.type) != existing_type:
+                raise ValueError(
+                    "mTLS secrets cannot change type. Delete and recreate the secret."
+                )
+        elif existing_type == SecretType.CA_CERT:
+            if params.type is not None and SecretType(params.type) != existing_type:
+                raise ValueError(
+                    "CA certificate secrets cannot change type. Delete and recreate the secret."
+                )
+        elif params.type == SecretType.SSH_KEY:
+            raise ValueError(
+                "SSH key secrets must be created with their key value. Delete and recreate the secret instead."
+            )
+        elif params.type == SecretType.MTLS:
+            raise ValueError(
+                "mTLS secrets must be created with their key values. Delete and recreate the secret instead."
+            )
+        elif params.type == SecretType.CA_CERT:
+            raise ValueError(
+                "CA certificate secrets must be created with their key values. Delete and recreate the secret instead."
+            )
         set_fields = params.model_dump(exclude_unset=True)
         # Handle keys separately
         if keys := set_fields.pop("keys", None):
@@ -82,6 +112,11 @@ class SecretsService(BaseService):
                     )
                 else:
                     merged_keyvalues.append(SecretKeyValue(**kv))
+
+            if existing_type == SecretType.MTLS:
+                validate_mtls_key_values(merged_keyvalues)
+            elif existing_type == SecretType.CA_CERT:
+                validate_ca_cert_values(merged_keyvalues)
 
             secret.encrypted_keys = encrypt_keyvalues(
                 merged_keyvalues, key=self._encryption_key
@@ -185,6 +220,12 @@ class SecretsService(BaseService):
             raise TracecatAuthorizationError(
                 "Workspace ID is required to create a secret in a workspace"
             )
+        if params.type == SecretType.SSH_KEY:
+            validate_ssh_key_values(params.keys)
+        elif params.type == SecretType.MTLS:
+            validate_mtls_key_values(params.keys)
+        elif params.type == SecretType.CA_CERT:
+            validate_ca_cert_values(params.keys)
         secret = Secret(
             workspace_id=workspace_id,
             name=params.name,
@@ -241,7 +282,7 @@ class SecretsService(BaseService):
         """List all organization secrets."""
 
         stmt = select(OrganizationSecret).where(
-            OrganizationSecret.organization_id == config.TRACECAT__DEFAULT_ORG_ID
+            OrganizationSecret.organization_id == self.organization_id
         )
         if types:
             stmt = stmt.where(OrganizationSecret.type.in_(types))
@@ -252,7 +293,7 @@ class SecretsService(BaseService):
         """Get an organization secret by ID."""
 
         statement = select(OrganizationSecret).where(
-            OrganizationSecret.organization_id == config.TRACECAT__DEFAULT_ORG_ID,
+            OrganizationSecret.organization_id == self.organization_id,
             OrganizationSecret.id == secret_id,
         )
         result = await self.session.execute(statement)
@@ -266,7 +307,7 @@ class SecretsService(BaseService):
         """Retrieve an organization-wide secret by its name."""
         environment = environment or DEFAULT_SECRETS_ENVIRONMENT
         statement = select(OrganizationSecret).where(
-            OrganizationSecret.organization_id == config.TRACECAT__DEFAULT_ORG_ID,
+            OrganizationSecret.organization_id == self.organization_id,
             OrganizationSecret.name == secret_name,
             OrganizationSecret.environment == environment,
         )
@@ -287,8 +328,14 @@ class SecretsService(BaseService):
     @audit_log(resource_type="organization_secret", action="create")
     async def create_org_secret(self, params: SecretCreate) -> None:
         """Create a new organization secret."""
+        if params.type == SecretType.SSH_KEY:
+            validate_ssh_key_values(params.keys)
+        elif params.type == SecretType.MTLS:
+            validate_mtls_key_values(params.keys)
+        elif params.type == SecretType.CA_CERT:
+            validate_ca_cert_values(params.keys)
         secret = OrganizationSecret(
-            organization_id=config.TRACECAT__DEFAULT_ORG_ID,
+            organization_id=self.organization_id,
             name=params.name,
             type=params.type,
             description=params.description,
@@ -321,8 +368,6 @@ class SecretsService(BaseService):
         match target:
             case "registry":
                 return await self.get_registry_ssh_key(key_name, environment)
-            case "store":
-                return await self.get_store_ssh_key(key_name, environment)
             case _:
                 raise ValueError(f"Invalid target: {target}")
 
@@ -345,30 +390,4 @@ class SecretsService(BaseService):
             raise TracecatCredentialsNotFoundError(
                 f"SSH key {key_name} not found. Please check whether this key exists.\n\n"
                 " If not, please create a key in your organization's credentials page and try again."
-            ) from e
-
-    async def get_store_ssh_key(
-        self, key_name: str | None = None, environment: str | None = None
-    ) -> SecretStr:
-        """Get the SSH key for the store."""
-        key_name = key_name or STORE_GIT_SSH_KEY_SECRET_NAME
-        try:
-            secret = await self.get_secret_by_name(key_name, environment)
-            if secret.type != SecretType.SSH_KEY:
-                raise TracecatCredentialsError(
-                    f"SSH key type mismatch. Expected SSH key, got {secret.type}."
-                )
-            [kv] = self.decrypt_keys(secret.encrypted_keys)
-            logger.debug("SSH key found", key_name=key_name, key_length=len(kv.value))
-            raw_value = kv.value.get_secret_value()
-            # SSH keys must end with a newline char otherwise we run into
-            # load key errors in librcrypto.
-            # https://github.com/openssl/openssl/discussions/21481
-            if not raw_value.endswith("\n"):
-                raw_value += "\n"
-            return SecretStr(raw_value)
-        except TracecatNotFoundError as e:
-            raise TracecatCredentialsNotFoundError(
-                f"SSH key {key_name} not found. Please check whether this key exists.\n\n"
-                " If not, please create a key in your workspace's credentials page and try again.",
             ) from e

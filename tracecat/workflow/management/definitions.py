@@ -8,8 +8,14 @@ from tracecat.dsl.common import DSLInput
 from tracecat.exceptions import TracecatAuthorizationError, TracecatException
 from tracecat.identifiers.workflow import WorkflowID
 from tracecat.logger import logger
+from tracecat.registry.lock.service import RegistryLockService
+from tracecat.registry.lock.types import RegistryLock
 from tracecat.service import BaseService
-from tracecat.workflow.management.schemas import GetWorkflowDefinitionActivityInputs
+from tracecat.workflow.management.schemas import (
+    GetWorkflowDefinitionActivityInputs,
+    ResolveRegistryLockActivityInputs,
+    WorkflowDefinitionActivityResult,
+)
 
 
 class WorkflowDefinitionsService(BaseService):
@@ -47,8 +53,22 @@ class WorkflowDefinitionsService(BaseService):
         workflow_id: WorkflowID,
         dsl: DSLInput,
         *,
+        alias: str | None = None,
+        registry_lock: RegistryLock | None = None,
         commit: bool = True,
     ) -> WorkflowDefinition:
+        """Create a new workflow definition.
+
+        Args:
+            workflow_id: The ID of the workflow this definition belongs to.
+            dsl: The DSL input for the workflow definition.
+            registry_lock: Optional registry version lock to freeze with this definition.
+                Maps repository origin to version string.
+            commit: Whether to commit the transaction.
+
+        Returns:
+            The created WorkflowDefinition.
+        """
         if self.role.workspace_id is None:
             raise TracecatAuthorizationError("Workspace ID is required")
         statement = (
@@ -68,6 +88,8 @@ class WorkflowDefinitionsService(BaseService):
             workflow_id=workflow_id,
             content=dsl.model_dump(exclude_unset=True),
             version=version,
+            alias=alias,
+            registry_lock=registry_lock.model_dump() if registry_lock else None,
         )
         self.session.add(defn)
         if commit:
@@ -81,7 +103,7 @@ class WorkflowDefinitionsService(BaseService):
 @activity.defn
 async def get_workflow_definition_activity(
     input: GetWorkflowDefinitionActivityInputs,
-) -> DSLInput:
+) -> WorkflowDefinitionActivityResult:
     async with WorkflowDefinitionsService.with_session(role=input.role) as service:
         defn = await service.get_definition_by_workflow_id(
             input.workflow_id, version=input.version
@@ -91,4 +113,27 @@ async def get_workflow_definition_activity(
             logger.error(msg)
             raise TracecatException(msg)
         dsl = DSLInput(**defn.content)
-    return dsl
+    # Convert from DB dict type to RegistryLock (JSONB deserializes to dict)
+    registry_lock = (
+        RegistryLock.model_validate(defn.registry_lock) if defn.registry_lock else None
+    )
+    return WorkflowDefinitionActivityResult(dsl=dsl, registry_lock=registry_lock)
+
+
+@activity.defn
+async def resolve_registry_lock_activity(
+    input: ResolveRegistryLockActivityInputs,
+) -> RegistryLock:
+    """Resolve registry lock with action bindings for a set of actions.
+
+    This activity is called at workflow start if no lock is provided,
+    ensuring all trigger paths have a valid registry lock.
+    """
+    async with RegistryLockService.with_session(role=input.role) as service:
+        lock = await service.resolve_lock_with_bindings(input.action_names)
+    logger.info(
+        "Resolved registry lock",
+        num_origins=len(lock.origins),
+        num_actions=len(lock.actions),
+    )
+    return lock

@@ -31,6 +31,8 @@ from tracecat.exceptions import TracecatNotFoundError, TracecatValidationError
 from tracecat.identifiers.workflow import AnyWorkflowIDPath, WorkflowUUID
 from tracecat.logger import logger
 from tracecat.pagination import CursorPaginatedResponse, CursorPaginationParams
+from tracecat.registry.lock.service import RegistryLockService
+from tracecat.registry.lock.types import RegistryLock
 from tracecat.settings.service import get_setting
 from tracecat.tags.schemas import TagRead
 from tracecat.validation.schemas import (
@@ -444,10 +446,30 @@ async def commit_workflow(
     # Validation is complete. We can now construct the workflow definition
     # Phase 1: Create workflow definition
     # Workflow definition uses action.refs to refer to actions
-    # We should only instantiate action refs at workflow    runtime
+    # We should only instantiate action refs at workflow runtime
     service = WorkflowDefinitionsService(session, role=role)
+
+    # Get the workflow's current registry_lock
+    # If no lock exists (e.g., legacy workflow), resolve one with action bindings
+    if workflow.registry_lock is None:
+        lock_service = RegistryLockService(session, role)
+        action_names = {action.action for action in dsl.actions}
+        registry_lock = await lock_service.resolve_lock_with_bindings(action_names)
+        # Also update the workflow with the computed lock
+        workflow.registry_lock = registry_lock.model_dump()
+
+    registry_lock = RegistryLock.model_validate(workflow.registry_lock)
+
     # Creating a workflow definition only uses refs
-    defn = await service.create_workflow_definition(workflow_id, dsl, commit=False)
+    # Copy the alias from the draft workflow to the committed definition
+    # Pass the registry_lock to freeze it with this definition
+    defn = await service.create_workflow_definition(
+        workflow_id,
+        dsl,
+        alias=workflow.alias,
+        registry_lock=registry_lock,
+        commit=False,
+    )
 
     # Update Workflow
     # We don't need to backpropagate the graph to the workflow beacuse the workflow is the source of truth

@@ -1,7 +1,7 @@
 import logging
 import os
 import uuid
-from typing import Literal
+from typing import Literal, cast
 
 from tracecat.auth.enums import AuthType
 from tracecat.feature_flags.enums import FeatureFlag
@@ -22,32 +22,31 @@ TRACECAT__PUBLIC_APP_URL = os.environ.get(
     "TRACECAT__PUBLIC_APP_URL", "http://localhost"
 )
 
-
-TRACECAT__EXECUTOR_URL = os.environ.get(
-    "TRACECAT__EXECUTOR_URL", "http://executor:8000"
-)
-TRACECAT__EXECUTOR_CLIENT_TIMEOUT = float(
-    os.environ.get("TRACECAT__EXECUTOR_CLIENT_TIMEOUT") or 900.0
-)
-"""Timeout for the executor client in seconds (default 900s).
-
-The `httpx.Client` default is 5s, which doesn't work for long-running actions.
-This value is also used when waiting for Ray task execution so the outbound
-client timeout and Ray task await timeout remain aligned.
-"""
 TRACECAT__LOOP_MAX_BATCH_SIZE = int(os.environ.get("TRACECAT__LOOP_MAX_BATCH_SIZE", 64))
 """Maximum number of parallel requests to the worker service."""
+
+TRACECAT__EXECUTOR_QUEUE = os.environ.get(
+    "TRACECAT__EXECUTOR_QUEUE", "shared-action-queue"
+)
+"""Task queue for the ExecutorWorker (Temporal activity queue)."""
+
+TRACECAT__EXECUTOR_REGISTRY_CACHE_DIR = os.environ.get(
+    "TRACECAT__EXECUTOR_REGISTRY_CACHE_DIR", "/tmp/tracecat/registry-cache"
+)
+"""Directory for caching extracted registry tarballs in subprocess mode. Uses /tmp for ephemeral storage."""
 
 # TODO: Set this as an environment variable
 TRACECAT__SERVICE_ROLES_WHITELIST = [
     "tracecat-api",
     "tracecat-cli",
+    "tracecat-llm-gateway",
     "tracecat-runner",
     "tracecat-schedule-runner",
     "tracecat-ui",
 ]
 TRACECAT__DEFAULT_USER_ID = uuid.UUID(int=0)
 TRACECAT__DEFAULT_ORG_ID = uuid.UUID(int=0)
+"""Deprecated: This config is being remove in favor of platform-scoped models."""
 
 # === DB Config === #
 TRACECAT__DB_URI = os.environ.get(
@@ -217,6 +216,10 @@ TRACECAT__UNSAFE_DISABLE_SM_MASKING = os.environ.get(
 
 # === M2M config === #
 TRACECAT__SERVICE_KEY = os.environ.get("TRACECAT__SERVICE_KEY")
+TRACECAT__EXECUTOR_TOKEN_TTL_SECONDS = int(
+    os.environ.get("TRACECAT__EXECUTOR_TOKEN_TTL_SECONDS", 900)
+)
+"""Executor JWT TTL in seconds (default: 900 seconds)."""
 
 # === Remote registry === #
 TRACECAT__ALLOWED_GIT_DOMAINS = set(
@@ -237,11 +240,11 @@ TRACECAT__BLOB_STORAGE_BUCKET_ATTACHMENTS = os.environ.get(
 )
 """Bucket for case attachments."""
 
-# Bucket for registry wheels
+# Bucket for registry artifacts
 TRACECAT__BLOB_STORAGE_BUCKET_REGISTRY = os.environ.get(
     "TRACECAT__BLOB_STORAGE_BUCKET_REGISTRY", "tracecat-registry"
 )
-"""Bucket for registry wheel files and versioned artifacts."""
+"""Bucket for registry tarball files and versioned artifacts."""
 
 TRACECAT__BLOB_STORAGE_ENDPOINT = os.environ.get(
     "TRACECAT__BLOB_STORAGE_ENDPOINT", "http://minio:9000"
@@ -264,6 +267,70 @@ TRACECAT__DISABLE_PRESIGNED_URL_IP_CHECKING = (
 )
 """Disable client IP checking for presigned URLs. Set to false for production with public S3, true for local MinIO (default: true)."""
 
+# Bucket for workflow data (externalized results, triggers, etc.)
+TRACECAT__BLOB_STORAGE_BUCKET_WORKFLOW = os.environ.get(
+    "TRACECAT__BLOB_STORAGE_BUCKET_WORKFLOW", "tracecat-workflow"
+)
+"""Bucket for externalized workflow data (action results, triggers, etc.)."""
+
+TRACECAT__WORKFLOW_ARTIFACT_RETENTION_DAYS = int(
+    os.environ.get("TRACECAT__WORKFLOW_ARTIFACT_RETENTION_DAYS", 30)
+)
+"""Retention period in days for workflow artifacts in blob storage.
+
+Objects older than this will be automatically deleted via S3 lifecycle rules.
+Set to 0 to disable automatic expiration.
+Default: 30 days (matches Temporal Cloud workflow history retention).
+"""
+
+# === Result Externalization Config === #
+TRACECAT__RESULT_EXTERNALIZATION_ENABLED = os.environ.get(
+    "TRACECAT__RESULT_EXTERNALIZATION_ENABLED", "true"
+).lower() in ("true", "1")
+"""Enable externalization of large action results and triggers to S3/MinIO.
+
+When enabled, payloads exceeding the threshold are stored in blob storage with
+only a small reference kept in Temporal workflow history. This prevents history
+bloat for workflows with large payloads.
+
+Default: true.
+"""
+
+TRACECAT__RESULT_EXTERNALIZATION_THRESHOLD_BYTES = int(
+    os.environ.get("TRACECAT__RESULT_EXTERNALIZATION_THRESHOLD_BYTES", 128 * 1024)
+)
+"""Threshold in bytes above which payloads are externalized to blob storage.
+
+Payloads smaller than this are kept inline in workflow history.
+Default: 128 KB.
+"""
+
+# === Collection Manifests Config === #
+TRACECAT__COLLECTION_MANIFESTS_ENABLED = os.environ.get(
+    "TRACECAT__COLLECTION_MANIFESTS_ENABLED", "false"
+).lower() in ("true", "1")
+"""Feature gate for CollectionObject emission.
+
+When enabled, large collections (above thresholds) are stored as chunked manifests
+in blob storage, with only a small handle kept in Temporal workflow history.
+When disabled (default), large collections use legacy InlineObject/ExternalObject.
+"""
+
+TRACECAT__COLLECTION_CHUNK_SIZE = int(
+    os.environ.get("TRACECAT__COLLECTION_CHUNK_SIZE", "256")
+)
+"""Number of items per chunk in collection manifests. Default: 256."""
+
+TRACECAT__COLLECTION_INLINE_MAX_ITEMS = int(
+    os.environ.get("TRACECAT__COLLECTION_INLINE_MAX_ITEMS", "100")
+)
+"""Maximum items before using CollectionObject. Below this, use InlineObject/ExternalObject."""
+
+TRACECAT__COLLECTION_INLINE_MAX_BYTES = int(
+    os.environ.get("TRACECAT__COLLECTION_INLINE_MAX_BYTES", str(256 * 1024))
+)
+"""Maximum bytes before using CollectionObject. Default: 256 KB."""
+
 # === Local registry === #
 TRACECAT__LOCAL_REPOSITORY_ENABLED = os.getenv(
     "TRACECAT__LOCAL_REPOSITORY_ENABLED", "0"
@@ -280,7 +347,11 @@ TRACECAT__SANDBOX_NSJAIL_PATH = os.environ.get(
 TRACECAT__SANDBOX_ROOTFS_PATH = os.environ.get(
     "TRACECAT__SANDBOX_ROOTFS_PATH", "/var/lib/tracecat/sandbox-rootfs"
 )
-"""Path to the sandbox rootfs directory containing Python 3.12 + uv."""
+"""Path to the sandbox rootfs directory containing Python 3.12 + uv.
+
+Used by both action sandbox and agent sandbox. Runtime code is copied
+to job directory at spawn time, site-packages mounted read-only.
+"""
 
 TRACECAT__SANDBOX_CACHE_DIR = os.environ.get(
     "TRACECAT__SANDBOX_CACHE_DIR", "/var/lib/tracecat/sandbox-cache"
@@ -323,6 +394,95 @@ When False, uses nsjail sandbox for full OS-level isolation. Requires:
 - nsjail binary at TRACECAT__SANDBOX_NSJAIL_PATH
 - Sandbox rootfs at TRACECAT__SANDBOX_ROOTFS_PATH
 """
+
+# === Action Executor === #
+TRACECAT__EXECUTOR_BACKEND = os.environ.get("TRACECAT__EXECUTOR_BACKEND", "auto")
+"""Executor backend for running actions.
+
+Supported values:
+- 'pool': Warm nsjail workers (single-tenant, high throughput, ~100-200ms)
+- 'ephemeral': Cold nsjail subprocess per action (multitenant, full isolation, ~4000ms)
+- 'direct': In-process execution (TESTING ONLY - no isolation, no subprocess overhead)
+- 'auto': Auto-select based on environment (pool if nsjail available, else direct)
+
+Trust mode is derived from the backend type:
+- pool: untrusted (secrets pre-resolved, no DB creds)
+- ephemeral: untrusted (secrets pre-resolved, no DB creds)
+- direct: trusted (no sandbox)
+
+WARNING: 'direct' backend provides NO isolation between actions. Actions share
+the same process memory, env vars can leak, and crashes affect the whole worker.
+Only use 'direct' for tests. For production, use 'pool' or 'ephemeral'.
+"""
+
+TRACECAT__EXECUTOR_CLIENT_TIMEOUT = float(
+    os.environ.get("TRACECAT__EXECUTOR_CLIENT_TIMEOUT", "300")
+)
+"""Default timeout in seconds for executor client operations (default: 300s)."""
+
+# === Action Executor Sandbox === #
+TRACECAT__EXECUTOR_SANDBOX_ENABLED = os.environ.get(
+    "TRACECAT__EXECUTOR_SANDBOX_ENABLED", "false"
+).lower() in ("true", "1")
+"""Enable nsjail sandbox for action execution in subprocess mode.
+
+When True, actions run in an nsjail sandbox with:
+- Filesystem isolation (tmpdir VFS)
+- Resource limits (CPU, memory, file size, processes)
+- Network access (for DB, S3, external APIs)
+
+When False (default), actions run in direct subprocesses without sandboxing.
+
+Requires:
+- TRACECAT__EXECUTOR_BACKEND=pool or ephemeral
+- nsjail binary at TRACECAT__SANDBOX_NSJAIL_PATH
+- Sandbox rootfs at TRACECAT__SANDBOX_ROOTFS_PATH
+"""
+
+TRACECAT__EXECUTOR_TRACECAT_APP_DIR = os.environ.get(
+    "TRACECAT__EXECUTOR_TRACECAT_APP_DIR", ""
+)
+"""Path to the tracecat package directory for sandbox mounting.
+If not set, will be auto-detected from the installed tracecat package location.
+"""
+
+TRACECAT__EXECUTOR_SITE_PACKAGES_DIR = os.environ.get(
+    "TRACECAT__EXECUTOR_SITE_PACKAGES_DIR", ""
+)
+"""Path to the Python site-packages directory containing tracecat dependencies.
+If not set, will be auto-detected from a known dependency's location.
+"""
+
+TRACECAT__EXECUTOR_POOL_METRICS_ENABLED = os.environ.get(
+    "TRACECAT__EXECUTOR_POOL_METRICS_ENABLED", "false"
+).lower() in ("true", "1")
+"""Enable periodic metrics emission for the worker pool.
+
+When True, the pool emits metrics every 10 seconds including:
+- Pool utilization and capacity
+- Worker states (alive, dead, recycling)
+- Lock contention stats
+- Throughput metrics
+
+When False (default), metrics are not emitted to reduce log noise.
+"""
+
+# === Agent Sandbox (NSJail for ClaudeAgentRuntime) === #
+TRACECAT__AGENT_SANDBOX_TIMEOUT = int(
+    os.environ.get("TRACECAT__AGENT_SANDBOX_TIMEOUT", "600")
+)
+"""Default timeout for agent sandbox execution in seconds (10 minutes)."""
+
+TRACECAT__AGENT_SANDBOX_MEMORY_MB = int(
+    os.environ.get("TRACECAT__AGENT_SANDBOX_MEMORY_MB", "4096")
+)
+"""Default memory limit for agent sandbox execution in megabytes (4 GiB)."""
+
+TRACECAT__AGENT_QUEUE = os.environ.get("TRACECAT__AGENT_QUEUE", "shared-agent-queue")
+"""Task queue for the AgentWorker (Temporal workflow queue).
+
+This is the dedicated queue for agent workflow execution, separate from the main
+tracecat-task-queue used by DSLWorkflow."""
 
 # === Rate Limiting === #
 TRACECAT__RATE_LIMIT_ENABLED = (
@@ -411,9 +571,10 @@ TRACECAT__CONTEXT_COMPRESSION_ALGORITHM = os.environ.get(
 )
 """Compression algorithm to use. Supported: zstd, gzip, brotli. Defaults to zstd."""
 
-TRACECAT__WORKFLOW_RETURN_STRATEGY = os.environ.get(
-    "TRACECAT__WORKFLOW_RETURN_STRATEGY", "minimal"
-).lower()
+TRACECAT__WORKFLOW_RETURN_STRATEGY: Literal["context", "minimal"] = cast(
+    Literal["context", "minimal"],
+    os.environ.get("TRACECAT__WORKFLOW_RETURN_STRATEGY", "minimal").lower(),
+)
 """Strategy to use when returning a value from a workflow. Supported: context, minimal. Defaults to minimal."""
 
 # === Redis config === #
@@ -520,10 +681,10 @@ for _flag in os.environ.get("TRACECAT__FEATURE_FLAGS", "").split(","):
 
 
 # === Agent config === #
-ENABLE_REMOTE_AGENT_EXECUTOR = os.environ.get(
-    "ENABLE_REMOTE_AGENT_EXECUTOR", "false"
+TRACECAT__UNIFIED_AGENT_STREAMING_ENABLED = os.environ.get(
+    "TRACECAT__UNIFIED_AGENT_STREAMING_ENABLED", "false"
 ).lower() in ("true", "1")
-"""Whether to enable the remote agent executor."""
+"""Whether to enable unified streaming for agent execution."""
 
 TRACECAT__AGENT_MAX_TOOLS = int(os.environ.get("TRACECAT__AGENT_MAX_TOOLS", 30))
 """The maximum number of tools that can be used in an agent."""
@@ -560,3 +721,37 @@ TRACECAT__MODEL_CONTEXT_LIMITS = {
     "anthropic.claude-haiku-4-5-20251001-v1:0": 180_000,
 }
 """Model-specific character limits for agent message history truncation."""
+
+# === Registry Sync === #
+TRACECAT__REGISTRY_SYNC_SANDBOX_ENABLED = os.environ.get(
+    "TRACECAT__REGISTRY_SYNC_SANDBOX_ENABLED", "true"
+).lower() in ("true", "1")
+"""Enable sandboxed registry sync via Temporal workflow on ExecutorWorker.
+
+When True (default), registry sync operations run on the ExecutorWorker with:
+- Git clone in subprocess with SSH credentials
+- Package installation with network access
+- Action discovery (currently subprocess, future: nsjail without network)
+- Tarball build and upload to S3
+
+When False, uses the existing subprocess approach from the API service.
+"""
+
+TRACECAT__REGISTRY_SYNC_INSTALL_TIMEOUT = int(
+    os.environ.get("TRACECAT__REGISTRY_SYNC_INSTALL_TIMEOUT", 600)
+)
+"""Timeout for package installation during registry sync in seconds. Defaults to 600 (10 min)."""
+
+TRACECAT__REGISTRY_SYNC_DISCOVER_TIMEOUT = int(
+    os.environ.get("TRACECAT__REGISTRY_SYNC_DISCOVER_TIMEOUT", 300)
+)
+"""Timeout for action discovery during registry sync in seconds. Defaults to 300 (5 min)."""
+
+TRACECAT__BUILTIN_REGISTRY_SOURCE_PATH = os.environ.get(
+    "TRACECAT__BUILTIN_REGISTRY_SOURCE_PATH", "/app/packages/tracecat-registry"
+)
+"""Path to the builtin tracecat_registry package source.
+
+In Docker, packages are copied to /app/packages/tracecat-registry.
+In development with editable install, falls back to checking relative to the installed package.
+"""

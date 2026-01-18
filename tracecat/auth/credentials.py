@@ -22,9 +22,14 @@ from pydantic import UUID4
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tracecat import config
+from tracecat.auth.executor_tokens import verify_executor_token
 from tracecat.auth.schemas import UserRole
 from tracecat.auth.types import AccessLevel, Role
-from tracecat.auth.users import is_unprivileged, optional_current_active_user
+from tracecat.auth.users import (
+    current_active_user,
+    is_unprivileged,
+    optional_current_active_user,
+)
 from tracecat.authz.enums import WorkspaceRole
 from tracecat.authz.service import MembershipService, MembershipWithOrg
 from tracecat.contexts import ctx_role
@@ -67,15 +72,29 @@ def get_role_from_user(
     workspace_role: WorkspaceRole | None = None,
     service_id: InternalServiceID = "tracecat-api",
 ) -> Role:
+    # Superusers always get ADMIN access level
+    access_level = (
+        AccessLevel.ADMIN if user.is_superuser else USER_ROLE_TO_ACCESS_LEVEL[user.role]
+    )
     return Role(
         type="user",
         workspace_id=workspace_id,
         organization_id=organization_id,
         user_id=user.id,
         service_id=service_id,
-        access_level=USER_ROLE_TO_ACCESS_LEVEL[user.role],
+        access_level=access_level,
         workspace_role=workspace_role,
     )
+
+
+def _get_bearer_token(request: Request) -> str | None:
+    auth_header = request.headers.get("Authorization")
+    if not auth_header:
+        return None
+    scheme, _, token = auth_header.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        return None
+    return token
 
 
 async def _authenticate_service(
@@ -141,6 +160,7 @@ async def _role_dependency(
     api_key: str | None = None,
     allow_user: bool,
     allow_service: bool,
+    allow_executor: bool = False,
     require_workspace: Literal["yes", "no", "optional"],
     min_access_level: AccessLevel | None = None,
     require_workspace_roles: WorkspaceRole | list[WorkspaceRole] | None = None,
@@ -262,10 +282,21 @@ async def _role_dependency(
             workspace_role = membership_with_org.membership.role
             organization_id = membership_with_org.org_id
         else:
-            # Privileged user doesn't need workspace role verification
+            # No workspace specified; infer org from memberships when possible.
             workspace_role = None
-            # For privileged users, get organization_id from default or user's first workspace
             organization_id = config.TRACECAT__DEFAULT_ORG_ID
+            svc = MembershipService(session)
+            memberships_with_org = await svc.list_user_memberships_with_org(
+                user_id=user.id
+            )
+            org_ids = {m.org_id for m in memberships_with_org}
+            if len(org_ids) == 1:
+                organization_id = next(iter(org_ids))
+            elif len(org_ids) > 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Multiple organizations found. Provide workspace_id to select an organization.",
+                )
 
         role = get_role_from_user(
             user,
@@ -275,6 +306,58 @@ async def _role_dependency(
         )
     elif api_key and allow_service:
         role = await _authenticate_service(request, api_key)
+    elif allow_executor:
+        token = _get_bearer_token(request)
+        if not token:
+            logger.info("Missing executor bearer token")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized"
+            )
+        try:
+            token_payload = verify_executor_token(token)
+        except ValueError as exc:
+            logger.info("Invalid executor token", error=str(exc))
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized"
+            ) from exc
+
+        # Derive access_level from DB lookup on user_id (prevents privilege escalation)
+        access_level = AccessLevel.BASIC  # Default for system/anonymous executions
+        if token_payload.user_id is not None:
+            from sqlalchemy import select
+
+            stmt = select(User.role).where(User.id == token_payload.user_id)  # pyright: ignore[reportArgumentType]
+            result = await session.execute(stmt)
+            user_role = result.scalar_one_or_none()
+            if user_role is not None:
+                access_level = USER_ROLE_TO_ACCESS_LEVEL.get(
+                    user_role, AccessLevel.BASIC
+                )
+
+        # Construct Role from token payload + derived access_level
+        role = Role(
+            type="service",
+            service_id="tracecat-executor",
+            workspace_id=token_payload.workspace_id,
+            user_id=token_payload.user_id,
+            access_level=access_level,
+        )
+
+        if require_workspace == "yes":
+            if role.workspace_id is None:
+                logger.warning("Executor role missing workspace_id", role=role)
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden"
+                )
+            if workspace_id is not None and str(role.workspace_id) != str(workspace_id):
+                logger.warning(
+                    "Executor role workspace mismatch",
+                    role_workspace_id=role.workspace_id,
+                    request_workspace_id=workspace_id,
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden"
+                )
     else:
         logger.debug("Invalid authentication or authorization", user=user)
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
@@ -310,6 +393,7 @@ def RoleACL(
     *,
     allow_user: bool = True,
     allow_service: bool = False,
+    allow_executor: bool = False,
     require_workspace: Literal["yes", "no", "optional"] = "yes",
     min_access_level: AccessLevel | None = None,
     workspace_id_in_path: bool = False,
@@ -347,8 +431,34 @@ def RoleACL(
         HTTPException: If authentication fails or the caller lacks required permissions.
 
     """
-    if not any((allow_user, allow_service, require_workspace)):
-        raise ValueError("Must allow either user, service, or require workspace")
+    if not any((allow_user, allow_service, require_workspace, allow_executor)):
+        raise ValueError(
+            "Must allow either user, service, executor, or require workspace"
+        )
+
+    # Executor-only auth: workspace_id comes from JWT, not query param
+    is_executor_only = allow_executor and not allow_user and not allow_service
+    if is_executor_only and require_workspace == "yes":
+
+        async def role_dependency_executor_only(
+            request: Request,
+            session: AsyncDBSession,
+        ) -> Role:
+            return await _role_dependency(
+                request=request,
+                session=session,
+                workspace_id=None,  # Comes from JWT
+                user=None,
+                api_key=None,
+                allow_user=False,
+                allow_service=False,
+                allow_executor=True,
+                min_access_level=min_access_level,
+                require_workspace=require_workspace,
+                require_workspace_roles=require_workspace_roles,
+            )
+
+        return Depends(role_dependency_executor_only)
 
     if require_workspace == "yes":
         GetWsDep = Path if workspace_id_in_path else Query
@@ -369,6 +479,7 @@ def RoleACL(
                 api_key=api_key,
                 allow_user=allow_user,
                 allow_service=allow_service,
+                allow_executor=allow_executor,
                 min_access_level=min_access_level,
                 require_workspace=require_workspace,
                 require_workspace_roles=require_workspace_roles,
@@ -397,6 +508,7 @@ def RoleACL(
                 api_key=api_key,
                 allow_user=allow_user,
                 allow_service=allow_service,
+                allow_executor=allow_executor,
                 min_access_level=min_access_level,
                 require_workspace=require_workspace,
                 require_workspace_roles=require_workspace_roles,
@@ -420,6 +532,7 @@ def RoleACL(
                 api_key=api_key,
                 allow_user=allow_user,
                 allow_service=allow_service,
+                allow_executor=allow_executor,
                 min_access_level=min_access_level,
                 require_workspace=require_workspace,
                 require_workspace_roles=require_workspace_roles,
@@ -428,3 +541,36 @@ def RoleACL(
         return Depends(role_dependency_not_req_ws)
     else:
         raise ValueError(f"Invalid require_workspace value: {require_workspace}")
+
+
+# --- Platform-level (Superuser) Authentication ---
+
+
+async def _require_superuser(
+    user: Annotated[User, Depends(current_active_user)],
+) -> Role:
+    """Require superuser access for platform admin operations.
+
+    This dependency is used for /admin routes that require platform-level access.
+    Superusers can manage organizations, platform settings, and platform-level
+    registry sync operations.
+    """
+    if not user.is_superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden",
+        )
+    role = Role(
+        type="user",
+        user_id=user.id,
+        access_level=AccessLevel.ADMIN,
+        service_id="tracecat-api",
+        # NOTE: Platform routes are not org/workspace-scoped. Role still requires
+        # organization_id for backwards-compat in Phase 1.
+        organization_id=config.TRACECAT__DEFAULT_ORG_ID,
+    )
+    ctx_role.set(role)
+    return role
+
+
+SuperuserRole = Annotated[Role, Depends(_require_superuser)]

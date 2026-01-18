@@ -1,6 +1,7 @@
 import asyncio
 import dataclasses
 import os
+import signal
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
@@ -15,28 +16,21 @@ from tracecat import __version__ as APP_VERSION
 
 with workflow.unsafe.imports_passed_through():
     import sentry_sdk
-    from tracecat_ee.agent.activities import AgentActivities
-    from tracecat_ee.agent.approvals.service import ApprovalManager
     from tracecat_ee.agent.workflows.durable import DurableAgentWorkflow
 
     from tracecat import config
-    from tracecat.agent.preset.activities import (
-        resolve_agent_preset_config_activity,
-    )
-    from tracecat.agent.tools import SimpleToolExecutor
     from tracecat.dsl.action import DSLActivities
     from tracecat.dsl.client import get_temporal_client
     from tracecat.dsl.interceptor import SentryInterceptor
     from tracecat.dsl.plugins import TracecatPydanticAIPlugin
-    from tracecat.dsl.validation import (
-        normalize_trigger_inputs_activity,
-        validate_trigger_inputs_activity,
-    )
+    from tracecat.dsl.validation import resolve_time_anchor_activity
     from tracecat.dsl.workflow import DSLWorkflow
     from tracecat.ee.interactions.service import InteractionService
     from tracecat.logger import logger
+    from tracecat.storage.collection import CollectionActivities
     from tracecat.workflow.management.definitions import (
         get_workflow_definition_activity,
+        resolve_registry_lock_activity,
     )
     from tracecat.workflow.management.management import WorkflowsManagementService
     from tracecat.workflow.schedules.service import WorkflowSchedulesService
@@ -54,6 +48,21 @@ def new_sandbox_runner() -> SandboxedWorkflowRunner:
         SandboxRestrictions.invalid_module_members_default.children
     )
     del invalid_module_member_children["datetime"]
+
+    # Pass through tracecat modules to avoid class identity mismatches
+    # when Pydantic validates discriminated unions (e.g., StoredObject = InlineObject | ExternalObject)
+    # Also pass through jsonpath_ng which is used for expression evaluation in workflows
+    # Add beartype to passthrough modules to avoid circular import issues
+    # with its custom import hooks conflicting with Temporal's sandbox
+    passthrough_modules = SandboxRestrictions.passthrough_modules_default | {
+        "tracecat",
+        "tracecat_ee",
+        "tracecat_registry",
+        "jsonpath_ng",
+        "dateparser",
+        "beartype",
+    }
+
     return SandboxedWorkflowRunner(
         restrictions=dataclasses.replace(
             SandboxRestrictions.default,
@@ -61,6 +70,7 @@ def new_sandbox_runner() -> SandboxedWorkflowRunner:
                 SandboxRestrictions.invalid_module_members_default,
                 children=invalid_module_member_children,
             ),
+            passthrough_modules=passthrough_modules,
         )
     )
 
@@ -71,22 +81,23 @@ interrupt_event = asyncio.Event()
 def get_activities() -> list[Callable]:
     activities: list[Callable] = [
         *DSLActivities.load(),
+        *CollectionActivities.get_activities(),
         get_workflow_definition_activity,
+        resolve_registry_lock_activity,
         *WorkflowSchedulesService.get_activities(),
-        validate_trigger_inputs_activity,
-        normalize_trigger_inputs_activity,
+        resolve_time_anchor_activity,
         *WorkflowsManagementService.get_activities(),
         *InteractionService.get_activities(),
     ]
-    tool_executor = SimpleToolExecutor()
-    agent_activities = AgentActivities(tool_executor=tool_executor)
-    activities.extend(agent_activities.get_activities())
-    activities.extend(ApprovalManager.get_activities())
-    activities.append(resolve_agent_preset_config_activity)
     return activities
 
 
 async def main() -> None:
+    # Enable workflow replay log filtering for this process
+    from tracecat.logger import _logger
+
+    _logger._is_worker_process = True
+
     client = await get_temporal_client(plugins=[TracecatPydanticAIPlugin()])
 
     interceptors = []
@@ -145,11 +156,26 @@ async def main() -> None:
             logger.info("Shutting down")
 
 
+def _signal_handler(sig: int, _frame: object) -> None:
+    """Handle shutdown signals gracefully.
+
+    This mirrors the executor Temporal worker so the DSL worker can shut down
+    cleanly on SIGINT/SIGTERM (e.g. `docker stop`, Kubernetes termination).
+    """
+    logger.info("Received shutdown signal", signal=sig)
+    interrupt_event.set()
+
+
 if __name__ == "__main__":
+    # Install signal handlers before starting the event loop.
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
     loop = asyncio.new_event_loop()
     loop.set_task_factory(asyncio.eager_task_factory)
     try:
         loop.run_until_complete(main())
     except KeyboardInterrupt:
         interrupt_event.set()
+    finally:
         loop.run_until_complete(loop.shutdown_asyncgens())

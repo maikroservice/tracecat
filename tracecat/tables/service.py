@@ -14,7 +14,7 @@ from asyncpg.exceptions import (
     UndefinedTableError,
 )
 from sqlalchemy import select
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.exc import DBAPIError, IntegrityError, NoResultFound, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
 from tenacity import (
@@ -177,6 +177,28 @@ class BaseTablesService(BaseWorkspaceService):
                 normalised[column_name] = value
 
         return normalised
+
+    def _sa_type_for_column(self, sql_type: SqlType) -> sa.types.TypeEngine:
+        """Map SqlType to SQLAlchemy column types for safe binding."""
+        match sql_type:
+            case SqlType.TEXT | SqlType.SELECT:
+                return sa.String()
+            case SqlType.INTEGER:
+                return sa.BigInteger()
+            case SqlType.NUMERIC:
+                return sa.Numeric()
+            case SqlType.DATE:
+                return sa.Date()
+            case SqlType.BOOLEAN:
+                return sa.Boolean()
+            case SqlType.TIMESTAMP | SqlType.TIMESTAMPTZ:
+                return sa.TIMESTAMP(timezone=True)
+            case SqlType.JSONB | SqlType.MULTI_SELECT:
+                return JSONB()
+            case SqlType.UUID:
+                return sa.UUID()
+            case _:
+                return sa.String()
 
     async def list_tables(self) -> Sequence[Table]:
         """List all lookup tables for a workspace.
@@ -902,7 +924,12 @@ class BaseTablesService(BaseWorkspaceService):
         )
         if limit is not None:
             stmt = stmt.limit(limit)
-        async with self.session.begin() as txn:
+        txn_cm = (
+            self.session.begin_nested()
+            if self.session.in_transaction()
+            else self.session.begin()
+        )
+        async with txn_cm as txn:
             conn = await txn.session.connection()
             try:
                 result = await conn.execute(
@@ -914,6 +941,7 @@ class BaseTablesService(BaseWorkspaceService):
                 return [dict(row) for row in result.mappings().all()]
             except _RETRYABLE_DB_EXCEPTIONS as e:
                 # Log the error for debugging
+                # Note: Context manager handles rollback (savepoint or full) automatically
                 self.logger.warning(
                     "Retryable DB exception occurred",
                     kind=type(e).__name__,
@@ -921,8 +949,6 @@ class BaseTablesService(BaseWorkspaceService):
                     table=table_name,
                     schema=schema_name,
                 )
-                # Ensure transaction is rolled back
-                await conn.rollback()
                 raise
             except ProgrammingError as e:
                 while (cause := e.__cause__) is not None:
@@ -974,7 +1000,12 @@ class BaseTablesService(BaseWorkspaceService):
         exists_stmt = sa.exists(sa.select(1).select_from(table_clause).where(condition))
         stmt = sa.select(exists_stmt)
 
-        async with self.session.begin() as txn:
+        txn_cm = (
+            self.session.begin_nested()
+            if self.session.in_transaction()
+            else self.session.begin()
+        )
+        async with txn_cm as txn:
             conn = await txn.session.connection()
             try:
                 result = await conn.execute(
@@ -986,6 +1017,7 @@ class BaseTablesService(BaseWorkspaceService):
                 exists_val = result.scalar()
                 return bool(exists_val)
             except _RETRYABLE_DB_EXCEPTIONS as e:
+                # Note: Context manager handles rollback (savepoint or full) automatically
                 self.logger.warning(
                     "Retryable DB exception occurred during exists_rows",
                     kind=type(e).__name__,
@@ -993,7 +1025,6 @@ class BaseTablesService(BaseWorkspaceService):
                     table=table_name,
                     schema=schema_name,
                 )
-                await conn.rollback()
                 raise
             except ProgrammingError as e:
                 while (cause := e.__cause__) is not None:
@@ -1467,6 +1498,11 @@ class BaseTablesService(BaseWorkspaceService):
             normalised_row = self._normalize_row_inputs(table, row)
             rows_by_columns[frozenset(normalised_row.keys())].append(normalised_row)
 
+        column_type_map = {
+            column.name: self._sa_type_for_column(SqlType(column.type))
+            for column in table.columns
+        }
+
         conn = await self.session.connection()
 
         total_affected = 0
@@ -1486,7 +1522,13 @@ class BaseTablesService(BaseWorkspaceService):
         # Iterate over groups and execute separate INSERT/UPSERT statements.
         for col_set, group_rows in rows_by_columns.items():
             # Sanitize column identifiers for this group
-            cols = [sa.column(self._sanitize_identifier(col)) for col in col_set]
+            cols = [
+                sa.column(
+                    self._sanitize_identifier(col),
+                    type_=column_type_map.get(col),
+                )
+                for col in col_set
+            ]
             table_obj = sa.table(sanitized_table_name, *cols, schema=schema_name)
 
             if not upsert:

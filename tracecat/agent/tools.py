@@ -1,170 +1,165 @@
-"""Functions that create and call tools added to the agent."""
+"""Functions that create and call tools added to the agent.
 
-import inspect
-import keyword
-import textwrap
-import types
+This module provides harness-agnostic tool building from the Tracecat registry.
+Tools use canonical action names (with dots, e.g., 'core.cases.list_cases').
+Harness-specific adapters are responsible for converting to their required format.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+import tempfile
 from dataclasses import dataclass
-from functools import reduce
-from operator import or_
-from typing import Any, Protocol, Union, get_args, get_origin
+from pathlib import Path
+from typing import Any
 
 import orjson
-from pydantic_ai import ModelRetry
-from pydantic_ai.messages import (
-    ModelRequest,
-    ModelResponse,
-    ToolCallPart,
-    ToolReturnPart,
-)
-from pydantic_ai.tools import Tool
-from pydantic_core import PydanticUndefined
 from tracecat_registry import RegistrySecretType
 
+from tracecat.agent.types import Tool
 from tracecat.config import TRACECAT__AGENT_MAX_TOOLS
+from tracecat.contexts import ctx_role
 from tracecat.db.models import RegistryAction
-from tracecat.dsl.common import create_default_execution_context
-from tracecat.executor.service import (
-    _run_action_direct,
-    get_workspace_variables,
-    run_template_action,
-)
-from tracecat.expressions.common import ExprContext
-from tracecat.expressions.eval import collect_expressions, eval_templated_object
 from tracecat.expressions.expectations import create_expectation_model
 from tracecat.logger import logger
-from tracecat.registry.actions.schemas import BoundRegistryAction, RegistryActionOptions
+from tracecat.registry.actions.bound import BoundRegistryAction
+from tracecat.registry.actions.schemas import RegistryActionOptions
 from tracecat.registry.actions.service import RegistryActionsService
-from tracecat.secrets import secrets_manager
-
-# Define JsonValue type for tool parameters that accept any JSON-compatible value
-JsonValue = str | int | float | bool | None | list | dict
 
 
-def create_tool_call_message(
-    tool_name: str,
-    tool_args: str | dict[str, Any],
-    tool_call_id: str,
-    fixed_args: dict[str, Any] | None = None,
-) -> ModelResponse:
-    """Build an assistant tool-call message (ModelResponse)."""
-    if isinstance(tool_args, str):
-        try:
-            args = orjson.loads(tool_args)
-        except Exception:
-            logger.warning("Failed to parse tool args", tool_args=tool_args)
-            args = {"args": tool_args}
-    else:
-        args = tool_args
-    if fixed_args:
-        args = {**fixed_args, **args}
-    return ModelResponse(
-        parts=[
-            ToolCallPart(
-                tool_name=tool_name,
-                args=args,
-                tool_call_id=tool_call_id,
-            )
-        ]
-    )
-
-
-def create_tool_return_message(
-    tool_name: str,
-    content: Any,
-    tool_call_id: str,
-) -> ModelRequest:
-    """Build the matching tool-result message (ModelRequest)."""
-    return ModelRequest(
-        parts=[
-            ToolReturnPart(
-                tool_name=tool_name,
-                tool_call_id=tool_call_id,
-                content=content,
-            )
-        ]
-    )
+class ToolExecutionError(Exception):
+    """Raised when tool execution fails."""
 
 
 async def call_tracecat_action(
     action_name: str,
     args: dict[str, Any],
-    *,
-    service: RegistryActionsService | None = None,
 ) -> Any:
-    # Use provided service or create a new session context
-    if service is None:
-        async with RegistryActionsService.with_session() as session_service:
-            return await call_tracecat_action(
-                action_name, args, service=session_service
+    """Execute a Tracecat action in a subprocess.
+
+    This spawns a separate process to run the action, providing process isolation
+    and avoiding load on the executor service which handles workflow executions.
+
+    Uses temporary files for input/output to avoid Unix pipe buffer limits (64KB).
+
+    Args:
+        action_name: The action to execute (e.g., "core.http_request")
+        args: Arguments to pass to the action
+
+    Returns:
+        The action result
+
+    Raises:
+        ToolExecutionError: If action execution fails
+    """
+    role = ctx_role.get()
+    role_data = role.model_dump(mode="json") if role else None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = Path(tmpdir) / "input.json"
+        output_path = Path(tmpdir) / "output.json"
+
+        payload = orjson.dumps(
+            {
+                "action_name": action_name,
+                "args": args,
+                "role": role_data,
+            }
+        )
+        input_path.write_bytes(payload)
+
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "tracecat.agent._subprocess_runner",
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+            stderr=asyncio.subprocess.PIPE,
+            env=os.environ.copy(),
+        )
+
+        try:
+            _, stderr = await proc.communicate()
+        except asyncio.CancelledError:
+            if proc.returncode is None:
+                proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2)
+                except TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+            raise
+
+        if proc.returncode != 0:
+            error_msg = stderr.decode() if stderr else "Unknown subprocess error"
+            logger.error(
+                "Subprocess failed",
+                action_name=action_name,
+                returncode=proc.returncode,
+                stderr=error_msg,
             )
+            raise ToolExecutionError(f"Action execution failed: {error_msg}")
 
-    # Service provided - use it directly
-    reg_action = await service.get_action(action_name)
-    action_secrets = await service.fetch_all_action_secrets(reg_action)
-    bound_action = service.get_bound(reg_action, mode="execution")
+        if not output_path.exists():
+            logger.error(
+                "Subprocess did not produce output file",
+                action_name=action_name,
+            )
+            raise ToolExecutionError("Action execution failed: no output produced")
 
-    collected = collect_expressions(args)
-    secrets = await secrets_manager.get_action_secrets(
-        secret_exprs=collected.secrets, action_secrets=action_secrets
-    )
-    ws_vars = await get_workspace_variables(variable_exprs=collected.variables)
+        try:
+            result = orjson.loads(output_path.read_bytes())
+        except orjson.JSONDecodeError as e:
+            logger.error(
+                "Failed to parse subprocess output",
+                action_name=action_name,
+                error=str(e),
+            )
+            raise ToolExecutionError(f"Failed to parse action result: {e}") from e
+        else:
+            try:
+                output_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
-    # Call action with secrets in environment
-    context = create_default_execution_context()
-    context[ExprContext.SECRETS] = secrets
-    context[ExprContext.VARS] = ws_vars
+    if not result.get("success"):
+        error = result.get("error", "Unknown error")
+        logger.error("Action execution failed", action_name=action_name, error=error)
+        raise ToolExecutionError(error)
 
-    flattened_secrets = secrets_manager.flatten_secrets(secrets)
-    try:
-        args = eval_templated_object(args, operand=context)
-        with secrets_manager.env_sandbox(flattened_secrets):
-            # Call directly based on action type
-            if bound_action.is_template:
-                # For templates, pass the context with secrets
-                result = await run_template_action(
-                    action=bound_action,
-                    args=args,
-                    context=context,
-                )
-            else:
-                # UDFs can be called directly - secrets are now in the environment
-                result = await _run_action_direct(
-                    action=bound_action,
-                    args=args,
-                )
-    except Exception as e:
-        raise ModelRetry(str(e)) from e
-    return result
+    return result.get("result")
 
 
 async def create_tool_from_registry(
     action_name: str,
     ra: RegistryAction | None = None,
-    fixed_args: dict[str, Any] | None = None,
     *,
     service: RegistryActionsService | None = None,
     tool_approvals: dict[str, bool] | None = None,
 ) -> Tool:
-    """Create a Pydantic AI Tool directly from the registry.
+    """Create a Tool from a registry action.
 
     Args:
-        action_name: Full action name (e.g., "core.http_request")
-        fixed_args: Fixed arguments to curry into the tool function
+        action_name: Full canonical action name (e.g., "core.http_request")
+        ra: Optional pre-fetched RegistryAction
+        service: Optional RegistryActionsService instance
+        tool_approvals: Tool approval requirements by tool name
 
     Returns:
-        A configured Pydantic AI Tool
+        A Tool with canonical action name and JSON schema
 
     Raises:
-        ValueError: If action has no description or template action is invalid
+        ValueError: If action has no description
     """
-    # Load action from registry
     if service is None:
         async with RegistryActionsService.with_session() as _service:
             return await create_tool_from_registry(
                 action_name,
                 ra,
-                fixed_args,
                 service=_service,
                 tool_approvals=tool_approvals,
             )
@@ -173,50 +168,18 @@ async def create_tool_from_registry(
     options = RegistryActionOptions.model_validate(reg_action.options)
     bound_action = service.get_bound(reg_action, mode="execution")
 
-    fixed_args = fixed_args or {}
-    fixed_arg_names = set(fixed_args.keys())
-
     # Extract metadata from the bound action
     description, model_cls = _extract_action_metadata(bound_action)
 
-    # Create function signature and get parameter mapping
-    sig = _create_function_signature(model_cls, fixed_arg_names)
-
-    # Create wrapper function that calls the action with fixed args merged
-    async def tool_func(**kwargs: Any) -> Any:
-        # Remap sanitized parameter names back to original field names
-        remapped_kwargs = {}
-        for param_name, value in kwargs.items():
-            original_name = sig.param_mapping.get(param_name, param_name)
-            remapped_kwargs[original_name] = value
-
-        # Merge fixed arguments with runtime arguments
-        merged_args = {**fixed_args, **remapped_kwargs}
-        # Important: Do not reuse the builder's service/session for execution.
-        # Each tool invocation should create its own short-lived DB session to
-        # avoid concurrent operations on a shared AsyncSession when multiple
-        # tools are called in parallel by the agent.
-        return await call_tracecat_action(action_name, merged_args)
-
-    # Set function name
-    tool_func.__name__ = _generate_tool_function_name(
-        bound_action.namespace, bound_action.name
-    )
-
-    # Validate description
     if not description:
         raise ValueError(f"Action '{action_name}' has no description")
 
-    # Set function signature and annotations for proper introspection
-    tool_func.__signature__ = sig.signature  # type: ignore[attr-defined]
-    tool_func.__annotations__ = sig.annotations
-
-    # Generate Google-style docstring, excluding fixed args
-    tool_func.__doc__ = _generate_google_style_docstring(
-        description, model_cls, fixed_arg_names
+    # Get JSON schema from model class
+    parameters_json_schema = (
+        model_cls.model_json_schema() if hasattr(model_cls, "model_json_schema") else {}
     )
 
-    # Create tool with enforced documentation standards
+    # Determine requires_approval
     override = (tool_approvals or {}).get(action_name)
     if override is not None:
         requires_approval = override
@@ -224,9 +187,9 @@ async def create_tool_from_registry(
         requires_approval = options.requires_approval
 
     return Tool(
-        tool_func,
-        docstring_format="google",
-        require_parameter_descriptions=False,
+        name=action_name,  # Canonical name with dots
+        description=description,
+        parameters_json_schema=parameters_json_schema,
         requires_approval=requires_approval,
     )
 
@@ -236,11 +199,11 @@ class CreateToolResult:
     """Result of creating a single tool from a registry action."""
 
     tool: Tool
-    """The created tool, or None if creation failed."""
+    """The created tool."""
     collected_secrets: set[RegistrySecretType]
     """Secrets collected during tool creation."""
     action_name: str
-    """The action name that was processed."""
+    """The canonical action name (with dots)."""
 
 
 async def create_single_tool(
@@ -254,7 +217,7 @@ async def create_single_tool(
     Args:
         service: The registry actions service instance
         ra: The registry action to create a tool from
-        action_name: The formatted action name (namespace.name)
+        action_name: The canonical action name (namespace.name)
         tool_approvals: Tool approval requirements by tool name
 
     Returns:
@@ -263,14 +226,12 @@ async def create_single_tool(
     collected_secrets: set[RegistrySecretType] = set()
 
     try:
-        # Fetch all secrets for this action
         action_secrets = await service.fetch_all_action_secrets(ra)
         collected_secrets.update(action_secrets)
 
         tool = await create_tool_from_registry(
             action_name,
             ra,
-            None,
             service=service,
             tool_approvals=tool_approvals,
         )
@@ -290,9 +251,13 @@ async def create_single_tool(
 
 
 @dataclass
-class BuildToolsResult[DepsT]:
-    tools: list[Tool[DepsT]]
+class BuildToolsResult:
+    """Result of building tools from registry actions."""
+
+    tools: list[Tool]
+    """List of tools with canonical action names."""
     collected_secrets: set[RegistrySecretType]
+    """All secrets required by the tools."""
 
 
 async def build_agent_tools(
@@ -301,20 +266,29 @@ async def build_agent_tools(
     tool_approvals: dict[str, bool] | None = None,
     max_tools: int = TRACECAT__AGENT_MAX_TOOLS,
 ) -> BuildToolsResult:
-    """Build tools from a list of actions."""
+    """Build tools from a list of actions.
+
+    Args:
+        namespaces: Optional list of namespace prefixes to filter by
+        actions: List of canonical action names to build tools for
+        tool_approvals: Tool approval requirements by tool name
+        max_tools: Maximum number of tools allowed
+
+    Returns:
+        BuildToolsResult containing tools and collected secrets
+
+    Raises:
+        ValueError: If actions are missing/failed or max_tools exceeded
+    """
     if not actions:
-        return BuildToolsResult(
-            tools=[],
-            collected_secrets=set(),
-        )
+        return BuildToolsResult(tools=[], collected_secrets=set())
+
     tools: list[Tool] = []
     collected_secrets: set[RegistrySecretType] = set()
 
-    # Get actions from registry
     async with RegistryActionsService.with_session() as service:
         selected_actions = await service.get_actions(actions)
 
-        # Collect action build issues
         failed_actions: set[str] = set()
         missing_actions: set[str] = set()
 
@@ -326,10 +300,6 @@ async def build_agent_tools(
                 if action_name not in found_actions
             }
 
-        # NOTE: avoid running `create_tool` concurrently with the same
-        # `RegistryActionsService` instance. AsyncSession does not support
-        # concurrent usage, so we iterate sequentially instead of
-        # `asyncio.gather`.
         for ra in selected_actions:
             action_name = f"{ra.namespace}.{ra.name}"
             logger.debug(f"Building tool for action: {action_name}")
@@ -339,7 +309,6 @@ async def build_agent_tools(
                 if not any(action_name.startswith(ns) for ns in namespaces):
                     continue
 
-            # Create the tool using the extracted function
             result = await create_single_tool(
                 service,
                 ra,
@@ -347,20 +316,13 @@ async def build_agent_tools(
                 tool_approvals=tool_approvals,
             )
 
-            # Check if result is None and handle accordingly
             if result is None:
                 failed_actions.add(action_name)
                 continue
 
-            # Update collected secrets
             collected_secrets.update(result.collected_secrets)
+            tools.append(result.tool)
 
-            if result.tool is not None:
-                tools.append(result.tool)
-            else:
-                failed_actions.add(result.action_name)
-
-    # If there were failures, raise simple error
     if missing_actions or failed_actions:
         details: list[str] = []
         if missing_actions:
@@ -379,24 +341,7 @@ async def build_agent_tools(
     if max_tools > 0 and len(tools) > max_tools:
         raise ValueError(f"Cannot request more than {max_tools} tools")
 
-    return BuildToolsResult(
-        tools=tools,
-        collected_secrets=collected_secrets,
-    )
-
-
-def _sanitize_parameter_name(name: str) -> str:
-    """Sanitize parameter names that are Python reserved keywords.
-
-    Args:
-        name: The original parameter name
-
-    Returns:
-        A valid Python parameter name
-    """
-    if keyword.iskeyword(name):
-        return f"{name}_"
-    return name
+    return BuildToolsResult(tools=tools, collected_secrets=collected_secrets)
 
 
 def _extract_action_metadata(bound_action: BoundRegistryAction) -> tuple[str, type]:
@@ -409,247 +354,37 @@ def _extract_action_metadata(bound_action: BoundRegistryAction) -> tuple[str, ty
         Tuple of (description, model_cls)
 
     Raises:
-        ValueError: If template action is not set or description is missing
+        ValueError: If template action is not set
     """
     if bound_action.type == "template":
         if not bound_action.template_action:
             raise ValueError("Template action is not set")
 
-        # Use template description with fallback
         description = (
             bound_action.template_action.definition.description
             or bound_action.description
         )
 
-        # Get the model from expects
         expects = bound_action.template_action.definition.expects
         model_cls = create_expectation_model(
             expects, bound_action.template_action.definition.action.replace(".", "__")
         )
     else:
-        # Use UDF description and args_cls
         description = bound_action.description
         model_cls = bound_action.args_cls
 
     return description, model_cls
 
 
-@dataclass(frozen=True, slots=True)
-class FunctionSignature:
-    signature: inspect.Signature
-    annotations: dict[str, Any]
-    param_mapping: dict[str, str]
-
-
-def _replace_any_with_jsonvalue(annotation: Any) -> Any:
-    """Replace Any type annotations with JsonValue for better tool schema generation.
-
-    Handles both direct Any types and Any within union types (e.g., str | Any).
-
-    Args:
-        annotation: The type annotation to check and potentially replace
-
-    Returns:
-        JsonValue if annotation is Any, or a union with Any replaced by JsonValue
-    """
-    # Check if the annotation is exactly Any
-    if annotation is Any:
-        return JsonValue
-
-    # Check if it's a Union type (handles both Union[X, Y] and X | Y syntax)
-    origin = get_origin(annotation)
-    if origin is Union or isinstance(annotation, types.UnionType):
-        # Get all the union members
-        args = get_args(annotation)
-        # Replace any Any members with JsonValue
-        new_args = tuple(JsonValue if arg is Any else arg for arg in args)
-
-        # If we made changes, reconstruct the union
-        if new_args != args:
-            # Use reduce with | operator to reconstruct union (Python 3.10+ syntax)
-            if len(new_args) == 1:
-                return new_args[0]
-            return reduce(or_, new_args)
-
-    return annotation
-
-
-def _create_function_signature(
-    model_cls: type, fixed_args: set[str] | None = None
-) -> FunctionSignature:
-    """Create function signature and annotations from a Pydantic model.
-
-    Args:
-        model_cls: The Pydantic model class
-        fixed_args: Set of argument names that are fixed and should be excluded
-
-    Returns:
-        Tuple of (signature, annotations, param_mapping)
-        param_mapping: dict mapping sanitized param names to original field names
-    """
-    sig_params = []
-    annotations = {}
-    param_mapping = {}  # sanitized_name -> original_field_name
-    fixed_args = fixed_args or set()
-
-    for field_name, field_info in model_cls.model_fields.items():
-        # Skip fixed arguments
-        if field_name in fixed_args:
-            continue
-
-        # Use the Pydantic field's annotation directly
-        annotation = field_info.annotation
-        # Replace Any with JsonValue for strictness (OpenAI specific) in tool schema generation
-        annotation = _replace_any_with_jsonvalue(annotation)
-
-        # Handle defaults from Pydantic field
-        if field_info.default is not PydanticUndefined:
-            # Field has an explicit default value
-            default = field_info.default
-        elif field_info.default_factory is not None:
-            # Field has a default factory
-            default = None
-            # Only wrap in Union if not already optional
-            # Check if the annotation is already a Union type with None
-            if hasattr(annotation, "__args__") and type(None) in annotation.__args__:
-                # Already optional, don't double-wrap
-                pass
-            else:
-                # Make optional types explicit for clarity
-                annotation = annotation | None
-        else:
-            # Required field
-            default = inspect.Parameter.empty
-
-        # Sanitize field name for Python keywords
-        param_name = _sanitize_parameter_name(field_name)
-        param_mapping[param_name] = field_name
-
-        # Create parameter
-        param = inspect.Parameter(
-            name=param_name,
-            kind=inspect.Parameter.KEYWORD_ONLY,
-            annotation=annotation,
-            default=default,
-        )
-        sig_params.append(param)
-        annotations[param_name] = annotation
-
-    # Add return annotation
-    annotations["return"] = Any
-
-    return FunctionSignature(
-        signature=inspect.Signature(sig_params),
-        annotations=annotations,
-        param_mapping=param_mapping,
-    )
-
-
-def _generate_tool_function_name(namespace: str, name: str, *, sep: str = "__") -> str:
-    """Generate a function name from namespace and action name.
-
-    Args:
-        namespace: The action namespace (e.g., "tools.slack")
-        name: The action name (e.g., "post_message")
-        sep: The separator to use between namespace and name
-
-    Returns:
-        Generated function name (e.g., "tools.slack.post_message" -> "tools__slack__post_message")
-    """
-    # Extract the last part of namespace after splitting by "."
-    return f"{namespace}{sep}{name}".replace(".", sep)
-
-
-def _generate_google_style_docstring(
-    description: str | None, model_cls: type, fixed_args: set[str] | None = None
-) -> str:
-    """Generate a Google-style docstring from a description and Pydantic model.
-
-    Args:
-        description: The base description for the function
-        model_cls: The Pydantic model class containing parameter information
-        fixed_args: Set of argument names that are fixed and should be excluded
-
-    Returns:
-        A properly formatted Google-style docstring with Args section
-
-    Raises:
-        ValueError: If description is None
-    """
-    if description is None:
-        raise ValueError("Tool description cannot be None")
-
-    # Extract parameter descriptions from the model's JSON schema
-    param_lines = []
-    fixed_args = fixed_args or set()
-
-    if hasattr(model_cls, "model_json_schema"):
-        schema = model_cls.model_json_schema()
-        properties = schema.get("properties", {})
-
-        for prop_name, prop_info in properties.items():
-            # Skip fixed arguments
-            if prop_name in fixed_args:
-                continue
-
-            # Get description from schema, fall back to a placeholder if missing
-            prop_desc = prop_info.get("description", f"Parameter {prop_name}")
-            param_lines.append(f"{prop_name}: {prop_desc}")
-
-    # Build the complete docstring
-    if param_lines:
-        params_section = "\n".join(param_lines)
-        indented_params = textwrap.indent(params_section, "    ")
-        return f"{description}\n\nArgs:\n{indented_params}"
-    else:
-        return f"{description}\n\nArgs:\n    None"
-
-
 def denormalize_tool_name(tool_name: str) -> str:
-    """Convert a tool ID to a format that can be used to execute the tool."""
+    """Convert MCP tool name format to canonical action name.
+
+    MCP tool names use double underscores, canonical names use dots.
+
+    Args:
+        tool_name: MCP format name (e.g., "core__cases__list_cases")
+
+    Returns:
+        Canonical action name (e.g., "core.cases.list_cases")
+    """
     return tool_name.replace("__", ".")
-
-
-class ToolExecutor(Protocol):
-    """Client for tool calls."""
-
-    async def run(self, tool_name: str, args: dict[str, Any]) -> Any: ...
-
-
-class SimpleToolExecutor(ToolExecutor):
-    """Simple implementation of ToolExecutor that uses the registry to execute tools."""
-
-    async def run(self, tool_name: str, args: dict[str, Any]) -> Any:
-        """Execute a tool by ID with the given arguments.
-
-        Args:
-            tool_id: The tool identifier (e.g., "core.http.request" or "core__http__request")
-            args: Dictionary of arguments to pass to the tool
-
-        Returns:
-            The result of the tool execution
-
-        Raises:
-            ModelRetry: If the tool requests a retry
-            Exception: For any other tool execution errors
-        """
-        # Convert double underscores to dots for action name format
-        logger.info("Executing tool call", tool_id=tool_name)
-
-        # Create tool from registry
-        async with RegistryActionsService.with_session() as svc:
-            tool = await create_tool_from_registry(
-                tool_name, fixed_args=args, service=svc
-            )
-
-        # Execute the tool function
-        result = await tool.function(**args)  # type: ignore
-        return result
-
-
-class RemoteToolExecutor(ToolExecutor):
-    """Executor for tools that are not in the registry."""
-
-    async def run(self, tool_name: str, args: dict[str, Any]) -> Any:
-        """Execute a tool by ID with the given arguments."""
-        raise NotImplementedError("Remote tool execution is not implemented")

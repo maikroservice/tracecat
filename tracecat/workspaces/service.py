@@ -6,7 +6,6 @@ from pydantic import UUID4
 from sqlalchemy import select
 from sqlalchemy.orm import load_only, noload
 
-from tracecat import config
 from tracecat.audit.logger import audit_log
 from tracecat.auth.types import AccessLevel, Role
 from tracecat.authz.controls import require_access_level
@@ -14,8 +13,9 @@ from tracecat.authz.enums import OwnerType, WorkspaceRole
 from tracecat.cases.service import CaseFieldsService
 from tracecat.db.models import Membership, Ownership, User, Workspace
 from tracecat.exceptions import TracecatException, TracecatManagementError
-from tracecat.identifiers import OrganizationID, UserID, WorkspaceID
+from tracecat.identifiers import UserID, WorkspaceID
 from tracecat.service import BaseService
+from tracecat.workflow.schedules.service import WorkflowSchedulesService
 from tracecat.workspaces.schemas import WorkspaceSearch, WorkspaceUpdate
 
 
@@ -30,11 +30,15 @@ class WorkspaceService(BaseService):
         self, limit: int | None = None
     ) -> Sequence[Workspace]:
         """List all workspaces in the organization."""
-        statement = select(Workspace).options(
-            load_only(
-                *(getattr(Workspace, f) for f in self._load_only)
-            ),  # only what the route returns
-            noload("*"),  # disable all relationship loaders
+        statement = (
+            select(Workspace)
+            .options(
+                load_only(
+                    *(getattr(Workspace, f) for f in self._load_only)
+                ),  # only what the route returns
+                noload("*"),  # disable all relationship loaders
+            )
+            .where(Workspace.organization_id == self.organization_id)
         )
         if limit is not None:
             if limit <= 0:
@@ -70,14 +74,13 @@ class WorkspaceService(BaseService):
         self,
         name: str,
         *,
-        organization_id: OrganizationID = config.TRACECAT__DEFAULT_ORG_ID,
         override_id: UUID4 | None = None,
         users: list[User] | None = None,
     ) -> Workspace:
         """Create a new workspace."""
         kwargs = {
             "name": name,
-            "organization_id": organization_id,
+            "organization_id": self.organization_id,
             # Workspace model defines the relationship as "members"
             "members": users or [],
         }
@@ -91,7 +94,7 @@ class WorkspaceService(BaseService):
         ownership = Ownership(
             resource_id=str(workspace.id),
             resource_type="workspace",
-            owner_id=organization_id,
+            owner_id=self.organization_id,
             owner_type=OwnerType.USER.value,
         )
         self.session.add(ownership)
@@ -116,7 +119,10 @@ class WorkspaceService(BaseService):
 
     async def get_workspace(self, workspace_id: WorkspaceID) -> Workspace | None:
         """Retrieve a workspace by ID."""
-        statement = select(Workspace).where(Workspace.id == workspace_id)
+        statement = select(Workspace).where(
+            Workspace.organization_id == self.organization_id,
+            Workspace.id == workspace_id,
+        )
         result = await self.session.execute(statement)
         return result.scalar_one_or_none()
 
@@ -144,7 +150,10 @@ class WorkspaceService(BaseService):
             raise TracecatManagementError(
                 "There must be at least one workspace in the organization."
             )
-        statement = select(Workspace).where(Workspace.id == workspace_id)
+        statement = select(Workspace).where(
+            Workspace.organization_id == self.organization_id,
+            Workspace.id == workspace_id,
+        )
         result = await self.session.execute(statement)
         workspace = result.scalar_one()
         bootstrap_role = Role(
@@ -154,6 +163,14 @@ class WorkspaceService(BaseService):
             workspace_role=WorkspaceRole.ADMIN,
             access_level=AccessLevel.ADMIN,
         )
+
+        # Delete Temporal schedules before workspace deletion
+        schedule_service = WorkflowSchedulesService(
+            session=self.session, role=bootstrap_role
+        )
+        for schedule in await schedule_service.list_schedules():
+            await schedule_service.delete_schedule(schedule.id, commit=False)
+
         case_fields_service = CaseFieldsService(
             session=self.session, role=bootstrap_role
         )
@@ -163,7 +180,9 @@ class WorkspaceService(BaseService):
 
     async def search_workspaces(self, params: WorkspaceSearch) -> Sequence[Workspace]:
         """Retrieve a workspace by ID."""
-        statement = select(Workspace)
+        statement = select(Workspace).where(
+            Workspace.organization_id == self.organization_id
+        )
         if self.role.access_level < AccessLevel.ADMIN:
             # Only list workspaces where user is a member
             statement = statement.where(

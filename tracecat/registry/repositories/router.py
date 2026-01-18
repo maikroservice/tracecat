@@ -1,7 +1,7 @@
+import uuid
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, HTTPException, status
-from pydantic import UUID4
 from sqlalchemy.exc import IntegrityError, NoResultFound
 
 from tracecat.auth.credentials import RoleACL
@@ -29,6 +29,7 @@ from tracecat.registry.repositories.schemas import (
     RegistryRepositoryReadMinimal,
     RegistryRepositorySync,
     RegistryRepositoryUpdate,
+    RegistryVersionPromoteResponse,
 )
 from tracecat.registry.repositories.service import RegistryReposService
 from tracecat.settings.service import get_setting
@@ -75,7 +76,7 @@ async def sync_registry_repository(
         min_access_level=AccessLevel.ADMIN,
     ),
     session: AsyncDBSession,
-    repository_id: UUID4,
+    repository_id: uuid.UUID,
     sync_params: RegistryRepositorySync | None = None,
 ) -> None:
     """Load actions from a specific registry repository.
@@ -105,12 +106,37 @@ async def sync_registry_repository(
     # Check if v2 sync is enabled via feature flag
     use_v2_sync = is_feature_enabled(FeatureFlag.REGISTRY_SYNC_V2)
 
+    # For git+ssh repos, we need SSH context for wheel building
+    is_git_ssh = repo.origin.startswith("git+ssh://")
+
     try:
         if use_v2_sync:
-            # V2 sync: creates RegistryVersion, builds wheel, populates RegistryIndex
-            commit_sha, version = await actions_service.sync_actions_from_repository_v2(
-                repo, target_commit_sha=target_commit_sha
-            )
+            if is_git_ssh:
+                # Get SSH context for git operations
+                allowed_domains_setting = await get_setting(
+                    "git_allowed_domains", role=role
+                )
+                allowed_domains = allowed_domains_setting or {"github.com"}
+                git_url = parse_git_url(repo.origin, allowed_domains=allowed_domains)
+
+                async with ssh_context(
+                    role=role, git_url=git_url, session=session
+                ) as ssh_env:
+                    # V2 sync with SSH env for wheel building
+                    (
+                        commit_sha,
+                        version,
+                    ) = await actions_service.sync_actions_from_repository_v2(
+                        repo, target_commit_sha=target_commit_sha, ssh_env=ssh_env
+                    )
+            else:
+                # V2 sync without SSH (built-in registry)
+                (
+                    commit_sha,
+                    version,
+                ) = await actions_service.sync_actions_from_repository_v2(
+                    repo, target_commit_sha=target_commit_sha
+                )
             logger.info(
                 "Synced repository (v2)",
                 origin=repo.origin,
@@ -195,6 +221,7 @@ async def list_registry_repositories(
             origin=repo.origin,
             last_synced_at=repo.last_synced_at,
             commit_sha=repo.commit_sha,
+            current_version_id=repo.current_version_id,
         )
         for repo in repositories
     ]
@@ -209,7 +236,7 @@ async def get_registry_repository(
         require_workspace="no",
     ),
     session: AsyncDBSession,
-    repository_id: UUID4,
+    repository_id: uuid.UUID,
 ) -> RegistryRepositoryRead:
     """Get a specific registry repository by origin."""
     service = RegistryReposService(session, role)
@@ -226,6 +253,7 @@ async def get_registry_repository(
         origin=repository.origin,
         last_synced_at=repository.last_synced_at,
         commit_sha=repository.commit_sha,
+        current_version_id=repository.current_version_id,
         actions=[
             RegistryActionRead.model_validate(action, from_attributes=True)
             for action in repository.actions
@@ -242,7 +270,7 @@ async def list_repository_commits(
         require_workspace="no",
     ),
     session: AsyncDBSession,
-    repository_id: UUID4,
+    repository_id: uuid.UUID,
     branch: str = "main",
     limit: int = 10,
 ) -> list[GitCommitInfo]:
@@ -357,6 +385,7 @@ async def create_registry_repository(
         origin=created_repository.origin,
         last_synced_at=created_repository.last_synced_at,
         commit_sha=created_repository.commit_sha,
+        current_version_id=created_repository.current_version_id,
         actions=[
             RegistryActionRead.model_validate(action, from_attributes=True)
             for action in created_repository.actions
@@ -374,7 +403,7 @@ async def update_registry_repository(
         min_access_level=AccessLevel.ADMIN,
     ),
     session: AsyncDBSession,
-    repository_id: UUID4,
+    repository_id: uuid.UUID,
     params: RegistryRepositoryUpdate,
 ) -> RegistryRepositoryRead:
     """Update an existing registry repository."""
@@ -393,6 +422,7 @@ async def update_registry_repository(
         origin=updated_repository.origin,
         last_synced_at=updated_repository.last_synced_at,
         commit_sha=updated_repository.commit_sha,
+        current_version_id=updated_repository.current_version_id,
         actions=[
             RegistryActionRead.model_validate(action, from_attributes=True)
             for action in updated_repository.actions
@@ -410,7 +440,7 @@ async def delete_registry_repository(
         min_access_level=AccessLevel.ADMIN,
     ),
     session: AsyncDBSession,
-    repository_id: UUID4,
+    repository_id: uuid.UUID,
 ):
     """Delete a registry repository."""
     service = RegistryReposService(session, role)
@@ -429,3 +459,72 @@ async def delete_registry_repository(
             detail=f"The {repository.origin!r} repository cannot be deleted.",
         )
     await service.delete_repository(repository)
+
+
+@router.post(
+    "/{repository_id}/versions/{version_id}/promote",
+    response_model=RegistryVersionPromoteResponse,
+)
+async def promote_registry_version(
+    *,
+    role: Role = RoleACL(
+        allow_user=True,
+        allow_service=False,
+        require_workspace="no",
+        min_access_level=AccessLevel.ADMIN,
+    ),
+    session: AsyncDBSession,
+    repository_id: uuid.UUID,
+    version_id: uuid.UUID,
+) -> RegistryVersionPromoteResponse:
+    """Promote a specific version to be the current version of the repository.
+
+    This endpoint allows administrators to manually promote or rollback to a
+    specific registry version, overriding the auto-promotion that happens during sync.
+
+    Args:
+        repository_id: The ID of the repository
+        version_id: The ID of the version to promote
+
+    Returns:
+        RegistryVersionPromoteResponse with previous and current version info
+
+    Raises:
+        404: If repository or version not found
+        400: If version doesn't belong to repository or has no tarball
+    """
+    service = RegistryReposService(session, role)
+    try:
+        repository = await service.get_repository_by_id(repository_id)
+    except NoResultFound as e:
+        logger.error("Registry repository not found", repository_id=repository_id)
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Registry repository not found",
+        ) from e
+
+    previous_version_id = repository.current_version_id
+
+    try:
+        updated_repository = await service.promote_version(repository, version_id)
+    except RegistryError as e:
+        logger.warning("Cannot promote version", exc=e)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e
+
+    # Get the version string for the response
+    from tracecat.registry.versions.service import RegistryVersionsService
+
+    versions_service = RegistryVersionsService(session, role)
+    version = await versions_service.get_version(version_id)
+    version_string = version.version if version else str(version_id)
+
+    return RegistryVersionPromoteResponse(
+        repository_id=updated_repository.id,
+        origin=updated_repository.origin,
+        previous_version_id=previous_version_id,
+        current_version_id=version_id,
+        version=version_string,
+    )

@@ -6,6 +6,22 @@ default:
 test:
 	pytest --cache-clear tests/registry tests/unit tests/playbooks -x
 
+# Run fast unit tests in parallel (excludes slow/integration/temporal tests)
+test-fast:
+	uv run pytest tests/unit -m "not (slow or integration or temporal)" -n auto -x
+
+# Run only workflow/temporal tests
+test-temporal:
+	uv run pytest tests/temporal -x
+
+# Run specific test file with parallel execution
+test-file file:
+	uv run pytest {{file}} -n auto -x
+
+# Run tests matching a keyword
+test-k keyword:
+	uv run pytest tests/unit -k "{{keyword}}" -n auto -x
+
 # Run backend benchmarks inside Docker (required for nsjail on macOS)
 bench *args:
 	docker run --rm \
@@ -13,7 +29,7 @@ bench *args:
 		--cap-add SYS_ADMIN \
 		--security-opt seccomp=unconfined \
 		--env-file .env \
-		-e REDIS_HOST=redis \
+		-e REDIS_URL=redis://redis:6379 \
 		-e TRACECAT__BLOB_STORAGE_ENDPOINT=http://minio:9000 \
 		-e TRACECAT__DB_URI=postgresql+psycopg://postgres:postgres@postgres_db:5432/postgres \
 		-v "$(pwd)/tests:/app/tests:ro" \
@@ -61,8 +77,8 @@ lint: lint-ui lint-app
 lint-fix: lint-fix-ui lint-fix-app
 fix: lint-fix
 
-mypy path:
-	mypy --ignore-missing-imports {{path}}
+typecheck:
+	uv run basedpyright --warnings --threads 4
 gen-client:
 	pnpm -C frontend generate-client
 	just lint-fix

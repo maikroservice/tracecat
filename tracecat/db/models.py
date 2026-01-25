@@ -46,7 +46,7 @@ from sqlalchemy.orm import (
 from tracecat import config
 from tracecat.agent.approvals.enums import ApprovalStatus
 from tracecat.auth.schemas import UserRole
-from tracecat.authz.enums import WorkspaceRole
+from tracecat.authz.enums import OrgRole, WorkspaceRole
 from tracecat.cases.durations.schemas import CaseDurationAnchorSelection
 from tracecat.cases.enums import (
     CaseEventType,
@@ -64,7 +64,9 @@ from tracecat.identifiers import (
 from tracecat.identifiers.workflow import WorkflowUUID
 from tracecat.integrations.enums import IntegrationStatus, MCPAuthType, OAuthGrantType
 from tracecat.interactions.enums import InteractionStatus, InteractionType
+from tracecat.invitations.enums import InvitationStatus
 from tracecat.secrets.constants import DEFAULT_SECRETS_ENVIRONMENT
+from tracecat.tiers.types import EntitlementsDict
 from tracecat.workspaces.schemas import WorkspaceSettings
 
 _UNSET = object()
@@ -75,6 +77,7 @@ CASE_STATUS_ENUM = Enum(CaseStatus, name="casestatus")
 CASE_TASK_STATUS_ENUM = Enum(CaseTaskStatus, name="casetaskstatus")
 INTERACTION_STATUS_ENUM = Enum(InteractionStatus, name="interactionstatus")
 APPROVAL_STATUS_ENUM = Enum(ApprovalStatus, name="approvalstatus")
+INVITATION_STATUS_ENUM = Enum(InvitationStatus, name="invitationstatus")
 
 
 # Naming convention for constraints so Alembic can generate deterministic names
@@ -108,6 +111,29 @@ class TimestampMixin:
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
+    )
+
+
+class InvitationMixin:
+    """Mixin for invitation columns shared between workspace and organization invitations."""
+
+    email: Mapped[str] = mapped_column(String(255), doc="Email address of the invitee")
+    status: Mapped[InvitationStatus] = mapped_column(
+        INVITATION_STATUS_ENUM, default=InvitationStatus.PENDING, index=True
+    )
+    invited_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("user.id", ondelete="SET NULL"),
+        doc="User who created the invitation",
+    )
+    token: Mapped[str] = mapped_column(
+        String(64), unique=True, doc="Unique token for magic link acceptance"
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), doc="When the invitation expires"
+    )
+    accepted_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), doc="When the invitation was accepted"
     )
 
 
@@ -174,6 +200,19 @@ class Organization(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String, index=True)
     slug: Mapped[str] = mapped_column(String, unique=True, index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # Relationships
+    members: Mapped[list[User]] = relationship(
+        "User",
+        secondary="organization_membership",
+        back_populates="organizations",
+        lazy="select",
+    )
+    organization_tier: Mapped[OrganizationTier | None] = relationship(
+        "OrganizationTier",
+        back_populates="organization",
+        uselist=False,
+    )
 
 
 class OrganizationModel(RecordModel):
@@ -245,6 +284,33 @@ class Membership(Base):
         Enum(WorkspaceRole, name="workspacerole"),
         nullable=False,
         default=WorkspaceRole.EDITOR,
+    )
+
+
+class OrganizationMembership(Base, TimestampMixin):
+    """Link table for users and organizations (many to many)."""
+
+    __tablename__ = "organization_membership"
+    __table_args__ = (
+        # Index for "get all members of org" queries
+        # (PK index covers user_id lookups, but not org_id alone)
+        Index("ix_org_membership_org_id", "organization_id"),
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("user.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("organization.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    role: Mapped[OrgRole] = mapped_column(
+        Enum(OrgRole, name="orgrole"),
+        nullable=False,
+        default=OrgRole.MEMBER,
     )
 
 
@@ -390,6 +456,12 @@ class User(SQLAlchemyBaseUserTableUUID, Base):
     chats: Mapped[list[Chat]] = relationship(
         "Chat",
         back_populates="user",
+        lazy="select",
+    )
+    organizations: Mapped[list[Organization]] = relationship(
+        "Organization",
+        secondary=OrganizationMembership.__table__,
+        back_populates="members",
         lazy="select",
     )
 
@@ -834,7 +906,10 @@ class Webhook(WorkspaceModel):
 
     @property
     def secret(self) -> str:
-        secret = os.getenv("TRACECAT__SIGNING_SECRET")
+        secret = (
+            os.environ.get("TRACECAT__SIGNING_SECRET")
+            or config.TRACECAT__SIGNING_SECRET
+        )
         if not secret:
             raise ValueError("TRACECAT__SIGNING_SECRET is not set")
         # Using legacy format to prevent webhook url changes
@@ -2033,9 +2108,22 @@ class AgentSession(WorkspaceModel):
         nullable=True,
         doc="Last processed Redis stream ID - used to resume streaming from correct position",
     )
+    # Parent session for forked sessions (approval continuations)
+    parent_session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("agent_session.id", ondelete="SET NULL", use_alter=True),
+        nullable=True,
+        index=True,
+        doc="Parent session ID for forked sessions (e.g., approval continuations)",
+    )
 
     # Relationships
     creator: Mapped[User | None] = relationship("User")
+    parent_session: Mapped[AgentSession | None] = relationship(
+        "AgentSession",
+        remote_side=[id],
+        foreign_keys=[parent_session_id],
+    )
     history: Mapped[list[AgentSessionHistory]] = relationship(
         "AgentSessionHistory",
         back_populates="session",
@@ -2157,6 +2245,13 @@ class AgentPreset(WorkspaceModel):
     )
     retries: Mapped[int] = mapped_column(
         Integer, default=3, nullable=False, doc="Maximum retry attempts per run"
+    )
+    enable_internet_access: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=text("false"),
+        nullable=False,
+        doc="Whether to enable direct internet access in the agent sandbox",
     )
 
     workspace: Mapped[Workspace] = relationship(back_populates="agent_presets")
@@ -2714,3 +2809,113 @@ class Tag(WorkspaceModel):
         secondary=WorkflowTag.__table__,
         back_populates="tags",
     )
+
+
+class OrganizationInvitation(InvitationMixin, TimestampMixin, Base):
+    """Invitation to join an organization."""
+
+    __tablename__ = "organization_invitation"
+    __table_args__ = (Index("ix_organization_invitation_email", "email"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID, primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID, ForeignKey("organization.id", ondelete="CASCADE"), index=True
+    )
+    role: Mapped[OrgRole] = mapped_column(
+        Enum(OrgRole, name="orgrole"),
+        default=OrgRole.MEMBER,
+        doc="Role to grant upon acceptance",
+    )
+
+    # Relationships
+    organization: Mapped[Organization] = relationship("Organization")
+    inviter: Mapped[User | None] = relationship("User")
+
+
+class Invitation(InvitationMixin, TimestampMixin, Base):
+    """Invitation to join a workspace."""
+
+    __tablename__ = "invitation"
+    __table_args__ = (Index("ix_invitation_email", "email"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID, primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        UUID, ForeignKey("workspace.id", ondelete="CASCADE"), index=True
+    )
+    role: Mapped[WorkspaceRole] = mapped_column(
+        Enum(WorkspaceRole, name="workspacerole"),
+        default=WorkspaceRole.EDITOR,
+        doc="Role to grant upon acceptance",
+    )
+
+    # Relationships
+    workspace: Mapped[Workspace] = relationship("Workspace")
+    inviter: Mapped[User | None] = relationship("User")
+
+
+class Tier(Base, TimestampMixin):
+    """Platform-configurable tier definition.
+
+    Tiers define resource limits and feature entitlements that apply to organizations.
+    The default tier provides unlimited access for self-hosted deployments.
+    """
+
+    __tablename__ = "tier"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID, primary_key=True, default=uuid.uuid4)
+    display_name: Mapped[str] = mapped_column(String)
+
+    # Limits (None = unlimited)
+    max_concurrent_workflows: Mapped[int | None] = mapped_column(Integer)
+    max_action_executions_per_workflow: Mapped[int | None] = mapped_column(Integer)
+    max_concurrent_actions: Mapped[int | None] = mapped_column(Integer)
+    api_rate_limit: Mapped[int | None] = mapped_column(Integer)
+    api_burst_capacity: Mapped[int | None] = mapped_column(Integer)
+
+    # Entitlements (JSONB for flexibility)
+    entitlements: Mapped[EntitlementsDict] = mapped_column(JSONB, default=dict)
+
+    # Metadata
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class OrganizationTier(Base, TimestampMixin):
+    """Organization's assigned tier with optional overrides.
+
+    Each organization can have a tier assigned with per-org overrides for limits
+    and entitlements. None values mean "use tier default".
+    """
+
+    __tablename__ = "organization_tier"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID, primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("organization.id", ondelete="CASCADE"),
+        unique=True,
+        index=True,
+    )
+    tier_id: Mapped[uuid.UUID] = mapped_column(UUID, ForeignKey("tier.id"))
+
+    # Per-org limit overrides (None = use tier default)
+    max_concurrent_workflows: Mapped[int | None] = mapped_column(Integer)
+    max_action_executions_per_workflow: Mapped[int | None] = mapped_column(Integer)
+    max_concurrent_actions: Mapped[int | None] = mapped_column(Integer)
+    api_rate_limit: Mapped[int | None] = mapped_column(Integer)
+    api_burst_capacity: Mapped[int | None] = mapped_column(Integer)
+
+    # Per-org entitlement overrides
+    entitlement_overrides: Mapped[EntitlementsDict | None] = mapped_column(JSONB)
+
+    # Billing (future)
+    stripe_customer_id: Mapped[str | None] = mapped_column(String)
+    stripe_subscription_id: Mapped[str | None] = mapped_column(String)
+    expires_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+
+    # Relationships
+    organization: Mapped[Organization] = relationship(
+        "Organization", back_populates="organization_tier"
+    )
+    tier: Mapped[Tier] = relationship("Tier")

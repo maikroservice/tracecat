@@ -18,29 +18,54 @@ import type {
   ActionsUpdateActionResponse,
   AdminCreateOrganizationData,
   AdminCreateOrganizationResponse,
+  AdminCreateTierData,
+  AdminCreateTierResponse,
   AdminDeleteOrganizationData,
   AdminDeleteOrganizationResponse,
+  AdminDeleteTierData,
+  AdminDeleteTierResponse,
   AdminDemoteFromSuperuserData,
   AdminDemoteFromSuperuserResponse,
   AdminGetOrganizationData,
   AdminGetOrganizationResponse,
+  AdminGetOrgTierData,
+  AdminGetOrgTierResponse,
   AdminGetRegistrySettingsResponse,
   AdminGetRegistryStatusResponse,
+  AdminGetTierData,
+  AdminGetTierResponse,
   AdminGetUserData,
   AdminGetUserResponse,
   AdminListOrganizationsResponse,
+  AdminListOrgRepositoriesData,
+  AdminListOrgRepositoriesResponse,
+  AdminListOrgRepositoryVersionsData,
+  AdminListOrgRepositoryVersionsResponse,
   AdminListRegistryVersionsData,
   AdminListRegistryVersionsResponse,
+  AdminListTiersData,
+  AdminListTiersResponse,
   AdminListUsersResponse,
+  AdminPromoteOrgRepositoryVersionData,
+  AdminPromoteOrgRepositoryVersionResponse,
+  AdminPromoteRegistryVersionData,
+  AdminPromoteRegistryVersionResponse,
   AdminPromoteToSuperuserData,
   AdminPromoteToSuperuserResponse,
+  AdminSyncAllRepositoriesData,
   AdminSyncAllRepositoriesResponse,
+  AdminSyncOrgRepositoryData,
+  AdminSyncOrgRepositoryResponse,
   AdminSyncRepositoryData,
   AdminSyncRepositoryResponse,
   AdminUpdateOrganizationData,
   AdminUpdateOrganizationResponse,
+  AdminUpdateOrgTierData,
+  AdminUpdateOrgTierResponse,
   AdminUpdateRegistrySettingsData,
   AdminUpdateRegistrySettingsResponse,
+  AdminUpdateTierData,
+  AdminUpdateTierResponse,
   AgentCreateProviderCredentialsData,
   AgentCreateProviderCredentialsResponse,
   AgentDeleteProviderCredentialsData,
@@ -70,6 +95,8 @@ import type {
   AgentSessionsCreateSessionResponse,
   AgentSessionsDeleteSessionData,
   AgentSessionsDeleteSessionResponse,
+  AgentSessionsForkSessionData,
+  AgentSessionsForkSessionResponse,
   AgentSessionsGetSessionData,
   AgentSessionsGetSessionResponse,
   AgentSessionsGetSessionVercelData,
@@ -216,6 +243,10 @@ import type {
   GraphApplyGraphOperationsResponse,
   GraphGetGraphData,
   GraphGetGraphResponse,
+  InboxListItemsData,
+  InboxListItemsPaginatedData,
+  InboxListItemsPaginatedResponse,
+  InboxListItemsResponse,
   IntegrationsConnectProviderData,
   IntegrationsConnectProviderResponse,
   IntegrationsDeleteIntegrationData,
@@ -296,6 +327,8 @@ import type {
   RegistryRepositoriesListRegistryRepositoriesResponse,
   RegistryRepositoriesListRepositoryCommitsData,
   RegistryRepositoriesListRepositoryCommitsResponse,
+  RegistryRepositoriesListRepositoryVersionsData,
+  RegistryRepositoriesListRepositoryVersionsResponse,
   RegistryRepositoriesPromoteRegistryVersionData,
   RegistryRepositoriesPromoteRegistryVersionResponse,
   RegistryRepositoriesReloadRegistryRepositoriesResponse,
@@ -3279,6 +3312,8 @@ export const agentSessionsCreateSession = (
  * @param data.workspaceId
  * @param data.entityType Filter by entity type
  * @param data.entityId Filter by entity ID
+ * @param data.excludeEntityTypes Entity types to exclude from results
+ * @param data.parentSessionId Filter by parent session ID (for finding forked sessions)
  * @param data.limit Maximum number of sessions to return
  * @returns unknown Successful Response
  * @throws ApiError
@@ -3292,6 +3327,8 @@ export const agentSessionsListSessions = (
     query: {
       entity_type: data.entityType,
       entity_id: data.entityId,
+      exclude_entity_types: data.excludeEntityTypes,
+      parent_session_id: data.parentSessionId,
       limit: data.limit,
       workspace_id: data.workspaceId,
     },
@@ -3486,6 +3523,41 @@ export const agentSessionsStreamSessionEvents = (
 }
 
 /**
+ * Fork Session
+ * Fork an existing session to continue conversation post-decision.
+ *
+ * Creates a new session linked to the parent session, allowing users
+ * to ask the agent for context after making approval decisions.
+ *
+ * Set entity_type to 'approval' for inbox forks to hide from main chat list.
+ * @param data The data for the request.
+ * @param data.sessionId
+ * @param data.workspaceId
+ * @param data.requestBody
+ * @returns AgentSessionRead Successful Response
+ * @throws ApiError
+ */
+export const agentSessionsForkSession = (
+  data: AgentSessionsForkSessionData
+): CancelablePromise<AgentSessionsForkSessionResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/agent/sessions/{session_id}/fork",
+    path: {
+      session_id: data.sessionId,
+    },
+    query: {
+      workspace_id: data.workspaceId,
+    },
+    body: data.requestBody,
+    mediaType: "application/json",
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
  * Submit Approvals
  * Submit approval decisions to a running agent workflow.
  *
@@ -3639,25 +3711,138 @@ export const adminDeleteOrganization = (
 }
 
 /**
- * Sync All Repositories
- * Trigger sync for all platform registry repositories.
- * @returns RegistrySyncResponse Successful Response
+ * List Org Repositories
+ * List registry repositories for an organization.
+ * @param data The data for the request.
+ * @param data.orgId
+ * @returns OrgRegistryRepositoryRead Successful Response
  * @throws ApiError
  */
-export const adminSyncAllRepositories =
-  (): CancelablePromise<AdminSyncAllRepositoriesResponse> => {
-    return __request(OpenAPI, {
-      method: "POST",
-      url: "/admin/registry/sync",
-    })
-  }
+export const adminListOrgRepositories = (
+  data: AdminListOrgRepositoriesData
+): CancelablePromise<AdminListOrgRepositoriesResponse> => {
+  return __request(OpenAPI, {
+    method: "GET",
+    url: "/admin/organizations/{org_id}/registry/repositories",
+    path: {
+      org_id: data.orgId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * List Org Repository Versions
+ * List versions for a specific repository in an organization.
+ * @param data The data for the request.
+ * @param data.orgId
+ * @param data.repositoryId
+ * @returns OrgRegistryVersionRead Successful Response
+ * @throws ApiError
+ */
+export const adminListOrgRepositoryVersions = (
+  data: AdminListOrgRepositoryVersionsData
+): CancelablePromise<AdminListOrgRepositoryVersionsResponse> => {
+  return __request(OpenAPI, {
+    method: "GET",
+    url: "/admin/organizations/{org_id}/registry/repositories/{repository_id}/versions",
+    path: {
+      org_id: data.orgId,
+      repository_id: data.repositoryId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Sync Org Repository
+ * Sync a registry repository for an organization.
+ * @param data The data for the request.
+ * @param data.orgId
+ * @param data.repositoryId
+ * @param data.requestBody
+ * @returns OrgRegistrySyncResponse Successful Response
+ * @throws ApiError
+ */
+export const adminSyncOrgRepository = (
+  data: AdminSyncOrgRepositoryData
+): CancelablePromise<AdminSyncOrgRepositoryResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/admin/organizations/{org_id}/registry/repositories/{repository_id}/sync",
+    path: {
+      org_id: data.orgId,
+      repository_id: data.repositoryId,
+    },
+    body: data.requestBody,
+    mediaType: "application/json",
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Promote Org Repository Version
+ * Promote a registry version to be the current version for an org repository.
+ * @param data The data for the request.
+ * @param data.orgId
+ * @param data.repositoryId
+ * @param data.versionId
+ * @returns OrgRegistryVersionPromoteResponse Successful Response
+ * @throws ApiError
+ */
+export const adminPromoteOrgRepositoryVersion = (
+  data: AdminPromoteOrgRepositoryVersionData
+): CancelablePromise<AdminPromoteOrgRepositoryVersionResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/admin/organizations/{org_id}/registry/repositories/{repository_id}/versions/{version_id}/promote",
+    path: {
+      org_id: data.orgId,
+      repository_id: data.repositoryId,
+      version_id: data.versionId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Sync All Repositories
+ * Trigger sync for all platform registry repositories.
+ * @param data The data for the request.
+ * @param data.force Force sync by deleting existing version
+ * @returns tracecat_ee__admin__registry__schemas__RegistrySyncResponse Successful Response
+ * @throws ApiError
+ */
+export const adminSyncAllRepositories = (
+  data: AdminSyncAllRepositoriesData = {}
+): CancelablePromise<AdminSyncAllRepositoriesResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/admin/registry/sync",
+    query: {
+      force: data.force,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
 
 /**
  * Sync Repository
  * Trigger sync for a specific platform registry repository.
  * @param data The data for the request.
  * @param data.repositoryId
- * @returns RegistrySyncResponse Successful Response
+ * @param data.force Force sync by deleting existing version
+ * @returns tracecat_ee__admin__registry__schemas__RegistrySyncResponse Successful Response
  * @throws ApiError
  */
 export const adminSyncRepository = (
@@ -3668,6 +3853,9 @@ export const adminSyncRepository = (
     url: "/admin/registry/sync/{repository_id}",
     path: {
       repository_id: data.repositoryId,
+    },
+    query: {
+      force: data.force,
     },
     errors: {
       422: "Validation Error",
@@ -3695,7 +3883,7 @@ export const adminGetRegistryStatus =
  * @param data The data for the request.
  * @param data.repositoryId
  * @param data.limit
- * @returns RegistryVersionRead Successful Response
+ * @returns tracecat_ee__admin__registry__schemas__RegistryVersionRead Successful Response
  * @throws ApiError
  */
 export const adminListRegistryVersions = (
@@ -3707,6 +3895,31 @@ export const adminListRegistryVersions = (
     query: {
       repository_id: data.repositoryId,
       limit: data.limit,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Promote Registry Version
+ * Promote a registry version to be the current version for a repository.
+ * @param data The data for the request.
+ * @param data.repositoryId
+ * @param data.versionId
+ * @returns tracecat_ee__admin__registry__schemas__RegistryVersionPromoteResponse Successful Response
+ * @throws ApiError
+ */
+export const adminPromoteRegistryVersion = (
+  data: AdminPromoteRegistryVersionData
+): CancelablePromise<AdminPromoteRegistryVersionResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/admin/registry/{repository_id}/versions/{version_id}/promote",
+    path: {
+      repository_id: data.repositoryId,
+      version_id: data.versionId,
     },
     errors: {
       422: "Validation Error",
@@ -3742,6 +3955,172 @@ export const adminUpdateRegistrySettings = (
   return __request(OpenAPI, {
     method: "PATCH",
     url: "/admin/settings/registry",
+    body: data.requestBody,
+    mediaType: "application/json",
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * List Tiers
+ * List all tiers.
+ * @param data The data for the request.
+ * @param data.includeInactive Include inactive tiers in results
+ * @returns TierRead Successful Response
+ * @throws ApiError
+ */
+export const adminListTiers = (
+  data: AdminListTiersData = {}
+): CancelablePromise<AdminListTiersResponse> => {
+  return __request(OpenAPI, {
+    method: "GET",
+    url: "/admin/tiers",
+    query: {
+      include_inactive: data.includeInactive,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Create Tier
+ * Create a new tier.
+ * @param data The data for the request.
+ * @param data.requestBody
+ * @returns TierRead Successful Response
+ * @throws ApiError
+ */
+export const adminCreateTier = (
+  data: AdminCreateTierData
+): CancelablePromise<AdminCreateTierResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/admin/tiers",
+    body: data.requestBody,
+    mediaType: "application/json",
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Get Tier
+ * Get tier by ID.
+ * @param data The data for the request.
+ * @param data.tierId
+ * @returns TierRead Successful Response
+ * @throws ApiError
+ */
+export const adminGetTier = (
+  data: AdminGetTierData
+): CancelablePromise<AdminGetTierResponse> => {
+  return __request(OpenAPI, {
+    method: "GET",
+    url: "/admin/tiers/{tier_id}",
+    path: {
+      tier_id: data.tierId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Update Tier
+ * Update a tier.
+ * @param data The data for the request.
+ * @param data.tierId
+ * @param data.requestBody
+ * @returns TierRead Successful Response
+ * @throws ApiError
+ */
+export const adminUpdateTier = (
+  data: AdminUpdateTierData
+): CancelablePromise<AdminUpdateTierResponse> => {
+  return __request(OpenAPI, {
+    method: "PATCH",
+    url: "/admin/tiers/{tier_id}",
+    path: {
+      tier_id: data.tierId,
+    },
+    body: data.requestBody,
+    mediaType: "application/json",
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Delete Tier
+ * Delete a tier (only if no orgs are assigned to it).
+ * @param data The data for the request.
+ * @param data.tierId
+ * @returns void Successful Response
+ * @throws ApiError
+ */
+export const adminDeleteTier = (
+  data: AdminDeleteTierData
+): CancelablePromise<AdminDeleteTierResponse> => {
+  return __request(OpenAPI, {
+    method: "DELETE",
+    url: "/admin/tiers/{tier_id}",
+    path: {
+      tier_id: data.tierId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Get Org Tier
+ * Get tier assignment for an organization.
+ * @param data The data for the request.
+ * @param data.orgId
+ * @returns OrganizationTierRead Successful Response
+ * @throws ApiError
+ */
+export const adminGetOrgTier = (
+  data: AdminGetOrgTierData
+): CancelablePromise<AdminGetOrgTierResponse> => {
+  return __request(OpenAPI, {
+    method: "GET",
+    url: "/admin/tiers/organizations/{org_id}",
+    path: {
+      org_id: data.orgId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Update Org Tier
+ * Update organization's tier assignment and overrides.
+ * @param data The data for the request.
+ * @param data.orgId
+ * @param data.requestBody
+ * @returns OrganizationTierRead Successful Response
+ * @throws ApiError
+ */
+export const adminUpdateOrgTier = (
+  data: AdminUpdateOrgTierData
+): CancelablePromise<AdminUpdateOrgTierResponse> => {
+  return __request(OpenAPI, {
+    method: "PATCH",
+    url: "/admin/tiers/organizations/{org_id}",
+    path: {
+      org_id: data.orgId,
+    },
     body: data.requestBody,
     mediaType: "application/json",
     errors: {
@@ -3825,6 +4204,72 @@ export const adminDemoteFromSuperuser = (
     url: "/admin/users/{user_id}/demote",
     path: {
       user_id: data.userId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * List Items
+ * List all inbox items for the workspace.
+ *
+ * Returns inbox items aggregated from all registered providers,
+ * sorted by status priority (pending first) then by creation time.
+ * @param data The data for the request.
+ * @param data.workspaceId
+ * @param data.limit
+ * @param data.offset
+ * @returns InboxItemRead Successful Response
+ * @throws ApiError
+ */
+export const inboxListItems = (
+  data: InboxListItemsData
+): CancelablePromise<InboxListItemsResponse> => {
+  return __request(OpenAPI, {
+    method: "GET",
+    url: "/inbox",
+    query: {
+      limit: data.limit,
+      offset: data.offset,
+      workspace_id: data.workspaceId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * List Items Paginated
+ * List inbox items with cursor-based pagination.
+ *
+ * Supports sorting by created_at, updated_at, or status.
+ * Default sort is by created_at descending.
+ * @param data The data for the request.
+ * @param data.workspaceId
+ * @param data.limit
+ * @param data.cursor
+ * @param data.reverse
+ * @param data.orderBy Column name to order by (created_at, updated_at, status)
+ * @param data.sort Sort direction (asc or desc)
+ * @returns CursorPaginatedResponse_InboxItemRead_ Successful Response
+ * @throws ApiError
+ */
+export const inboxListItemsPaginated = (
+  data: InboxListItemsPaginatedData
+): CancelablePromise<InboxListItemsPaginatedResponse> => {
+  return __request(OpenAPI, {
+    method: "GET",
+    url: "/inbox/paginated",
+    query: {
+      limit: data.limit,
+      cursor: data.cursor,
+      reverse: data.reverse,
+      order_by: data.orderBy,
+      sort: data.sort,
+      workspace_id: data.workspaceId,
     },
     errors: {
       422: "Validation Error",
@@ -3940,7 +4385,7 @@ export const registryRepositoriesReloadRegistryRepositories =
  *
  * Args:
  * repository_id: The ID of the repository to sync
- * sync_params: Optional sync parameters, including target commit SHA
+ * sync_params: Optional sync parameters, including target commit SHA and force flag
  *
  * Raises:
  * 422: If there is an error syncing the repository (validation error)
@@ -3949,7 +4394,7 @@ export const registryRepositoriesReloadRegistryRepositories =
  * @param data The data for the request.
  * @param data.repositoryId
  * @param data.requestBody
- * @returns void Successful Response
+ * @returns tracecat__registry__repositories__schemas__RegistrySyncResponse Successful Response
  * @throws ApiError
  */
 export const registryRepositoriesSyncRegistryRepository = (
@@ -3972,8 +4417,38 @@ export const registryRepositoriesSyncRegistryRepository = (
 }
 
 /**
+ * List Repository Versions
+ * List all versions for a specific registry repository.
+ * @param data The data for the request.
+ * @param data.repositoryId
+ * @returns tracecat__registry__repositories__schemas__RegistryVersionRead Successful Response
+ * @throws ApiError
+ */
+export const registryRepositoriesListRepositoryVersions = (
+  data: RegistryRepositoriesListRepositoryVersionsData
+): CancelablePromise<RegistryRepositoriesListRepositoryVersionsResponse> => {
+  return __request(OpenAPI, {
+    method: "GET",
+    url: "/registry/repos/{repository_id}/versions",
+    path: {
+      repository_id: data.repositoryId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
  * List Registry Repositories
  * List all registry repositories.
+ *
+ * Returns both platform (base) and org-scoped repositories merged into a single list
+ * using UNION ALL. Platform repositories (like tracecat-registry) are shared across
+ * all organizations.
+ *
+ * Both table hierarchies share the same column structure via BaseRegistryRepository,
+ * so we select only the common columns and union the results.
  * @returns RegistryRepositoryReadMinimal Successful Response
  * @throws ApiError
  */
@@ -4009,7 +4484,9 @@ export const registryRepositoriesCreateRegistryRepository = (
 
 /**
  * Get Registry Repository
- * Get a specific registry repository by origin.
+ * Get a specific registry repository by ID.
+ *
+ * Handles both platform (base) and org-scoped repositories.
  * @param data The data for the request.
  * @param data.repositoryId
  * @returns RegistryRepositoryRead Successful Response
@@ -4115,6 +4592,8 @@ export const registryRepositoriesListRepositoryCommits = (
  * This endpoint allows administrators to manually promote or rollback to a
  * specific registry version, overriding the auto-promotion that happens during sync.
  *
+ * Handles both platform (base) and org-scoped repositories.
+ *
  * Args:
  * repository_id: The ID of the repository
  * version_id: The ID of the version to promote
@@ -4128,7 +4607,7 @@ export const registryRepositoriesListRepositoryCommits = (
  * @param data The data for the request.
  * @param data.repositoryId
  * @param data.versionId
- * @returns RegistryVersionPromoteResponse Successful Response
+ * @returns tracecat__registry__repositories__schemas__RegistryVersionPromoteResponse Successful Response
  * @throws ApiError
  */
 export const registryRepositoriesPromoteRegistryVersion = (
@@ -4149,7 +4628,7 @@ export const registryRepositoriesPromoteRegistryVersion = (
 
 /**
  * List Registry Actions
- * List all actions in a registry.
+ * List all actions from registry index.
  * @returns RegistryActionReadMinimal Successful Response
  * @throws ApiError
  */
@@ -7358,11 +7837,13 @@ export const publicCheckHealth =
 
 /**
  * Check Ready
- * Readiness check - returns 200 only after startup is complete.
+ * Readiness check - returns 200 only after startup and registry sync complete.
  *
  * Use this endpoint for Docker healthchecks to ensure the API has finished
- * initializing (including registry sync) before accepting traffic.
- * @returns HealthResponse Successful Response
+ * initializing and the platform registry is synced before accepting traffic.
+ *
+ * Returns a detailed response including registry sync status.
+ * @returns ReadinessResponse Successful Response
  * @throws ApiError
  */
 export const publicCheckReady =

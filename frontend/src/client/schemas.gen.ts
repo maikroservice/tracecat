@@ -846,22 +846,9 @@ export const $AdminUserRead = {
       ],
       title: "Last Login At",
     },
-    created_at: {
-      type: "string",
-      format: "date-time",
-      title: "Created At",
-    },
   },
   type: "object",
-  required: [
-    "id",
-    "email",
-    "role",
-    "is_active",
-    "is_superuser",
-    "is_verified",
-    "created_at",
-  ],
+  required: ["id", "email", "role", "is_active", "is_superuser", "is_verified"],
   title: "AdminUserRead",
   description: "Admin view of a user.",
 } as const
@@ -1044,6 +1031,11 @@ export const $AgentPresetCreate = {
       title: "Retries",
       default: 3,
     },
+    enable_internet_access: {
+      type: "boolean",
+      title: "Enable Internet Access",
+      default: false,
+    },
     name: {
       type: "string",
       maxLength: 120,
@@ -1190,6 +1182,11 @@ export const $AgentPresetRead = {
       minimum: 0,
       title: "Retries",
       default: 3,
+    },
+    enable_internet_access: {
+      type: "boolean",
+      title: "Enable Internet Access",
+      default: false,
     },
     id: {
       type: "string",
@@ -1458,6 +1455,17 @@ export const $AgentPresetUpdate = {
       ],
       title: "Retries",
     },
+    enable_internet_access: {
+      anyOf: [
+        {
+          type: "boolean",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Enable Internet Access",
+    },
   },
   type: "object",
   title: "AgentPresetUpdate",
@@ -1553,7 +1561,14 @@ export const $AgentSessionCreate = {
 
 export const $AgentSessionEntity = {
   type: "string",
-  enum: ["case", "agent_preset", "agent_preset_builder", "copilot", "workflow"],
+  enum: [
+    "case",
+    "agent_preset",
+    "agent_preset_builder",
+    "copilot",
+    "workflow",
+    "approval",
+  ],
   title: "AgentSessionEntity",
   description: `The type of entity associated with an agent session.
 
@@ -1562,7 +1577,28 @@ Determines the context and behavior of the session:
 - AGENT_PRESET: Live chat testing a preset configuration
 - AGENT_PRESET_BUILDER: Builder chat for editing/configuring a preset
 - COPILOT: Workspace-level copilot assistant
-- WORKFLOW: Workflow-initiated agent run (from action)`,
+- WORKFLOW: Workflow-initiated agent run (from action)
+- APPROVAL: Inbox approval continuation (hidden from main chat list)`,
+} as const
+
+export const $AgentSessionForkRequest = {
+  properties: {
+    entity_type: {
+      anyOf: [
+        {
+          $ref: "#/components/schemas/AgentSessionEntity",
+        },
+        {
+          type: "null",
+        },
+      ],
+      description:
+        "Override entity type for the forked session. Use 'approval' for inbox forks to hide from main chat list.",
+    },
+  },
+  type: "object",
+  title: "AgentSessionForkRequest",
+  description: "Request schema for forking an agent session.",
 } as const
 
 export const $AgentSessionRead = {
@@ -1649,6 +1685,18 @@ export const $AgentSessionRead = {
         },
       ],
       title: "Last Stream Id",
+    },
+    parent_session_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Parent Session Id",
     },
     created_at: {
       type: "string",
@@ -1763,6 +1811,18 @@ export const $AgentSessionReadVercel = {
         },
       ],
       title: "Last Stream Id",
+    },
+    parent_session_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Parent Session Id",
     },
     created_at: {
       type: "string",
@@ -1885,6 +1945,18 @@ export const $AgentSessionReadWithMessages = {
         },
       ],
       title: "Last Stream Id",
+    },
+    parent_session_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Parent Session Id",
     },
     created_at: {
       type: "string",
@@ -5575,6 +5647,69 @@ export const $CursorPaginatedResponse_CaseReadMinimal_ = {
   title: "CursorPaginatedResponse[CaseReadMinimal]",
 } as const
 
+export const $CursorPaginatedResponse_InboxItemRead_ = {
+  properties: {
+    items: {
+      items: {
+        $ref: "#/components/schemas/InboxItemRead",
+      },
+      type: "array",
+      title: "Items",
+    },
+    next_cursor: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Next Cursor",
+      description: "Cursor for next page",
+    },
+    prev_cursor: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Prev Cursor",
+      description: "Cursor for previous page",
+    },
+    has_more: {
+      type: "boolean",
+      title: "Has More",
+      description: "Whether more items exist",
+      default: false,
+    },
+    has_previous: {
+      type: "boolean",
+      title: "Has Previous",
+      description: "Whether previous items exist",
+      default: false,
+    },
+    total_estimate: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Total Estimate",
+      description: "Estimated total count from table statistics",
+    },
+  },
+  type: "object",
+  required: ["items"],
+  title: "CursorPaginatedResponse[InboxItemRead]",
+} as const
+
 export const $CursorPaginatedResponse_TableRowRead_ = {
   properties: {
     items: {
@@ -5873,7 +6008,7 @@ export const $DSLEntrypoint = {
       anyOf: [
         {
           additionalProperties: {
-            $ref: "#/components/schemas/ExpectedField",
+            $ref: "#/components/schemas/ExpectedField-Output",
           },
           type: "object",
         },
@@ -6537,6 +6672,28 @@ export const $EditorParamRead = {
   title: "EditorParamRead",
 } as const
 
+export const $EntitlementsDict = {
+  properties: {
+    custom_registry: {
+      type: "boolean",
+      title: "Custom Registry",
+    },
+    sso: {
+      type: "boolean",
+      title: "Sso",
+    },
+    git_sync: {
+      type: "boolean",
+      title: "Git Sync",
+    },
+  },
+  type: "object",
+  title: "EntitlementsDict",
+  description: `TypedDict for tier entitlements stored in JSONB.
+
+All keys are optional (total=False) to support partial overrides.`,
+} as const
+
 export const $ErrorDetails = {
   properties: {
     type: {
@@ -6843,7 +7000,7 @@ export const $ExecutionType = {
 Distinguishes between draft (development) and published (production) executions.`,
 } as const
 
-export const $ExpectedField = {
+export const $ExpectedField_Input = {
   properties: {
     type: {
       type: "string",
@@ -6861,18 +7018,48 @@ export const $ExpectedField = {
       title: "Description",
     },
     default: {
+      title: "Default",
+    },
+    enum: {
       anyOf: [
-        {},
+        {
+          items: {
+            type: "string",
+          },
+          type: "array",
+        },
         {
           type: "null",
         },
       ],
-      title: "Default",
+      title: "Enum",
+    },
+    optional: {
+      anyOf: [
+        {
+          type: "boolean",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Optional",
     },
   },
+  additionalProperties: false,
   type: "object",
   required: ["type"],
   title: "ExpectedField",
+  description: `Schema for a field in a template action's expects definition.
+
+Note: The default field uses a sentinel to distinguish between
+"no default specified" (required field) and "default is explicitly None"
+(optional field).`,
+} as const
+
+export const $ExpectedField_Output = {
+  additionalProperties: true,
+  type: "object",
 } as const
 
 export const $ExprType = {
@@ -7014,7 +7201,6 @@ export const $FeatureFlag = {
     "agent-presets",
     "case-durations",
     "case-tasks",
-    "executor-auth",
     "registry-client",
     "registry-sync-v2",
   ],
@@ -7795,6 +7981,116 @@ distinguish multiple files.`,
   type: "object",
   required: ["url", "media_type", "identifier"],
   title: "ImageUrl",
+} as const
+
+export const $InboxItemRead = {
+  properties: {
+    id: {
+      type: "string",
+      format: "uuid",
+      title: "Id",
+      description: "Unique inbox item ID",
+    },
+    type: {
+      $ref: "#/components/schemas/InboxItemType",
+      description: "Type of inbox item",
+    },
+    title: {
+      type: "string",
+      title: "Title",
+      description: "Display title",
+    },
+    preview: {
+      type: "string",
+      title: "Preview",
+      description: "Preview text",
+    },
+    status: {
+      $ref: "#/components/schemas/InboxItemStatus",
+      description: "Item status",
+    },
+    unread: {
+      type: "boolean",
+      title: "Unread",
+      description: "Whether the item is unread",
+    },
+    created_at: {
+      type: "string",
+      format: "date-time",
+      title: "Created At",
+      description: "Creation timestamp",
+    },
+    updated_at: {
+      type: "string",
+      format: "date-time",
+      title: "Updated At",
+      description: "Last update timestamp",
+    },
+    workflow: {
+      anyOf: [
+        {
+          $ref: "#/components/schemas/WorkflowSummary",
+        },
+        {
+          type: "null",
+        },
+      ],
+      description: "Associated workflow",
+    },
+    source_id: {
+      type: "string",
+      format: "uuid",
+      title: "Source Id",
+      description: "ID of the source entity",
+    },
+    source_type: {
+      type: "string",
+      title: "Source Type",
+      description: "Type of source entity (e.g., agent_session)",
+    },
+    metadata: {
+      anyOf: [
+        {
+          additionalProperties: true,
+          type: "object",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Metadata",
+      description: "Type-specific metadata",
+    },
+  },
+  type: "object",
+  required: [
+    "id",
+    "type",
+    "title",
+    "preview",
+    "status",
+    "unread",
+    "created_at",
+    "updated_at",
+    "source_id",
+    "source_type",
+  ],
+  title: "InboxItemRead",
+  description: "Read model for inbox items.",
+} as const
+
+export const $InboxItemStatus = {
+  type: "string",
+  enum: ["pending", "completed", "failed"],
+  title: "InboxItemStatus",
+  description: "Status of inbox items.",
+} as const
+
+export const $InboxItemType = {
+  type: "string",
+  enum: ["approval"],
+  title: "InboxItemType",
+  description: "Types of inbox items.",
 } as const
 
 export const $InferredColumn = {
@@ -8970,6 +9266,263 @@ export const $OrgRead = {
   description: "Organization response.",
 } as const
 
+export const $OrgRegistryRepositoryRead = {
+  properties: {
+    id: {
+      type: "string",
+      format: "uuid",
+      title: "Id",
+    },
+    origin: {
+      type: "string",
+      title: "Origin",
+    },
+    last_synced_at: {
+      anyOf: [
+        {
+          type: "string",
+          format: "date-time",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Last Synced At",
+    },
+    commit_sha: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Commit Sha",
+    },
+    current_version_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Current Version Id",
+    },
+  },
+  type: "object",
+  required: ["id", "origin"],
+  title: "OrgRegistryRepositoryRead",
+  description: "Organization registry repository response.",
+} as const
+
+export const $OrgRegistrySyncRequest = {
+  properties: {
+    force: {
+      type: "boolean",
+      title: "Force",
+      description: "Force sync by deleting the existing version first",
+      default: false,
+    },
+  },
+  type: "object",
+  title: "OrgRegistrySyncRequest",
+  description: "Organization registry sync request.",
+} as const
+
+export const $OrgRegistrySyncResponse = {
+  properties: {
+    success: {
+      type: "boolean",
+      title: "Success",
+    },
+    repository_id: {
+      type: "string",
+      format: "uuid",
+      title: "Repository Id",
+    },
+    origin: {
+      type: "string",
+      title: "Origin",
+    },
+    version: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Version",
+    },
+    commit_sha: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Commit Sha",
+    },
+    actions_count: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Actions Count",
+    },
+    forced: {
+      type: "boolean",
+      title: "Forced",
+      default: false,
+    },
+    skipped: {
+      type: "boolean",
+      title: "Skipped",
+      default: false,
+    },
+    message: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Message",
+    },
+  },
+  type: "object",
+  required: ["success", "repository_id", "origin"],
+  title: "OrgRegistrySyncResponse",
+  description: "Organization registry sync response.",
+} as const
+
+export const $OrgRegistryVersionPromoteResponse = {
+  properties: {
+    repository_id: {
+      type: "string",
+      format: "uuid",
+      title: "Repository Id",
+    },
+    origin: {
+      type: "string",
+      title: "Origin",
+    },
+    previous_version_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Previous Version Id",
+    },
+    previous_version: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Previous Version",
+    },
+    current_version_id: {
+      type: "string",
+      format: "uuid",
+      title: "Current Version Id",
+    },
+    current_version: {
+      type: "string",
+      title: "Current Version",
+    },
+  },
+  type: "object",
+  required: [
+    "repository_id",
+    "origin",
+    "previous_version_id",
+    "previous_version",
+    "current_version_id",
+    "current_version",
+  ],
+  title: "OrgRegistryVersionPromoteResponse",
+  description: "Response from promoting an organization registry version.",
+} as const
+
+export const $OrgRegistryVersionRead = {
+  properties: {
+    id: {
+      type: "string",
+      format: "uuid",
+      title: "Id",
+    },
+    repository_id: {
+      type: "string",
+      format: "uuid",
+      title: "Repository Id",
+    },
+    version: {
+      type: "string",
+      title: "Version",
+    },
+    commit_sha: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Commit Sha",
+    },
+    tarball_uri: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Tarball Uri",
+    },
+    created_at: {
+      type: "string",
+      format: "date-time",
+      title: "Created At",
+    },
+  },
+  type: "object",
+  required: ["id", "repository_id", "version", "created_at"],
+  title: "OrgRegistryVersionRead",
+  description: "Organization registry version response.",
+} as const
+
+export const $OrgRole = {
+  type: "string",
+  enum: ["member", "admin", "owner"],
+  title: "OrgRole",
+  description: "Organization-level roles.",
+} as const
+
 export const $OrgUpdate = {
   properties: {
     name: {
@@ -9093,6 +9646,283 @@ export const $OrganizationSecretRead = {
   ],
   title: "OrganizationSecretRead",
   description: "Read schema for organization-scoped secrets.",
+} as const
+
+export const $OrganizationTierRead = {
+  properties: {
+    id: {
+      type: "string",
+      format: "uuid",
+      title: "Id",
+    },
+    organization_id: {
+      type: "string",
+      format: "uuid",
+      title: "Organization Id",
+    },
+    tier_id: {
+      type: "string",
+      format: "uuid",
+      title: "Tier Id",
+    },
+    max_concurrent_workflows: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Max Concurrent Workflows",
+    },
+    max_action_executions_per_workflow: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Max Action Executions Per Workflow",
+    },
+    max_concurrent_actions: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Max Concurrent Actions",
+    },
+    api_rate_limit: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Api Rate Limit",
+    },
+    api_burst_capacity: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Api Burst Capacity",
+    },
+    entitlement_overrides: {
+      anyOf: [
+        {
+          $ref: "#/components/schemas/EntitlementsDict",
+        },
+        {
+          type: "null",
+        },
+      ],
+    },
+    stripe_customer_id: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Stripe Customer Id",
+    },
+    stripe_subscription_id: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Stripe Subscription Id",
+    },
+    expires_at: {
+      anyOf: [
+        {
+          type: "string",
+          format: "date-time",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Expires At",
+    },
+    created_at: {
+      type: "string",
+      format: "date-time",
+      title: "Created At",
+    },
+    updated_at: {
+      type: "string",
+      format: "date-time",
+      title: "Updated At",
+    },
+    tier: {
+      anyOf: [
+        {
+          $ref: "#/components/schemas/TierRead",
+        },
+        {
+          type: "null",
+        },
+      ],
+    },
+  },
+  type: "object",
+  required: [
+    "id",
+    "organization_id",
+    "tier_id",
+    "max_concurrent_workflows",
+    "max_action_executions_per_workflow",
+    "max_concurrent_actions",
+    "api_rate_limit",
+    "api_burst_capacity",
+    "entitlement_overrides",
+    "stripe_customer_id",
+    "stripe_subscription_id",
+    "expires_at",
+    "created_at",
+    "updated_at",
+  ],
+  title: "OrganizationTierRead",
+  description: "Organization tier assignment response.",
+} as const
+
+export const $OrganizationTierUpdate = {
+  properties: {
+    tier_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Tier Id",
+    },
+    max_concurrent_workflows: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Max Concurrent Workflows",
+    },
+    max_action_executions_per_workflow: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Max Action Executions Per Workflow",
+    },
+    max_concurrent_actions: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Max Concurrent Actions",
+    },
+    api_rate_limit: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Api Rate Limit",
+    },
+    api_burst_capacity: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Api Burst Capacity",
+    },
+    entitlement_overrides: {
+      anyOf: [
+        {
+          $ref: "#/components/schemas/EntitlementsDict",
+        },
+        {
+          type: "null",
+        },
+      ],
+    },
+    stripe_customer_id: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Stripe Customer Id",
+    },
+    stripe_subscription_id: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Stripe Subscription Id",
+    },
+    expires_at: {
+      anyOf: [
+        {
+          type: "string",
+          format: "date-time",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Expires At",
+    },
+  },
+  type: "object",
+  title: "OrganizationTierUpdate",
+  description: "Update organization tier assignment request.",
 } as const
 
 export const $OutputType = {
@@ -9751,6 +10581,21 @@ export const $PullResult = {
     "message",
   ],
   title: "PullResult",
+} as const
+
+export const $ReadinessResponse = {
+  properties: {
+    status: {
+      type: "string",
+      title: "Status",
+    },
+    registry: {
+      $ref: "#/components/schemas/RegistryStatus",
+    },
+  },
+  type: "object",
+  required: ["status", "registry"],
+  title: "ReadinessResponse",
 } as const
 
 export const $ReasoningUIPart = {
@@ -10796,6 +11641,13 @@ export const $RegistryRepositorySync = {
       description:
         "The specific commit SHA to sync to. If None, syncs to HEAD.",
     },
+    force: {
+      type: "boolean",
+      title: "Force",
+      description:
+        "Force sync by deleting the existing version first, allowing re-sync.",
+      default: false,
+    },
   },
   type: "object",
   title: "RegistryRepositorySync",
@@ -10939,6 +11791,33 @@ export const $RegistrySecretType_Output = {
   },
 } as const
 
+export const $RegistryStatus = {
+  properties: {
+    synced: {
+      type: "boolean",
+      title: "Synced",
+    },
+    expected_version: {
+      type: "string",
+      title: "Expected Version",
+    },
+    current_version: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Current Version",
+    },
+  },
+  type: "object",
+  required: ["synced", "expected_version", "current_version"],
+  title: "RegistryStatus",
+} as const
+
 export const $RegistryStatusResponse = {
   properties: {
     total_repositories: {
@@ -10969,133 +11848,6 @@ export const $RegistryStatusResponse = {
   required: ["total_repositories", "last_sync_at", "repositories"],
   title: "RegistryStatusResponse",
   description: "Registry health status.",
-} as const
-
-export const $RegistrySyncResponse = {
-  properties: {
-    success: {
-      type: "boolean",
-      title: "Success",
-    },
-    synced_at: {
-      type: "string",
-      format: "date-time",
-      title: "Synced At",
-    },
-    repositories: {
-      items: {
-        $ref: "#/components/schemas/RepositorySyncResult",
-      },
-      type: "array",
-      title: "Repositories",
-    },
-  },
-  type: "object",
-  required: ["success", "synced_at", "repositories"],
-  title: "RegistrySyncResponse",
-  description: "Response from sync operation.",
-} as const
-
-export const $RegistryVersionPromoteResponse = {
-  properties: {
-    repository_id: {
-      type: "string",
-      format: "uuid",
-      title: "Repository Id",
-    },
-    origin: {
-      type: "string",
-      title: "Origin",
-    },
-    previous_version_id: {
-      anyOf: [
-        {
-          type: "string",
-          format: "uuid",
-        },
-        {
-          type: "null",
-        },
-      ],
-      title: "Previous Version Id",
-    },
-    current_version_id: {
-      type: "string",
-      format: "uuid",
-      title: "Current Version Id",
-    },
-    version: {
-      type: "string",
-      title: "Version",
-    },
-  },
-  type: "object",
-  required: [
-    "repository_id",
-    "origin",
-    "previous_version_id",
-    "current_version_id",
-    "version",
-  ],
-  title: "RegistryVersionPromoteResponse",
-  description: "Response model for version promotion.",
-} as const
-
-export const $RegistryVersionRead = {
-  properties: {
-    id: {
-      type: "string",
-      format: "uuid",
-      title: "Id",
-    },
-    repository_id: {
-      type: "string",
-      format: "uuid",
-      title: "Repository Id",
-    },
-    version: {
-      type: "string",
-      title: "Version",
-    },
-    commit_sha: {
-      anyOf: [
-        {
-          type: "string",
-        },
-        {
-          type: "null",
-        },
-      ],
-      title: "Commit Sha",
-    },
-    tarball_uri: {
-      anyOf: [
-        {
-          type: "string",
-        },
-        {
-          type: "null",
-        },
-      ],
-      title: "Tarball Uri",
-    },
-    created_at: {
-      type: "string",
-      format: "date-time",
-      title: "Created At",
-    },
-  },
-  type: "object",
-  required: [
-    "id",
-    "repository_id",
-    "version",
-    "commit_sha",
-    "tarball_uri",
-    "created_at",
-  ],
-  title: "RegistryVersionRead",
-  description: "Registry version details.",
 } as const
 
 export const $ReopenedEventRead = {
@@ -11187,6 +11939,18 @@ export const $RepositoryStatus = {
         },
       ],
       title: "Commit Sha",
+    },
+    current_version_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Current Version Id",
     },
   },
   type: "object",
@@ -11429,6 +12193,16 @@ export const $Role = {
       anyOf: [
         {
           $ref: "#/components/schemas/WorkspaceRole",
+        },
+        {
+          type: "null",
+        },
+      ],
+    },
+    org_role: {
+      anyOf: [
+        {
+          $ref: "#/components/schemas/OrgRole",
         },
         {
           type: "null",
@@ -14111,7 +14885,7 @@ export const $TemplateActionDefinition_Input = {
     },
     expects: {
       additionalProperties: {
-        $ref: "#/components/schemas/ExpectedField",
+        $ref: "#/components/schemas/ExpectedField-Input",
       },
       type: "object",
       title: "Expects",
@@ -14239,7 +15013,7 @@ export const $TemplateActionDefinition_Output = {
     },
     expects: {
       additionalProperties: {
-        $ref: "#/components/schemas/ExpectedField",
+        $ref: "#/components/schemas/ExpectedField-Output",
       },
       type: "object",
       title: "Expects",
@@ -14470,6 +15244,321 @@ export const $ThinkingBlock = {
   type: "object",
   required: ["thinking", "signature"],
   title: "ThinkingBlock",
+} as const
+
+export const $TierCreate = {
+  properties: {
+    display_name: {
+      type: "string",
+      maxLength: 255,
+      minLength: 1,
+      title: "Display Name",
+    },
+    max_concurrent_workflows: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Max Concurrent Workflows",
+    },
+    max_action_executions_per_workflow: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Max Action Executions Per Workflow",
+    },
+    max_concurrent_actions: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Max Concurrent Actions",
+    },
+    api_rate_limit: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Api Rate Limit",
+    },
+    api_burst_capacity: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Api Burst Capacity",
+    },
+    entitlements: {
+      $ref: "#/components/schemas/EntitlementsDict",
+      default: {},
+    },
+    is_default: {
+      type: "boolean",
+      title: "Is Default",
+      default: false,
+    },
+    sort_order: {
+      type: "integer",
+      title: "Sort Order",
+      default: 0,
+    },
+  },
+  type: "object",
+  required: ["display_name"],
+  title: "TierCreate",
+  description: "Create tier request.",
+} as const
+
+export const $TierRead = {
+  properties: {
+    id: {
+      type: "string",
+      format: "uuid",
+      title: "Id",
+    },
+    display_name: {
+      type: "string",
+      title: "Display Name",
+    },
+    max_concurrent_workflows: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Max Concurrent Workflows",
+    },
+    max_action_executions_per_workflow: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Max Action Executions Per Workflow",
+    },
+    max_concurrent_actions: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Max Concurrent Actions",
+    },
+    api_rate_limit: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Api Rate Limit",
+    },
+    api_burst_capacity: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Api Burst Capacity",
+    },
+    entitlements: {
+      $ref: "#/components/schemas/EntitlementsDict",
+    },
+    is_default: {
+      type: "boolean",
+      title: "Is Default",
+    },
+    sort_order: {
+      type: "integer",
+      title: "Sort Order",
+    },
+    is_active: {
+      type: "boolean",
+      title: "Is Active",
+    },
+    created_at: {
+      type: "string",
+      format: "date-time",
+      title: "Created At",
+    },
+    updated_at: {
+      type: "string",
+      format: "date-time",
+      title: "Updated At",
+    },
+  },
+  type: "object",
+  required: [
+    "id",
+    "display_name",
+    "max_concurrent_workflows",
+    "max_action_executions_per_workflow",
+    "max_concurrent_actions",
+    "api_rate_limit",
+    "api_burst_capacity",
+    "entitlements",
+    "is_default",
+    "sort_order",
+    "is_active",
+    "created_at",
+    "updated_at",
+  ],
+  title: "TierRead",
+  description: "Tier response schema.",
+} as const
+
+export const $TierUpdate = {
+  properties: {
+    display_name: {
+      anyOf: [
+        {
+          type: "string",
+          maxLength: 255,
+          minLength: 1,
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Display Name",
+    },
+    max_concurrent_workflows: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Max Concurrent Workflows",
+    },
+    max_action_executions_per_workflow: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Max Action Executions Per Workflow",
+    },
+    max_concurrent_actions: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Max Concurrent Actions",
+    },
+    api_rate_limit: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Api Rate Limit",
+    },
+    api_burst_capacity: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Api Burst Capacity",
+    },
+    entitlements: {
+      anyOf: [
+        {
+          $ref: "#/components/schemas/EntitlementsDict",
+        },
+        {
+          type: "null",
+        },
+      ],
+    },
+    is_default: {
+      anyOf: [
+        {
+          type: "boolean",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Is Default",
+    },
+    sort_order: {
+      anyOf: [
+        {
+          type: "integer",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Sort Order",
+    },
+    is_active: {
+      anyOf: [
+        {
+          type: "boolean",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Is Active",
+    },
+  },
+  type: "object",
+  title: "TierUpdate",
+  description: "Update tier request.",
 } as const
 
 export const $Toggle = {
@@ -16336,7 +17425,7 @@ export const $WorkflowEntrypointValidationRequest = {
       anyOf: [
         {
           additionalProperties: {
-            $ref: "#/components/schemas/ExpectedField",
+            $ref: "#/components/schemas/ExpectedField-Input",
           },
           type: "object",
         },
@@ -17284,7 +18373,7 @@ export const $WorkflowRead = {
       anyOf: [
         {
           additionalProperties: {
-            $ref: "#/components/schemas/ExpectedField",
+            $ref: "#/components/schemas/ExpectedField-Output",
           },
           type: "object",
         },
@@ -17499,6 +18588,38 @@ export const $WorkflowReadMinimal = {
   description: "Minimal version of WorkflowRead model for list endpoints.",
 } as const
 
+export const $WorkflowSummary = {
+  properties: {
+    id: {
+      type: "string",
+      format: "uuid",
+      title: "Id",
+      description: "Workflow ID",
+    },
+    title: {
+      type: "string",
+      title: "Title",
+      description: "Workflow title",
+    },
+    alias: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Alias",
+      description: "Workflow alias",
+    },
+  },
+  type: "object",
+  required: ["id", "title"],
+  title: "WorkflowSummary",
+  description: "Summary of a workflow for inbox item context.",
+} as const
+
 export const $WorkflowSyncPullRequest = {
   properties: {
     commit_sha: {
@@ -17612,7 +18733,7 @@ export const $WorkflowUpdate = {
       anyOf: [
         {
           additionalProperties: {
-            $ref: "#/components/schemas/ExpectedField",
+            $ref: "#/components/schemas/ExpectedField-Input",
           },
           type: "object",
         },
@@ -18101,4 +19222,296 @@ export const $Yaml = {
   },
   type: "object",
   title: "Yaml",
+} as const
+
+export const $tracecat__registry__repositories__schemas__RegistrySyncResponse =
+  {
+    properties: {
+      success: {
+        type: "boolean",
+        title: "Success",
+      },
+      repository_id: {
+        type: "string",
+        format: "uuid",
+        title: "Repository Id",
+      },
+      origin: {
+        type: "string",
+        title: "Origin",
+      },
+      version: {
+        anyOf: [
+          {
+            type: "string",
+          },
+          {
+            type: "null",
+          },
+        ],
+        title: "Version",
+      },
+      commit_sha: {
+        anyOf: [
+          {
+            type: "string",
+          },
+          {
+            type: "null",
+          },
+        ],
+        title: "Commit Sha",
+      },
+      actions_count: {
+        anyOf: [
+          {
+            type: "integer",
+          },
+          {
+            type: "null",
+          },
+        ],
+        title: "Actions Count",
+      },
+      forced: {
+        type: "boolean",
+        title: "Forced",
+        default: false,
+      },
+    },
+    type: "object",
+    required: ["success", "repository_id", "origin"],
+    title: "RegistrySyncResponse",
+    description: "Response model for registry sync operation.",
+  } as const
+
+export const $tracecat__registry__repositories__schemas__RegistryVersionPromoteResponse =
+  {
+    properties: {
+      repository_id: {
+        type: "string",
+        format: "uuid",
+        title: "Repository Id",
+      },
+      origin: {
+        type: "string",
+        title: "Origin",
+      },
+      previous_version_id: {
+        anyOf: [
+          {
+            type: "string",
+            format: "uuid",
+          },
+          {
+            type: "null",
+          },
+        ],
+        title: "Previous Version Id",
+      },
+      current_version_id: {
+        type: "string",
+        format: "uuid",
+        title: "Current Version Id",
+      },
+      version: {
+        type: "string",
+        title: "Version",
+      },
+    },
+    type: "object",
+    required: [
+      "repository_id",
+      "origin",
+      "previous_version_id",
+      "current_version_id",
+      "version",
+    ],
+    title: "RegistryVersionPromoteResponse",
+    description: "Response model for version promotion.",
+  } as const
+
+export const $tracecat__registry__repositories__schemas__RegistryVersionRead = {
+  properties: {
+    id: {
+      type: "string",
+      format: "uuid",
+      title: "Id",
+    },
+    repository_id: {
+      type: "string",
+      format: "uuid",
+      title: "Repository Id",
+    },
+    version: {
+      type: "string",
+      title: "Version",
+    },
+    commit_sha: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Commit Sha",
+    },
+    tarball_uri: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Tarball Uri",
+    },
+    created_at: {
+      type: "string",
+      format: "date-time",
+      title: "Created At",
+    },
+  },
+  type: "object",
+  required: [
+    "id",
+    "repository_id",
+    "version",
+    "commit_sha",
+    "tarball_uri",
+    "created_at",
+  ],
+  title: "RegistryVersionRead",
+  description: "Response model for reading a registry version.",
+} as const
+
+export const $tracecat_ee__admin__registry__schemas__RegistrySyncResponse = {
+  properties: {
+    success: {
+      type: "boolean",
+      title: "Success",
+    },
+    synced_at: {
+      type: "string",
+      format: "date-time",
+      title: "Synced At",
+    },
+    repositories: {
+      items: {
+        $ref: "#/components/schemas/RepositorySyncResult",
+      },
+      type: "array",
+      title: "Repositories",
+    },
+  },
+  type: "object",
+  required: ["success", "synced_at", "repositories"],
+  title: "RegistrySyncResponse",
+  description: "Response from sync operation.",
+} as const
+
+export const $tracecat_ee__admin__registry__schemas__RegistryVersionPromoteResponse =
+  {
+    properties: {
+      repository_id: {
+        type: "string",
+        format: "uuid",
+        title: "Repository Id",
+      },
+      origin: {
+        type: "string",
+        title: "Origin",
+      },
+      previous_version_id: {
+        anyOf: [
+          {
+            type: "string",
+            format: "uuid",
+          },
+          {
+            type: "null",
+          },
+        ],
+        title: "Previous Version Id",
+      },
+      current_version_id: {
+        type: "string",
+        format: "uuid",
+        title: "Current Version Id",
+      },
+      version: {
+        type: "string",
+        title: "Version",
+      },
+    },
+    type: "object",
+    required: [
+      "repository_id",
+      "origin",
+      "previous_version_id",
+      "current_version_id",
+      "version",
+    ],
+    title: "RegistryVersionPromoteResponse",
+    description: "Response from promoting a registry version.",
+  } as const
+
+export const $tracecat_ee__admin__registry__schemas__RegistryVersionRead = {
+  properties: {
+    id: {
+      type: "string",
+      format: "uuid",
+      title: "Id",
+    },
+    repository_id: {
+      type: "string",
+      format: "uuid",
+      title: "Repository Id",
+    },
+    version: {
+      type: "string",
+      title: "Version",
+    },
+    commit_sha: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Commit Sha",
+    },
+    tarball_uri: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Tarball Uri",
+    },
+    created_at: {
+      type: "string",
+      format: "date-time",
+      title: "Created At",
+    },
+  },
+  type: "object",
+  required: [
+    "id",
+    "repository_id",
+    "version",
+    "commit_sha",
+    "tarball_uri",
+    "created_at",
+  ],
+  title: "RegistryVersionRead",
+  description: "Registry version details.",
 } as const

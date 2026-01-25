@@ -105,7 +105,7 @@ class TypeTransformer(Transformer):
     @v_args(inline=True)
     def union_type(self, *types) -> type:
         logger.trace("Union type:", types=types)
-        return Union[types]  # type: ignore # noqa: UP007
+        return Union[types]  # noqa: UP007  # pyright: ignore[reportReturnType]
 
     @v_args(inline=True)
     def reference_type(self, name) -> str:
@@ -165,7 +165,7 @@ def create_expectation_model(
         if description:
             field_info_kwargs["description"] = description
 
-        if "default" in validated_field_info.model_fields_set:
+        if validated_field_info.has_default():
             # If the field has a default value, use it
             field_info_kwargs["default"] = validated_field_info.default
         else:

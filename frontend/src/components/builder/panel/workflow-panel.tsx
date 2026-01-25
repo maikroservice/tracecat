@@ -65,6 +65,7 @@ const createWorkflowUpdateFormSchema = (workspaceId: string) =>
           message: "Timeout cannot exceed 14 days (1209600 seconds)",
         })
         .optional(),
+      sample_data: z.unknown().nullish().optional(),
       /* Input Schema */
       expects: z
         .record(
@@ -201,7 +202,8 @@ function WorkflowSettingsPanel({
     }),
     defaultValues: {
       title: workflow.title,
-      alias: workflow.alias,
+      alias: workflow.alias,      
+      sample_data: workflow.sample_data,
       environment: workflow.config?.environment || "default",
       timeout: workflow.config?.timeout || 0,
       // Use undefined for empty objects so the YAML editor shows empty instead of {}
@@ -544,6 +546,40 @@ function WorkflowSettingsPanel({
                 </FormItem>
               )}
             />
+
+            {/* Sample data */}
+            <FormItem>
+              <FormLabel className="flex items-center text-xs">
+                <HoverCard openDelay={100} closeDelay={100}>
+                  <HoverCardTrigger asChild className="hover:border-none">
+                    <Info className="mr-1 size-3 stroke-muted-foreground" />
+                  </HoverCardTrigger>
+                  <HoverCardContent
+                    className="w-[300px] p-3 font-mono text-xs tracking-tight"
+                    side="left"
+                    sideOffset={20}
+                  >
+                    <div className="w-full space-y-4">
+                      <div className="flex w-full items-center justify-between text-muted-foreground">
+                        <span className="font-mono text-sm font-semibold">
+                          Sample data
+                        </span>
+                        <span className="text-xs text-muted-foreground/80">
+                          (optional)
+                        </span>
+                      </div>
+                      <span className="text-muted-foreground">
+                        Sample input data for testing the workflow. This can be
+                        used to preview how the workflow will process example
+                        inputs.
+                      </span>
+                    </div>
+                  </HoverCardContent>
+                </HoverCard>
+                <span>Sample data</span>
+              </FormLabel>
+              <ControlledYamlField fieldName="sample_data" hideType />
+            </FormItem>
 
             {/* Input schema */}
             <FormItem>

@@ -716,6 +716,11 @@ class Workflow(WorkspaceModel):
         doc="Workflow alias or ID for the workflow to run when this fails.",
     )
     icon_url: Mapped[str | None] = mapped_column(String, nullable=True)
+    sample_data: Mapped[dict[str, str] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        doc="Sample input data for testing the workflow",
+    )
     registry_lock: Mapped[dict[str, str] | None] = mapped_column(
         JSONB,
         nullable=True,

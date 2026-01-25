@@ -33,6 +33,7 @@ import {
   HoverCardTrigger,
 } from "@/components/ui/hover-card"
 import { Input } from "@/components/ui/input"
+import { CodeEditor } from "@/components/editor/codemirror/code-editor"
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
@@ -202,7 +203,7 @@ function WorkflowSettingsPanel({
     }),
     defaultValues: {
       title: workflow.title,
-      alias: workflow.alias,      
+      alias: workflow.alias,
       sample_data: workflow.sample_data,
       environment: workflow.config?.environment || "default",
       timeout: workflow.config?.timeout || 0,
@@ -548,38 +549,58 @@ function WorkflowSettingsPanel({
             />
 
             {/* Sample data */}
-            <FormItem>
-              <FormLabel className="flex items-center text-xs">
-                <HoverCard openDelay={100} closeDelay={100}>
-                  <HoverCardTrigger asChild className="hover:border-none">
-                    <Info className="mr-1 size-3 stroke-muted-foreground" />
-                  </HoverCardTrigger>
-                  <HoverCardContent
-                    className="w-[300px] p-3 font-mono text-xs tracking-tight"
-                    side="left"
-                    sideOffset={20}
-                  >
-                    <div className="w-full space-y-4">
-                      <div className="flex w-full items-center justify-between text-muted-foreground">
-                        <span className="font-mono text-sm font-semibold">
-                          Sample data
-                        </span>
-                        <span className="text-xs text-muted-foreground/80">
-                          (optional)
-                        </span>
-                      </div>
-                      <span className="text-muted-foreground">
-                        Sample input data for testing the workflow. This can be
-                        used to preview how the workflow will process example
-                        inputs.
-                      </span>
-                    </div>
-                  </HoverCardContent>
-                </HoverCard>
-                <span>Sample data</span>
-              </FormLabel>
-              <ControlledYamlField fieldName="sample_data" hideType />
-            </FormItem>
+            <FormField
+              name="sample_data"
+              control={methods.control}
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel className="flex items-center text-xs">
+                    <HoverCard openDelay={100} closeDelay={100}>
+                      <HoverCardTrigger asChild className="hover:border-none">
+                        <Info className="mr-1 size-3 stroke-muted-foreground" />
+                      </HoverCardTrigger>
+                      <HoverCardContent
+                        className="w-[300px] p-3 font-mono text-xs tracking-tight"
+                        side="left"
+                        sideOffset={20}
+                      >
+                        <div className="w-full space-y-4">
+                          <div className="flex w-full items-center justify-between text-muted-foreground">
+                            <span className="font-mono text-sm font-semibold">
+                              Sample data
+                            </span>
+                            <span className="text-xs text-muted-foreground/80">
+                              (optional)
+                            </span>
+                          </div>
+                          <span className="text-muted-foreground">
+                            Sample input data for testing the workflow. This can be
+                            used to preview how the workflow will process example
+                            inputs.
+                          </span>
+                        </div>
+                      </HoverCardContent>
+                    </HoverCard>
+                    <span>Sample data</span>
+                  </FormLabel>
+                  <FormControl>
+                    <CodeEditor
+                      language="json"
+                      value={field.value ? JSON.stringify(field.value, null, 2) : ""}
+                      onChange={(value) => {
+                        try {
+                          const parsed = JSON.parse(value);
+                          field.onChange(parsed);
+                        } catch {
+                          // Keep typing, don't update if invalid JSON
+                        }
+                      }}
+                    />
+                  </FormControl>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
 
             {/* Input schema */}
             <FormItem>

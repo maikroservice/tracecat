@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import json
 from collections.abc import AsyncGenerator
@@ -9,7 +10,9 @@ from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
 from tracecat import config
-from tracecat.db import session_events  # noqa: F401 - ensure listeners are registered
+from tracecat.db import (
+    session_events,  # noqa: F401  # pyright: ignore[reportUnusedImport] - side effect import to register listeners
+)
 
 # Global so we don't create more than one engine per process.
 # Outside of being best practice, this is needed so we can properly pool
@@ -32,13 +35,50 @@ def get_connection_string(
 
 def _get_db_uri(driver: Literal["psycopg", "asyncpg"] = "psycopg") -> str:
     # Check if AWS environment
-    if config.TRACECAT__DB_USER and config.TRACECAT__DB_PASS__ARN:
+    if config.TRACECAT__DB_PASS__ARN:
         logger.info("Retrieving database password from AWS Secrets Manager...")
         try:
-            session = boto3.session.Session()  # type: ignore
+            session = boto3.session.Session()
             client = session.client(service_name="secretsmanager")
             response = client.get_secret_value(SecretId=config.TRACECAT__DB_PASS__ARN)
-            password = json.loads(response["SecretString"])["password"]
+            secret_string = response.get("SecretString")
+            if not secret_string and response.get("SecretBinary"):
+                try:
+                    secret_string = base64.b64decode(response["SecretBinary"]).decode(
+                        "utf-8"
+                    )
+                except UnicodeDecodeError as e:
+                    logger.error(
+                        "Error decoding secret from AWS Secrets Manager."
+                        " SecretBinary must be UTF-8 encoded text or JSON."
+                        " Use SecretString for plain text credentials.",
+                        error=e,
+                    )
+                    raise e
+            if not secret_string:
+                raise KeyError("SecretString")
+
+            parsed_json = True
+            try:
+                secret_payload = json.loads(secret_string)
+            except json.JSONDecodeError:
+                parsed_json = False
+                secret_payload = {}
+
+            username = config.TRACECAT__DB_USER
+            password = None
+            if isinstance(secret_payload, dict):
+                username = username or secret_payload.get("username")
+                password = secret_payload.get("password")
+
+            if not password:
+                if not parsed_json and config.TRACECAT__DB_USER:
+                    password = secret_string
+                else:
+                    raise KeyError("password")
+
+            if not username:
+                raise KeyError("username")
         except ClientError as e:
             logger.error(
                 "Error retrieving secret from AWS secrets manager."
@@ -49,30 +89,49 @@ def _get_db_uri(driver: Literal["psycopg", "asyncpg"] = "psycopg") -> str:
         except KeyError as e:
             logger.error(
                 "Error retrieving secret from AWS secrets manager."
-                " `password` not found in secret."
                 " Please check that the database secret in AWS Secrets Manager is a valid JSON object"
-                " with `username` and `password`"
+                " with `username` and `password` (or set TRACECAT__DB_USER and store the password as the secret string)."
             )
             raise e
 
         # Get the password from AWS Secrets Manager
+        if not config.TRACECAT__DB_ENDPOINT:
+            raise ValueError(
+                "TRACECAT__DB_ENDPOINT is required when using AWS Secrets Manager"
+            )
+        if not config.TRACECAT__DB_PORT:
+            raise ValueError(
+                "TRACECAT__DB_PORT is required when using AWS Secrets Manager"
+            )
+        if not config.TRACECAT__DB_NAME:
+            raise ValueError(
+                "TRACECAT__DB_NAME is required when using AWS Secrets Manager"
+            )
         uri = get_connection_string(
-            username=config.TRACECAT__DB_USER,
+            username=username,
             password=password,
-            host=config.TRACECAT__DB_ENDPOINT,  # type: ignore
-            port=config.TRACECAT__DB_PORT,  # type: ignore
-            database=config.TRACECAT__DB_NAME,  # type: ignore
+            host=config.TRACECAT__DB_ENDPOINT,
+            port=config.TRACECAT__DB_PORT,
+            database=config.TRACECAT__DB_NAME,
             driver=driver,
         )
         logger.info("Successfully retrieved database password from AWS Secrets Manager")
     # Else check if the password is in the local environment
     elif config.TRACECAT__DB_USER and config.TRACECAT__DB_PASS:
+        if not config.TRACECAT__DB_ENDPOINT:
+            raise ValueError(
+                "TRACECAT__DB_ENDPOINT is required when using DB credentials"
+            )
+        if not config.TRACECAT__DB_PORT:
+            raise ValueError("TRACECAT__DB_PORT is required when using DB credentials")
+        if not config.TRACECAT__DB_NAME:
+            raise ValueError("TRACECAT__DB_NAME is required when using DB credentials")
         uri = get_connection_string(
             username=config.TRACECAT__DB_USER,
             password=config.TRACECAT__DB_PASS,
-            host=config.TRACECAT__DB_ENDPOINT,  # type: ignore
-            port=config.TRACECAT__DB_PORT,  # type: ignore
-            database=config.TRACECAT__DB_NAME,  # type: ignore
+            host=config.TRACECAT__DB_ENDPOINT,
+            port=config.TRACECAT__DB_PORT,
+            database=config.TRACECAT__DB_NAME,
             driver=driver,
         )
     # Else use the default URI
@@ -103,6 +162,15 @@ def get_async_engine() -> AsyncEngine:
     if _async_engine is None:
         _async_engine = _create_async_db_engine()
     return _async_engine
+
+
+def reset_async_engine() -> None:
+    """Reset the global async engine.
+
+    This should only be used in tests to ensure clean state between tests.
+    """
+    global _async_engine
+    _async_engine = None
 
 
 async def get_async_session() -> AsyncGenerator[AsyncSession, None]:

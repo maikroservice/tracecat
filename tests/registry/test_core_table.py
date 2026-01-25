@@ -1,7 +1,9 @@
 """Tests for core.table UDFs in the registry."""
 
-import contextlib
+import asyncio
+import os
 import uuid
+from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -10,8 +12,8 @@ import orjson
 import pytest
 import tracecat_registry.core.table as table_core
 from asyncpg import DuplicateTableError
+from sqlalchemy import text
 from sqlalchemy.exc import ProgrammingError
-from sqlalchemy.ext.asyncio import AsyncSession
 from tracecat_registry.core.table import (
     create_table,
     delete_row,
@@ -27,9 +29,12 @@ from tracecat_registry.core.table import (
     update_row,
 )
 
-from tracecat.auth.types import Role
+from tracecat import config
+from tracecat.auth.types import AccessLevel, Role
 from tracecat.contexts import ctx_role
+from tracecat.db.engine import get_async_session_context_manager
 from tracecat.db.models import Workspace
+from tracecat.identifiers.workflow import WorkspaceUUID
 from tracecat.tables.enums import SqlType
 from tracecat.tables.service import TablesService
 
@@ -158,29 +163,6 @@ def registry_client_ctx(monkeypatch: pytest.MonkeyPatch, registry_client_enabled
         fake_ctx = SimpleNamespace(tables=_FakeTablesClient())
         monkeypatch.setattr(table_core, "get_context", lambda: fake_ctx)
     yield
-
-
-@pytest.fixture
-def patched_session_context(session: AsyncSession):
-    """Fixture to patch get_async_session_context_manager to use the test session.
-
-    This is needed for integration tests that call UDFs directly, which internally
-    use TablesService.with_session(). Without this patch, the service creates a
-    new session that can't see data in the test's savepoint transaction.
-    """
-
-    @contextlib.asynccontextmanager
-    async def mock_session_cm():
-        yield session
-
-    def create_mock_cm():
-        return mock_session_cm()
-
-    with patch(
-        "tracecat.service.get_async_session_context_manager",
-        side_effect=create_mock_cm,
-    ):
-        yield
 
 
 @pytest.fixture
@@ -1128,18 +1110,122 @@ class TestCoreDownloadTable:
         assert result == ""
 
 
+# =============================================================================
+# DDL Integration Test Fixtures
+# =============================================================================
+# These fixtures are specifically for DDL tests that need to bypass the
+# savepoint-based session fixture. DDL operations (CREATE SCHEMA, CREATE TABLE)
+# acquire exclusive locks that conflict with SERIALIZABLE isolation.
+
+
+@pytest.fixture
+async def ddl_workspace() -> AsyncGenerator[Workspace, None]:
+    """Create a workspace for DDL tests using a clean database session.
+
+    Unlike svc_workspace, this fixture:
+    - Creates the workspace directly in the real database (not in a savepoint)
+    - Uses READ COMMITTED isolation (default) which works with DDL
+    - Properly cleans up the schema after the test
+
+    For pytest-xdist parallel execution, each worker gets a unique workspace ID
+    to prevent conflicts between concurrent tests.
+    """
+    # Generate unique workspace ID - include worker ID for parallel execution
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER", "main")
+    workspace_id = WorkspaceUUID(str(uuid.uuid4()))
+
+    workspace = Workspace(
+        id=workspace_id,
+        name=f"ddl-test-workspace-{worker_id}",
+        organization_id=config.TRACECAT__DEFAULT_ORG_ID,
+    )
+
+    # Create the workspace in the real database using a clean session
+    async with get_async_session_context_manager() as session:
+        # Set timeouts to avoid deadlocks with parallel workers
+        await session.execute(text("SET LOCAL lock_timeout = '5s'"))
+        await session.execute(text("SET LOCAL statement_timeout = '30s'"))
+        session.add(workspace)
+        await session.commit()
+        # Refresh to get the committed state
+        await session.refresh(workspace)
+
+    try:
+        yield workspace
+    finally:
+        # Clean up: drop schema first, then delete workspace
+        # Use timeout to prevent hanging on database locks during parallel test execution
+        schema_name = f"tables_{workspace_id.short()}"
+        try:
+            async with asyncio.timeout(30):  # 30 second timeout for cleanup
+                async with get_async_session_context_manager() as cleanup_session:
+                    # Set timeouts to avoid deadlocks with parallel workers
+                    await cleanup_session.execute(text("SET LOCAL lock_timeout = '5s'"))
+                    await cleanup_session.execute(
+                        text("SET LOCAL statement_timeout = '30s'")
+                    )
+                    # Drop the schema if it exists (CASCADE drops all tables in schema)
+                    await cleanup_session.execute(
+                        text(f'DROP SCHEMA IF EXISTS "{schema_name}" CASCADE')
+                    )
+                    await cleanup_session.commit()
+
+                    # Delete the workspace
+                    await cleanup_session.execute(
+                        text("DELETE FROM workspace WHERE id = :workspace_id"),
+                        {"workspace_id": str(workspace_id)},
+                    )
+                    await cleanup_session.commit()
+        except TimeoutError:
+            # Log but don't fail - the schema/workspace will be orphaned but
+            # won't affect other tests since each uses unique IDs
+            import logging
+
+            logging.warning(
+                f"Timeout during ddl_workspace cleanup for workspace {workspace_id}"
+            )
+
+
+@pytest.fixture
+def ddl_role(ddl_workspace: Workspace) -> Role:
+    """Create an admin role for DDL tests."""
+    return Role(
+        type="user",
+        access_level=AccessLevel.ADMIN,
+        workspace_id=ddl_workspace.id,
+        user_id=uuid.uuid4(),
+        service_id="tracecat-api",
+    )
+
+
 @pytest.mark.anyio
+@pytest.mark.xdist_group("ddl")
 class TestCoreTableIntegration:
-    """Integration tests for core.table UDFs using real database."""
+    """Integration tests for core.table UDFs using real database.
+
+    These tests only run with registry_client=False because they execute DDL
+    (CREATE SCHEMA, CREATE TABLE) which requires the direct database path.
+    DDL cannot work with the savepoint-based session fixture because PostgreSQL
+    DDL acquires exclusive locks that conflict with SERIALIZABLE isolation.
+
+    NOTE: These tests are grouped with @pytest.mark.xdist_group("ddl") to run
+    serially within the same worker when using pytest-xdist. This prevents
+    deadlocks during fixture teardown when multiple workers compete for
+    database locks on DDL operations.
+    """
 
     pytestmark = pytest.mark.usefixtures("db")
 
+    @pytest.fixture(autouse=True)
+    def skip_registry_client_on(self, registry_client_enabled: bool):
+        """Skip these tests when registry_client is enabled."""
+        if registry_client_enabled:
+            pytest.skip("Integration tests only run with registry_client=False")
+
     async def test_create_table_with_columns_integration(
         self,
-        session: AsyncSession,
-        svc_workspace: Workspace,
-        svc_admin_role: Role,
-        patched_session_context,
+        ddl_workspace: Workspace,
+        ddl_role: Role,
     ):
         """Test that create_table UDF actually creates columns in the database.
 
@@ -1147,7 +1233,7 @@ class TestCoreTableIntegration:
         was not creating columns despite them being specified.
         """
         # Set the role context for the UDF
-        token = ctx_role.set(svc_admin_role)
+        token = ctx_role.set(ddl_role)
         try:
             # Define columns for the table
             columns = [
@@ -1166,7 +1252,7 @@ class TestCoreTableIntegration:
 
             # Now verify the columns were actually created in the database
             # Use TablesService.with_session() to access the same committed data
-            async with TablesService.with_session(role=svc_admin_role) as service:
+            async with TablesService.with_session(role=ddl_role) as service:
                 tables = await service.list_tables()
 
                 # Find our table
@@ -1229,14 +1315,12 @@ class TestCoreTableIntegration:
 
     async def test_create_table_without_columns_integration(
         self,
-        session: AsyncSession,
-        svc_workspace: Workspace,
-        svc_admin_role: Role,
-        patched_session_context,
+        ddl_workspace: Workspace,
+        ddl_role: Role,
     ):
         """Test creating a table without predefined columns."""
         # Set the role context for the UDF
-        token = ctx_role.set(svc_admin_role)
+        token = ctx_role.set(ddl_role)
         try:
             # Create table without columns
             result = await create_table(name="empty_table")
@@ -1246,7 +1330,7 @@ class TestCoreTableIntegration:
             assert "id" in result
 
             # Verify in database using the same session type as the UDF
-            async with TablesService.with_session(role=svc_admin_role) as service:
+            async with TablesService.with_session(role=ddl_role) as service:
                 tables = await service.list_tables()
 
                 table_names = {table.name for table in tables}
@@ -1256,14 +1340,12 @@ class TestCoreTableIntegration:
 
     async def test_list_tables_integration(
         self,
-        session: AsyncSession,
-        svc_workspace: Workspace,
-        svc_admin_role: Role,
-        patched_session_context,
+        ddl_workspace: Workspace,
+        ddl_role: Role,
     ):
         """Test listing tables after creation."""
         # Set the role context for the UDF
-        token = ctx_role.set(svc_admin_role)
+        token = ctx_role.set(ddl_role)
         try:
             # Create multiple tables
             await create_table(
@@ -1391,14 +1473,12 @@ class TestCoreTableIntegration:
 
     async def test_create_table_raise_on_duplicate_false_integration(
         self,
-        session: AsyncSession,
-        svc_workspace: Workspace,
-        svc_admin_role: Role,
-        patched_session_context,
+        ddl_workspace: Workspace,
+        ddl_role: Role,
     ):
         """Test that create_table with raise_on_duplicate=False returns existing table."""
         # Set the role context for the UDF
-        token = ctx_role.set(svc_admin_role)
+        token = ctx_role.set(ddl_role)
         try:
             # Define columns for the table
             columns = [
@@ -1423,7 +1503,7 @@ class TestCoreTableIntegration:
             assert result2["id"] == first_table_id
 
             # Verify only one table exists with that name
-            async with TablesService.with_session(role=svc_admin_role) as service:
+            async with TablesService.with_session(role=ddl_role) as service:
                 tables = await service.list_tables()
                 duplicate_tables = [
                     t for t in tables if t.name == "duplicate_test_table"
@@ -1435,14 +1515,12 @@ class TestCoreTableIntegration:
 
     async def test_create_table_duplicate_with_raise_on_duplicate_true_integration(
         self,
-        session: AsyncSession,
-        svc_workspace: Workspace,
-        svc_admin_role: Role,
-        patched_session_context,
+        ddl_workspace: Workspace,
+        ddl_role: Role,
     ):
         """Test that create_table raises error on duplicate with raise_on_duplicate=True."""
         # Set the role context for the UDF
-        token = ctx_role.set(svc_admin_role)
+        token = ctx_role.set(ddl_role)
         try:
             # Create table first time
             await create_table(name="duplicate_error_test")

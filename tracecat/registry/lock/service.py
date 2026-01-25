@@ -111,9 +111,7 @@ class RegistryLockService(BaseService):
 
         # 3. Build action -> origin mapping using BFS to include template step actions
         actions: dict[str, str] = {}
-        queue: deque[str] = deque(
-            sorted(action_names - PlatformAction.interface_actions())
-        )
+        queue: deque[str] = deque(sorted(action_names))
 
         while queue:
             action_name = queue.popleft()
@@ -148,10 +146,14 @@ class RegistryLockService(BaseService):
                 impl = RegistryActionImplValidator.validate_python(
                     manifest_action.implementation
                 )
-                if impl.type == "template" and impl.template_action is not None:
+                if impl.type == "template":
                     for step in impl.template_action.definition.steps:
                         if PlatformAction.is_interface(step.action):
-                            continue
+                            raise RegistryError(
+                                f"Template action '{action_name}' contains step '{step.ref}' using "
+                                f"platform action '{step.action}'. Platform actions cannot be used "
+                                f"inside templates - use them directly in workflows instead."
+                            )
                         if step.action not in actions:
                             queue.append(step.action)
 

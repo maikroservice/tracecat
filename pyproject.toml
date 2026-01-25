@@ -66,7 +66,7 @@ dependencies = [
     "pydantic==2.12.5",
     "pygithub==2.8.1",
     "pynacl==1.6.2",
-    "pydantic-ai-slim[anthropic,bedrock,google,mcp,openai]==1.29.0",
+    "pyasn1==0.6.2",
     "pysaml2==7.5.0",
     "python-slugify==8.0.4",
     "redis[hiredis]==7.1.0",
@@ -92,6 +92,8 @@ Repository = "https://github.com/TracecatHQ/tracecat"
 
 
 [tool.uv.sources]
+tracecat = { workspace = true }
+tracecat-admin = { workspace = true }
 tracecat-registry = { workspace = true }
 tracecat-ee = { workspace = true }
 
@@ -116,8 +118,13 @@ override-dependencies = [
 ]
 
 [dependency-groups]
+admin = ["tracecat-admin"]
+lint = [
+    "basedpyright==1.37.1",
+    "types-aioboto3[sts,s3]==15.5.0",
+    "types-boto3[sts,s3]==1.42.25",
+]
 dev = [
-    "mypy==1.15.0",
     "pre-commit==4.1.0",
     "psycopg==3.1.19",
     "pytest-benchmark==5.2.3",
@@ -128,8 +135,7 @@ dev = [
     "python-dotenv==1.1.1",
     "respx==0.22.0",
     "ruff==0.13.0",
-    "types-aioboto3[sts,s3]==15.5.0",
-    "types-boto3[sts,s3]==1.42.25",
+    {include-group = "lint"},
 ]
 
 [tool.hatch.version]
@@ -137,10 +143,6 @@ path = "tracecat/__init__.py"
 
 [tool.hatch.metadata]
 allow-direct-references = true
-
-[tool.mypy]
-strict = true
-ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 88
@@ -162,12 +164,20 @@ ignore = [
     "W191", # indentation contains tabs
 ]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/temporal/*" = ["E402"]  # pytestmark before imports is intentional
+
 [tool.ruff.lint.pyupgrade]
 # Preserve types, even if a file imports `from __future__ import annotations`.
 keep-runtime-typing = true
 
 [tool.pytest.ini_options]
-addopts = ["--strict-config", "--strict-markers", "-vvrP"]
+addopts = [
+    "--strict-config",
+    "--strict-markers",
+    "-vvrP",
+    "--benchmark-disable",
+]
 xfail_strict = true
 log_level = "ERROR"
 log_cli = true
@@ -182,4 +192,41 @@ markers = [
     "integration: marks tests that perform live network calls and container operations",
     "llm: marks tests that perform LLM calls",
     "ollama: mark tests that require Ollama",
+    "temporal: marks tests that require Temporal server",
+    "regression: marks regression tests",
 ]
+
+[tool.basedpyright]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+include = ["tracecat", "packages", "alembic", "tests"]
+exclude = ["scripts/", "**/__pycache__", "**/node_modules"]
+# Core type checking - keep enabled for catching real bugs
+reportMissingTypeStubs = false    # Don't require stubs for all dependencies
+reportUnusedImport = "warning"
+reportUnusedVariable = "warning"
+reportUnusedFunction = "warning"
+reportDuplicateImport = "warning"
+# Disable noisy warnings that don't indicate real bugs
+reportAny = false
+reportExplicitAny = false
+reportUnknownArgumentType = false
+reportUnknownLambdaType = false
+reportUnknownMemberType = false
+reportUnknownParameterType = false
+reportUnknownVariableType = false
+reportMissingParameterType = false
+reportUnannotatedClassAttribute = false
+reportUnusedCallResult = false
+reportUnusedParameter = false
+reportImplicitStringConcatenation = false
+reportCallInDefaultInitializer = false
+reportImplicitOverride = false
+reportPrivateUsage = false
+reportPrivateLocalImportUsage = false
+reportImportCycles = false
+reportUnnecessaryComparison = false
+reportUnnecessaryIsInstance = false
+reportUnnecessaryCast = false
+reportDeprecated = false
+reportMissingTypeArgument = false

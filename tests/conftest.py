@@ -15,6 +15,7 @@ os.environ.setdefault("TRACECAT__WORKFLOW_RETURN_STRATEGY", "context")
 
 import aioboto3
 import pytest
+import redis
 import tracecat_registry.integrations.aws_boto3 as boto3_module
 from dotenv import load_dotenv
 from minio import Minio
@@ -30,7 +31,11 @@ from tests.database import TEST_DB_CONFIG
 from tracecat import config
 from tracecat.auth.types import AccessLevel, Role, system_role
 from tracecat.contexts import ctx_role
-from tracecat.db.engine import get_async_engine, get_async_session_context_manager
+from tracecat.db.engine import (
+    get_async_engine,
+    get_async_session_context_manager,
+    reset_async_engine,
+)
 from tracecat.db.models import Base, Workspace
 from tracecat.dsl.client import get_temporal_client
 from tracecat.dsl.plugins import TracecatPydanticAIPlugin
@@ -55,26 +60,54 @@ else:
     # Extract number from "gwN" format
     WORKER_OFFSET = int(WORKER_ID.replace("gw", ""))
 
-# MinIO test configuration - uses docker-compose service on port 9000
-# Credentials match .env.example (MINIO_ROOT_USER/MINIO_ROOT_PASSWORD)
-MINIO_PORT = 9000
-MINIO_ACCESS_KEY = "minio"
-MINIO_SECRET_KEY = "password"
+# Port configuration - reads from environment for worktree cluster support
+# Default ports are for cluster 1, override with PG_PORT, TEMPORAL_PORT, MINIO_PORT, REDIS_PORT
+PG_PORT = int(os.environ.get("PG_PORT", "5432"))
+TEMPORAL_PORT = int(os.environ.get("TEMPORAL_PORT", "7233"))
+MINIO_PORT = int(os.environ.get("MINIO_PORT", "9000"))
+REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 MINIO_WORKFLOW_BUCKET = "test-tracecat-workflow"
+
+# Worker-specific task queues for pytest-xdist isolation
+# Each xdist worker uses different queues to avoid workflow conflicts
+TEMPORAL_TASK_QUEUE = f"tracecat-task-queue-{WORKER_ID}"
+EXECUTOR_TASK_QUEUE = f"shared-action-queue-{WORKER_ID}"
+AGENT_TASK_QUEUE = f"shared-agent-queue-{WORKER_ID}"
+
+# Detect if running inside Docker container by checking for /.dockerenv file
+# This is more reliable than checking env vars like REDIS_URL, which may be
+# loaded from .env by load_dotenv() even when running on the host
+IN_DOCKER = os.path.exists("/.dockerenv")
+
+
+def _minio_credentials() -> tuple[str, str]:
+    load_dotenv()
+    access_key = (
+        os.environ.get("AWS_ACCESS_KEY_ID")
+        or os.environ.get("MINIO_ROOT_USER")
+        or "minioadmin"
+    )
+    secret_key = (
+        os.environ.get("AWS_SECRET_ACCESS_KEY")
+        or os.environ.get("MINIO_ROOT_PASSWORD")
+        or "minioadmin"
+    )
+    return access_key, secret_key
+
 
 # ---------------------------------------------------------------------------
 # Redis test configuration
 # ---------------------------------------------------------------------------
 
-# Redis runs on standard port via docker-compose
-# REDIS_HOST is configurable for running tests inside containers (e.g., executor)
-REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
-REDIS_PORT = 6379
-
 # Worker-specific Redis database number for pytest-xdist isolation
 # Each xdist worker uses a different database (0-15) to avoid conflicts
 # when multiple workers run tests in parallel
 REDIS_DB = WORKER_OFFSET % 16
+
+# Redis URL - use Docker hostname when inside container, localhost otherwise
+# Ignore REDIS_URL from .env as it contains Docker-internal hostname
+REDIS_HOST = "redis" if IN_DOCKER else "localhost"
+REDIS_URL = f"redis://{REDIS_HOST}:{REDIS_PORT}"
 
 
 # ---------------------------------------------------------------------------
@@ -93,27 +126,24 @@ def redis_server():
     Each pytest-xdist worker uses a different Redis database number
     to ensure test isolation during parallel execution.
     """
-    import redis as redis_sync
-
-    client = redis_sync.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB)
+    # Append worker-specific database number for isolation
+    worker_redis_url = f"{REDIS_URL}/{REDIS_DB}"
+    client = redis.Redis.from_url(worker_redis_url)
     for _ in range(30):
         try:
             if client.ping():
                 logger.info(
-                    f"Redis available at {REDIS_HOST}:{REDIS_PORT}, db={REDIS_DB} "
-                    f"(worker={WORKER_ID})"
+                    f"Redis available at {worker_redis_url} (worker={WORKER_ID})"
                 )
-                # Include database number in REDIS_URL for worker isolation
-                os.environ["REDIS_URL"] = (
-                    f"redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
-                )
+                # Set REDIS_URL with worker-specific database for isolation
+                os.environ["REDIS_URL"] = worker_redis_url
                 yield
                 return
         except Exception:
             time.sleep(1)
 
     pytest.fail(
-        f"Redis not available at {REDIS_HOST}:{REDIS_PORT}. "
+        f"Redis not available at {REDIS_URL}. "
         "Start it with: docker-compose -f docker-compose.dev.yml up -d redis"
     )
 
@@ -124,9 +154,7 @@ def clean_redis_db(redis_server):
 
     Uses worker-specific database to avoid affecting other xdist workers.
     """
-    import redis as redis_sync
-
-    client = redis_sync.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB)
+    client = redis.Redis.from_url(os.environ["REDIS_URL"])
     client.flushdb()
     yield
     client.flushdb()
@@ -146,16 +174,23 @@ def monkeysession(request: pytest.FixtureRequest):
 
 @pytest.fixture(autouse=True, scope="function")
 async def test_db_engine():
-    """Create a new engine for each integration test."""
+    """Ensure a fresh async engine for each test.
+
+    This fixture creates a new engine for each test function and disposes it
+    after the test completes. This ensures connections are properly cleaned up
+    and don't hold references to closed event loops when using pytest-xdist.
+    """
     engine = get_async_engine()
     try:
         yield engine
     finally:
-        # Ensure the engine is disposed even if the test fails
         try:
             await engine.dispose()
         except Exception as e:
-            logger.error(f"Error disposing engine in test_db_engine: {e}")
+            logger.warning(f"Error disposing engine: {e}")
+        finally:
+            # Reset the global so next test gets a fresh engine
+            reset_async_engine()
 
 
 @pytest.fixture(scope="session")
@@ -214,7 +249,12 @@ def registry_version_with_manifest(db: None, env_sandbox: None) -> Iterator[None
     """
     from sqlalchemy.orm import Session
 
-    from tracecat.db.models import RegistryRepository, RegistryVersion
+    from tracecat.db.models import (
+        PlatformRegistryRepository,
+        PlatformRegistryVersion,
+        RegistryRepository,
+        RegistryVersion,
+    )
 
     def _seed_registry_version(sync_db_uri: str) -> None:
         # Use sync engine to avoid event loop conflicts.
@@ -500,6 +540,38 @@ def registry_version_with_manifest(db: None, env_sandbox: None) -> Iterator[None
                 "implementation": webhook_impl,
             }
 
+            # core.transform.scatter (interface action)
+            scatter_impl = {
+                "type": "udf",
+                "url": origin,
+                "module": "tracecat_registry.core.transform",
+                "name": "scatter",
+            }
+            manifest_actions["core.transform.scatter"] = {
+                "namespace": "core.transform",
+                "name": "scatter",
+                "action_type": "udf",
+                "description": "Scatter collection into parallel streams",
+                "interface": {"expects": {}, "returns": None},
+                "implementation": scatter_impl,
+            }
+
+            # core.transform.gather (interface action)
+            gather_impl = {
+                "type": "udf",
+                "url": origin,
+                "module": "tracecat_registry.core.transform",
+                "name": "gather",
+            }
+            manifest_actions["core.transform.gather"] = {
+                "namespace": "core.transform",
+                "name": "gather",
+                "action_type": "udf",
+                "description": "Gather results from parallel streams",
+                "interface": {"expects": {}, "returns": None},
+                "implementation": gather_impl,
+            }
+
             manifest = {"schema_version": "1.0", "actions": manifest_actions}
 
             # Create RegistryVersion with manifest
@@ -554,6 +626,115 @@ def registry_version_with_manifest(db: None, env_sandbox: None) -> Iterator[None
                 },
             )
 
+            # Also seed platform registry tables for platform-scoped resolution
+            # The executor routes tracecat_registry origin to platform tables
+            platform_repo = session.scalar(
+                select(PlatformRegistryRepository).where(
+                    PlatformRegistryRepository.origin == origin,
+                )
+            )
+            if platform_repo is None:
+                platform_repo = PlatformRegistryRepository(origin=origin)
+                session.add(platform_repo)
+                try:
+                    session.commit()
+                except IntegrityError:
+                    session.rollback()
+                    platform_repo = session.scalar(
+                        select(PlatformRegistryRepository).where(
+                            PlatformRegistryRepository.origin == origin,
+                        )
+                    )
+                    if platform_repo is None:
+                        raise
+                else:
+                    session.refresh(platform_repo)
+
+            platform_rv = session.scalar(
+                select(PlatformRegistryVersion).where(
+                    PlatformRegistryVersion.repository_id == platform_repo.id,
+                    PlatformRegistryVersion.version == version,
+                )
+            )
+            if platform_rv is None:
+                platform_rv = PlatformRegistryVersion(
+                    repository_id=platform_repo.id,
+                    version=version,
+                    manifest=manifest,
+                    tarball_uri="s3://test/test.tar.gz",
+                )
+                session.add(platform_rv)
+                try:
+                    session.commit()
+                except IntegrityError:
+                    session.rollback()
+                    platform_rv = session.scalar(
+                        select(PlatformRegistryVersion).where(
+                            PlatformRegistryVersion.repository_id == platform_repo.id,
+                            PlatformRegistryVersion.version == version,
+                        )
+                    )
+                    if platform_rv is None:
+                        raise
+                else:
+                    session.refresh(platform_rv)
+            else:
+                platform_rv.manifest = manifest
+                platform_rv.tarball_uri = "s3://test/test.tar.gz"
+                session.commit()
+
+            platform_repo.current_version_id = platform_rv.id
+            session.commit()
+
+            # Create PlatformRegistryIndex entries for each action in the manifest
+            # This is required for get_actions_from_index to work in agent tools
+            from tracecat.db.models import PlatformRegistryIndex
+
+            for _action_name, action_data in manifest_actions.items():
+                existing_index = session.scalar(
+                    select(PlatformRegistryIndex).where(
+                        PlatformRegistryIndex.registry_version_id == platform_rv.id,
+                        PlatformRegistryIndex.namespace == action_data["namespace"],
+                        PlatformRegistryIndex.name == action_data["name"],
+                    )
+                )
+                if existing_index is None:
+                    # Ensure include_in_schema is True so actions appear in list queries
+                    options = action_data.get("options", {})
+                    options.setdefault("include_in_schema", True)
+                    index_entry = PlatformRegistryIndex(
+                        registry_version_id=platform_rv.id,
+                        namespace=action_data["namespace"],
+                        name=action_data["name"],
+                        action_type=action_data["action_type"],
+                        description=action_data.get("description", ""),
+                        default_title=action_data.get("default_title"),
+                        display_group=action_data.get("display_group"),
+                        doc_url=action_data.get("doc_url"),
+                        author=action_data.get("author"),
+                        deprecated=action_data.get("deprecated"),
+                        secrets=action_data.get("secrets"),
+                        interface=action_data.get("interface", {}),
+                        options=options,
+                    )
+                    session.add(index_entry)
+                    # Commit each entry individually to handle race conditions
+                    # with pytest-xdist parallel workers
+                    try:
+                        session.commit()
+                    except IntegrityError:
+                        session.rollback()
+                        # Entry already exists from another worker, continue
+
+            logger.info(
+                "Created platform registry version with manifest and index",
+                extra={
+                    "db_uri": sync_db_uri,
+                    "version": version,
+                    "num_actions": len(manifest_actions),
+                },
+            )
+
         sync_engine.dispose()
 
     # Seed both the per-test database and the default engine DB (used by services via with_session()).
@@ -581,6 +762,10 @@ async def session() -> AsyncGenerator[AsyncSession, None]:
     # Connect and begin the outer transaction
     async with async_engine.connect() as connection:
         await connection.begin()
+        # Avoid CI hangs: fail fast on lock waits and runaway statements.
+        # NOTE: SET LOCAL scopes these settings to the surrounding transaction.
+        await connection.execute(text("SET LOCAL lock_timeout = '30s'"))
+        await connection.execute(text("SET LOCAL statement_timeout = '5min'"))
 
         # Create session bound to this connection
         async_session = AsyncSession(
@@ -612,26 +797,22 @@ def env_sandbox(monkeysession: pytest.MonkeyPatch):
     importlib.reload(config)
     monkeysession.setattr(config, "TRACECAT__APP_ENV", "development")
 
-    # Detect if running inside Docker container by checking for /.dockerenv file
-    # This is more reliable than checking env vars like REDIS_HOST, which may be
-    # loaded from .env by load_dotenv() even when running on the host
-    in_docker = os.path.exists("/.dockerenv")
-    db_host = "postgres_db" if in_docker else "localhost"
-    temporal_host = "temporal" if in_docker else "localhost"
-    api_host = "api" if in_docker else "localhost"
-    blob_storage_host = "minio" if in_docker else "localhost"
+    # Use module-level IN_DOCKER detection for host selection
+    db_host = "postgres_db" if IN_DOCKER else "localhost"
+    temporal_host = "temporal" if IN_DOCKER else "localhost"
+    api_host = "api" if IN_DOCKER else "localhost"
+    blob_storage_host = "minio" if IN_DOCKER else "localhost"
 
-    db_uri = f"postgresql+psycopg://postgres:postgres@{db_host}:5432/postgres"
+    db_uri = f"postgresql+psycopg://postgres:postgres@{db_host}:{PG_PORT}/postgres"
     monkeysession.setattr(config, "TRACECAT__DB_URI", db_uri)
     monkeysession.setattr(
-        config, "TEMPORAL__CLUSTER_URL", f"http://{temporal_host}:7233"
+        config, "TEMPORAL__CLUSTER_URL", f"http://{temporal_host}:{TEMPORAL_PORT}"
     )
     blob_storage_endpoint = f"http://{blob_storage_host}:{MINIO_PORT}"
     monkeysession.setattr(
         config, "TRACECAT__BLOB_STORAGE_ENDPOINT", blob_storage_endpoint
     )
     # Configure MinIO for result externalization (StoredObject -> S3)
-    monkeysession.setattr(config, "TRACECAT__BLOB_STORAGE_PROTOCOL", "minio")
     monkeysession.setattr(
         config, "TRACECAT__BLOB_STORAGE_BUCKET_WORKFLOW", MINIO_WORKFLOW_BUCKET
     )
@@ -654,23 +835,20 @@ def env_sandbox(monkeysession: pytest.MonkeyPatch):
 
     monkeysession.setenv("TRACECAT__DB_URI", db_uri)
     monkeysession.setenv("TRACECAT__BLOB_STORAGE_ENDPOINT", blob_storage_endpoint)
-    monkeysession.setenv("TRACECAT__BLOB_STORAGE_PROTOCOL", "minio")
     monkeysession.setenv(
         "TRACECAT__BLOB_STORAGE_BUCKET_WORKFLOW", MINIO_WORKFLOW_BUCKET
     )
     monkeysession.setenv("TRACECAT__RESULT_EXTERNALIZATION_ENABLED", "true")
     monkeysession.setenv("TRACECAT__RESULT_EXTERNALIZATION_THRESHOLD_BYTES", "0")
-    monkeysession.setenv("MINIO_ROOT_USER", MINIO_ACCESS_KEY)
-    monkeysession.setenv("MINIO_ROOT_PASSWORD", MINIO_SECRET_KEY)
     # monkeysession.setenv("TRACECAT__DB_ENCRYPTION_KEY", Fernet.generate_key().decode())
     # Point API URL to appropriate host
     api_url = f"http://{api_host}:8000"
-    executor_url = f"http://{'executor' if in_docker else 'localhost'}:8001"
+    executor_url = f"http://{'executor' if IN_DOCKER else 'localhost'}:8001"
     monkeysession.setattr(config, "TRACECAT__API_URL", api_url)
     monkeysession.setenv("TRACECAT__API_URL", api_url)
     monkeysession.setenv("TRACECAT__EXECUTOR_URL", executor_url)
     # Use DirectBackend for in-process executor (no sandbox overhead) unless overridden
-    if not in_docker:
+    if not IN_DOCKER:
         monkeysession.setattr(config, "TRACECAT__EXECUTOR_BACKEND", "direct")
         monkeysession.setenv("TRACECAT__EXECUTOR_BACKEND", "direct")
     monkeysession.setenv("TRACECAT__PUBLIC_API_URL", f"http://{api_host}/api")
@@ -678,8 +856,13 @@ def env_sandbox(monkeysession: pytest.MonkeyPatch):
     monkeysession.setenv("TRACECAT__SIGNING_SECRET", "test-signing-secret")
     monkeysession.setenv("TEMPORAL__CLUSTER_URL", f"http://{temporal_host}:7233")
     monkeysession.setenv("TEMPORAL__CLUSTER_NAMESPACE", "default")
-    monkeysession.setenv("TEMPORAL__CLUSTER_QUEUE", "tracecat-task-queue")
-    monkeysession.setattr(config, "TEMPORAL__CLUSTER_QUEUE", "tracecat-task-queue")
+    # Use worker-specific task queues for pytest-xdist isolation
+    monkeysession.setenv("TEMPORAL__CLUSTER_QUEUE", TEMPORAL_TASK_QUEUE)
+    monkeysession.setattr(config, "TEMPORAL__CLUSTER_QUEUE", TEMPORAL_TASK_QUEUE)
+    monkeysession.setenv("TRACECAT__EXECUTOR_QUEUE", EXECUTOR_TASK_QUEUE)
+    monkeysession.setattr(config, "TRACECAT__EXECUTOR_QUEUE", EXECUTOR_TASK_QUEUE)
+    monkeysession.setenv("TRACECAT__AGENT_QUEUE", AGENT_TASK_QUEUE)
+    monkeysession.setattr(config, "TRACECAT__AGENT_QUEUE", AGENT_TASK_QUEUE)
 
     yield
     logger.info("Environment variables cleaned up")
@@ -752,7 +935,7 @@ async def test_workspace():
                 logger.warning(f"Error during workspace cleanup: {e}")
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture(scope="session")
 def temporal_client():
     try:
         loop = asyncio.get_event_loop()
@@ -800,6 +983,9 @@ async def svc_workspace(session: AsyncSession) -> AsyncGenerator[Workspace, None
     # so services that use `with_session()` (and thus `get_async_session_context_manager`)
     # can see the same workspace and satisfy foreign key constraints.
     async with get_async_session_context_manager() as global_session:
+        # Set timeouts to avoid deadlocks with parallel workers
+        await global_session.execute(text("SET LOCAL lock_timeout = '5s'"))
+        await global_session.execute(text("SET LOCAL statement_timeout = '30s'"))
         # Avoid duplicate insert if the workspace already exists
         result = await global_session.execute(
             select(Workspace).where(Workspace.id == workspace.id)
@@ -822,6 +1008,13 @@ async def svc_workspace(session: AsyncSession) -> AsyncGenerator[Workspace, None
         # Clean up workspace from global session (postgres database) first
         try:
             async with get_async_session_context_manager() as global_cleanup_session:
+                # Set timeouts to avoid deadlocks with parallel workers
+                await global_cleanup_session.execute(
+                    text("SET LOCAL lock_timeout = '5s'")
+                )
+                await global_cleanup_session.execute(
+                    text("SET LOCAL statement_timeout = '30s'")
+                )
                 result = await global_cleanup_session.execute(
                     select(Workspace).where(Workspace.id == workspace.id)
                 )
@@ -848,6 +1041,11 @@ async def svc_workspace(session: AsyncSession) -> AsyncGenerator[Workspace, None
                     # If that fails, try with a completely new session
                     await session.close()
                     async with get_async_session_context_manager() as new_session:
+                        # Set timeouts to avoid deadlocks with parallel workers
+                        await new_session.execute(text("SET LOCAL lock_timeout = '5s'"))
+                        await new_session.execute(
+                            text("SET LOCAL statement_timeout = '30s'")
+                        )
                         # Fetch the workspace again in the new session by logical ID
                         result = await new_session.execute(
                             select(Workspace).where(Workspace.id == workspace.id)
@@ -897,10 +1095,11 @@ def minio_server():
     endpoint = f"localhost:{MINIO_PORT}"
     for _ in range(30):
         try:
+            access_key, secret_key = _minio_credentials()
             client = Minio(
                 endpoint,
-                access_key=MINIO_ACCESS_KEY,
-                secret_key=MINIO_SECRET_KEY,
+                access_key=access_key,
+                secret_key=secret_key,
                 secure=False,
             )
             list(client.list_buckets())
@@ -935,10 +1134,11 @@ def workflow_bucket(minio_server, env_sandbox):
     importlib.reload(blob)
 
     # Create workflow bucket if it doesn't exist
+    access_key, secret_key = _minio_credentials()
     client = Minio(
         f"localhost:{MINIO_PORT}",
-        access_key=MINIO_ACCESS_KEY,
-        secret_key=MINIO_SECRET_KEY,
+        access_key=access_key,
+        secret_key=secret_key,
         secure=False,
     )
     try:
@@ -962,10 +1162,11 @@ def workflow_bucket(minio_server, env_sandbox):
 @pytest.fixture
 async def minio_client(minio_server) -> AsyncGenerator[Minio, None]:
     """Create MinIO client for testing."""
+    access_key, secret_key = _minio_credentials()
     client = Minio(
         f"localhost:{MINIO_PORT}",
-        access_key=MINIO_ACCESS_KEY,
-        secret_key=MINIO_SECRET_KEY,
+        access_key=access_key,
+        secret_key=secret_key,
         secure=False,
     )
     yield client
@@ -1000,9 +1201,9 @@ async def minio_bucket(minio_client: Minio) -> AsyncGenerator[str, None]:
 @pytest.fixture
 def mock_s3_secrets():
     """Mock S3 secrets to use MinIO credentials."""
-
-    secrets_manager.set("AWS_ACCESS_KEY_ID", MINIO_ACCESS_KEY)
-    secrets_manager.set("AWS_SECRET_ACCESS_KEY", MINIO_SECRET_KEY)
+    access_key, secret_key = _minio_credentials()
+    secrets_manager.set("AWS_ACCESS_KEY_ID", access_key)
+    secrets_manager.set("AWS_SECRET_ACCESS_KEY", secret_key)
     secrets_manager.set("AWS_REGION", "us-east-1")
 
 
@@ -1012,9 +1213,10 @@ async def aioboto3_minio_client(monkeypatch):
 
     # Mock get_session to return session with MinIO credentials
     async def mock_get_session():
+        access_key, secret_key = _minio_credentials()
         return aioboto3.Session(
-            aws_access_key_id=MINIO_ACCESS_KEY,
-            aws_secret_access_key=MINIO_SECRET_KEY,
+            aws_access_key_id=access_key,
+            aws_secret_access_key=secret_key,
             region_name="us-east-1",
         )
 

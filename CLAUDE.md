@@ -36,10 +36,46 @@ uv sync
 
 ### Development Stack
 ```bash
-# Standalone stack for use with git worktrees
+# IMPORTANT: Always use `just cluster` to manage the development stack
+# This handles database, Temporal, Redis, MinIO, API, and UI services
+# It also manages port allocation across multiple worktrees
+
+# Start the full stack (auto-selects available cluster number)
+just cluster up -d
+
+# Start with auto-registered test user (test@tracecat.com / password1234)
+just cluster up -d --seed
+
+# View all available commands
 just cluster
 
+# Common commands:
+just cluster ps              # Show running containers
+just cluster logs api        # View API service logs
+just cluster logs -f api     # Follow API logs
+just cluster restart api     # Restart a service (hot reload)
+just cluster down            # Stop the stack (keeps volumes)
+just cluster rm              # Stop and remove volumes
+just cluster attach api      # Shell into a container
+just cluster db              # Open TablePlus to PostgreSQL
+just cluster ports           # Show port mappings
+just cluster list            # List all running clusters
+
+# Port mappings (cluster 1 defaults):
+# - App UI: http://localhost:80
+# - API: http://localhost:80/api
+# - PostgreSQL: localhost:5432
+# - Temporal UI: http://localhost:8081
 ```
+
+**When to use `just cluster`:**
+- Need a database connection → `just cluster up -d`
+- Need to run integration tests → `just cluster up -d`
+- Need Temporal for workflow testing → `just cluster up -d`
+- Need to check service logs → `just cluster logs <service>`
+- Need to restart after code changes → `just cluster restart <service>`
+
+**Do NOT use raw `docker` or `docker compose` commands** - the cluster script handles environment variables, port allocation, and worktree isolation automatically.
 
 ### Testing
 ```bash
@@ -52,32 +88,80 @@ uv run pytest tests/unit          # Backend/API tests
 uv run pytest tests/registry     # Registry/integration tests
 uv run pytest tests/unit/test_functions.py -x --last-failed  # Inline functions tests
 
+# Parallel execution with pytest-xdist
+uv run pytest tests/unit -n auto
+
+# Run tests matching a keyword
+uv run pytest -k "keyword"
+
+# Run with specific markers
+uv run pytest -m "not slow and not temporal"
+uv run pytest -m temporal  # Temporal/workflow tests only
+
+# Run benchmarks (requires Docker for nsjail on macOS)
+just bench
+
 # Frontend tests
 cd frontend && pnpm test
 ```
 
+### Temporal Management
+```bash
+# Stop all running Temporal workflow executions
+just temporal-stop-all
+```
+
 ### Linting and Formatting
 ```bash
-# Lint and format everything
-just lint-fix
+# Lint and format everything (run before committing)
+just fix             # Short alias
+just lint-fix        # Same as above
 
 # Individual components
-just lint-fix-app    # Python: ruff check . && ruff format .
-just lint-fix-ui     # Frontend: pnpm check (Biome lint, format, and organize imports)
+just lint-fix-app    # Python: ruff check --fix . && ruff format .
+just lint-fix-ui     # Frontend: pnpm check --write (Biome lint, format, and organize imports)
+
+# Check only (no auto-fix) - useful for CI or verifying changes
+uv run ruff check .              # Python lint check only
+uv run ruff format --check .     # Python format check only
+cd frontend && pnpm check        # Frontend check only
 
 # Frontend-specific Biome commands
 cd frontend && pnpm lint          # Biome lint
 cd frontend && pnpm format:write  # Biome format
 cd frontend && pnpm check         # Biome comprehensive check (lint + format + organize imports)
-
-# Type checking
-just mypy <path>     # MyPy type checking for specific path
 ```
+
+### Type Checking
+```bash
+# Run basedpyright type checking (required before merging)
+just typecheck
+
+# Or run directly with options
+uv run basedpyright --warnings --threads 4
+
+# Check specific files or directories
+uv run basedpyright tracecat/api/
+
+# Common type errors to avoid:
+# - Using `type: ignore` comments (find alternative solutions)
+# - Missing return type annotations on public functions
+# - Using `Any` when a more specific type is possible
+```
+
+**Pre-commit hooks**: Runs automatically on commit:
+- Ruff (lint + format)
+- Gitleaks (secret detection)
+- YAML/TOML validation
+- UV lock sync
+- Frontend client generation (when tracecat/packages change)
+
+**CI Requirements**: Both linting (`just fix`) and type checking (`just typecheck`) must pass in CI before merging.
 
 ### API and Code Generation
 ```bash
 # Generate frontend API client
-just gen-client
+just gen-client-ci
 
 # Generate API spec (requires CLI installed)
 just gen-api
@@ -92,12 +176,15 @@ just gen-functions
 ### Core Components
 - **API Service** (`tracecat/api/`): FastAPI application with auth, workflows, cases
 - **Worker Service** (`tracecat/dsl/worker.py`): Temporal workflow worker
-- **Executor Service** (`tracecat/api/executor.py`): Action execution engine
+- **Executor Service** (`tracecat/executor/`): Action execution engine with index-based registry resolution
+- **Agent System** (`tracecat/agent/`): LLM-powered agents with multi-runtime support (PydanticAI, Claude Code), MCP integration, tool execution
+- **Organization Service** (`tracecat/organization/`): Multi-tenancy and organization membership management
+- **tracecat-admin CLI** (`packages/tracecat-admin/`): CLI tool for platform operators (admin, auth, migrate, orgs, registry commands)
 - **Frontend** (`frontend/`): Next.js 15 with TypeScript, React Query, Tailwind CSS
-- **Registry** (`registry/`): Independent package for integrations and templates
+- **Registry** (`packages/tracecat-registry/`): Independent package for integrations and templates
 
 ### Key Technologies
-- **Backend**: FastAPI, SQLAlchemy, Pydantic, Temporal, Ray, PostgreSQL, Alembic
+- **Backend**: FastAPI, SQLAlchemy, Pydantic, Temporal, Ray, PostgreSQL, Alembic, PydanticAI, LiteLLM, FastMCP
 - **Frontend**: Next.js 15, TypeScript, React Query, Tailwind CSS, Radix UI
 - **Infrastructure**: Docker, PostgreSQL, MinIO, Temporal Server
 - **Package Management**: `uv` for Python, `pnpm` for JavaScript
@@ -131,6 +218,11 @@ The codebase follows a three-tier type system to separate concerns and reduce ci
 - **Shims**: `tracecat/ee/` contains shims for backward compatibility
 - **Features**: RBAC, multi-tenancy, SSO integration, advanced auth, interactions
 
+### Agent System
+- **Location**: `tracecat/agent/`
+- **Purpose**: LLM-powered agents for workflow automation
+- **Key directories**: `runtime/` (PydanticAI, Claude Code), `mcp/` (Model Context Protocol), `executor/`, `preset/`
+
 ## Development Guidelines
 
 ### Dependency Management and Security
@@ -139,7 +231,7 @@ The codebase follows a three-tier type system to separate concerns and reduce ci
 - Security fixes should update the pinned version to the specific patched version, not use range constraints
 
 ### Python Standards
-- Use Python 3.11+ type hints with builtin types (`list`, `dict`, `set`)
+- Use Python 3.12+ type hints with builtin types (`list`, `dict`, `set`)
 - Follow Google Python style guide
 - Import statements at top of file only
 - Use `uv run` for executing Python/pytest commands
@@ -149,13 +241,19 @@ The codebase follows a three-tier type system to separate concerns and reduce ci
 - Always avoid use of `type: ignore` when writing python code
 - You must *NEVER* put import statements in function bodies.
 - If you are facing issues with circular imports you should try use `if TYPE_CHECKING: ...` instead.
+- Use PEP 695 generic syntax for new generics: `class Name[T: Bound]` over `TypeVar`
+- Use `StrEnum` for string-based enumerations (JSON/YAML serialization)
+- Use `frozen=True` dataclasses for immutable value objects
+- Use `TypedDict` with `NotRequired` for configuration types
+- Use `@runtime_checkable` protocols for structural typing
+- Avoid adding re-exports to `__init__.py` files; import directly from submodules (e.g., `from tracecat.agent.schemas import RunAgentArgs` not `from tracecat.agent import RunAgentArgs`). This keeps imports explicit, avoids circular import issues, and improves import performance. Exception: re-exports make sense for versioned external packages where you need to hide internal structure—rare for internal code.
 
 ### Type Organization Guidelines
 When adding new types, follow this pattern:
 - **Database tables**: Add to `tracecat/db/models.py` (SQLAlchemy classes)
 - **API schemas**: Add to module-specific `schemas.py` files (Pydantic models for request/response)
 - **Domain types**: Add to module-specific `types.py` files (protocols, dataclasses, type aliases)
-- **Avoiding circular imports**: Use `if TYPE_CHECKING:` for type-only imports, move shared types to `types.py`
+- **Avoiding circular imports and improving import performance**: Use `if TYPE_CHECKING:` for type-only imports, move shared types to `types.py`
 - **Import order**: `models` → `types` → `schemas` → `service` → `router` (to minimize circular dependencies)
 
 Example structure for a module like `tracecat/agent/`:
@@ -167,6 +265,37 @@ tracecat/agent/
 └── router.py        # FastAPI routes
 ```
 
+### Service Architecture
+Services inherit from `BaseService` (`tracecat/service.py`) which provides:
+- Automatic logger binding with service name
+- Context-aware role fallback via `ctx_role.get()`
+- `with_session()` context manager for lifecycle management
+
+Context variables (`tracecat/contexts.py`) for request-scoped state:
+- `ctx_role`: Current user/service role
+- `ctx_run`: Workflow run context
+- `ctx_logger`: Request-scoped logger
+- `ctx_interaction`: Interaction context for workflows
+
+Router access control using predefined roles from `tracecat/auth/dependencies.py`:
+```python
+from tracecat.auth.dependencies import WorkspaceUserRole, OrgAdminUser
+
+@router.get("/endpoint")
+async def handler(role: WorkspaceUserRole):  # User with workspace access
+    ...
+
+@router.get("/admin")
+async def admin_handler(role: OrgAdminUser):  # Org admin required
+    ...
+```
+
+Available predefined roles:
+- `WorkspaceUserRole`: User with workspace access
+- `ExecutorWorkspaceRole`: Executor service with workspace
+- `ServiceRole`: Internal service role
+- `OrgAdminUser`: Organization admin user
+
 ### Frontend Standards
 - Use kebab-case for file names
 - Use camelCase for functions/variables, UPPERCASE_SNAKE_CASE for constants
@@ -175,13 +304,13 @@ tracecat/agent/
 - Use "Title case example" over "Title Case Example" for UI text
 - Always use proper TypeScript type hints and avoid using `any` - use `unknown` if necessary
 - Avoid nested ternary statements - use `if/else` or `switch/case` instead
+- Place React hooks in `frontend/src/hooks/` directory (e.g., `use-inbox.ts`, `use-auth.ts`)
 
 ### UI Component Best Practices
 - **Avoid background colors on child elements within bordered containers**: When using shadcn components like SidebarInset that have rounded borders, don't add background colors (e.g., `bg-card`, `bg-background`) to immediate child elements. These backgrounds can paint over the parent's rounded border corners, making them appear cut off or missing. Instead, let the parent container handle the background styling.
 
 ### Code Quality
 - **Ruff**: Line length 88, comprehensive linting rules
-- **MyPy**: Strict type checking mode
 - **Pre-commit**: Automated hooks for Ruff, Gitleaks, YAML/TOML validation
 - All tests must pass before commits
 
@@ -192,11 +321,18 @@ tracecat/agent/
 - `frontend/package.json`: Frontend dependencies and scripts
 - `docker-compose.dev.yml`: Development environment
 - `alembic.ini`: Database migration configuration
+- `tracecat/service.py`: Base service class with context-aware defaults
+- `tracecat/contexts.py`: Context variables for request-scoped state
+- `scripts/cluster`: Multi-cluster orchestration script
 
 ### Testing Patterns
 - `tests/conftest.py`: Comprehensive pytest fixtures for database, workspaces, temporal
-- Test markers: `@pytest.mark.integration`, `@pytest.mark.unit`, `@pytest.mark.slow`
+- Test markers: `@pytest.mark.integration`, `@pytest.mark.unit`, `@pytest.mark.slow`, `@pytest.mark.temporal`, `@pytest.mark.llm`
 - Database isolation: Each test gets its own transaction
+- **Parallel testing**: pytest-xdist support with worker-specific:
+  - Temporal task queues: `tracecat-task-queue-{worker_id}`
+  - Redis databases: Worker offset % 16
+  - Port configuration via environment variables
 
 ### Action Templates and Registry
 - **Templates**: `packages/tracecat-registry/tracecat_registry/templates/` - YAML-based integration templates
@@ -227,13 +363,29 @@ tracecat/agent/
 - When writing typescript code, always do your best to use proper type hints and avoid using `any`. If you really have to you can use `unknown`.
 
 ## Frontend Type Generation
-- If you need to add frontend types, you should first try to generate them from the backend using `just gen-client`
+- If you need to add frontend types, you should first try to generate them from the backend using `just gen-client-ci`
 
 ## Database Migrations
-- When running an alembic migration, you should use `export TRACECAT__DB_URI=postgresql+psycopg://postgres:postgres@localhost:5432/postgres` or pass it into the command
+- Ensure the database is running first: `just cluster up -d`
+- When running an alembic migration, first check the PostgreSQL port with `just cluster ports`, then set the DB URI:
+  ```bash
+  export TRACECAT__DB_URI=postgresql+psycopg://postgres:postgres@localhost:<port>/postgres
+  ```
+  Default port is 5432 for cluster 1, but may be 5532, 5632, etc. for other clusters.
+- **Creating new migrations**: Always let Alembic autogenerate the migration first to get correct naming conventions and structure:
+  ```bash
+  uv run alembic revision --autogenerate -m "description of migration"
+  ```
+  Then review and edit the generated migration file as needed. This ensures consistent revision IDs and proper down_revision chains.
 
 ## Services and Logging Guidelines
-- When working with live services, avoid using `just` commands. You should use `docker` commands to inspect/manage services and read logs.
+- When working with live services, use `just cluster` commands to manage the stack:
+  - `just cluster logs <service>` - View service logs
+  - `just cluster logs -f <service>` - Follow logs in real-time
+  - `just cluster ps` - Check container status
+  - `just cluster restart <service>` - Restart a service
+  - `just cluster attach <service>` - Shell into a running container
+- Do NOT use raw `docker` or `docker compose` commands directly - the cluster script handles environment variables and port allocation
 
 ## Tracecat Template Best Practices
 

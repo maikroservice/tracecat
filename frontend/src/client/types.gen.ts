@@ -215,7 +215,6 @@ export type AdminUserRead = {
   is_superuser: boolean
   is_verified: boolean
   last_login_at?: string | null
-  created_at: string
 }
 
 export type AgentOutput = {
@@ -247,6 +246,7 @@ export type AgentPresetCreate = {
   } | null
   mcp_integrations?: Array<string> | null
   retries?: number
+  enable_internet_access?: boolean
   name: string
   slug?: string | null
 }
@@ -268,6 +268,7 @@ export type AgentPresetRead = {
   } | null
   mcp_integrations?: Array<string> | null
   retries?: number
+  enable_internet_access?: boolean
   id: string
   workspace_id: string
   name: string
@@ -308,6 +309,7 @@ export type AgentPresetUpdate = {
   } | null
   mcp_integrations?: Array<string> | null
   retries?: number | null
+  enable_internet_access?: boolean | null
 }
 
 /**
@@ -357,6 +359,7 @@ export type AgentSessionCreate = {
  * - AGENT_PRESET_BUILDER: Builder chat for editing/configuring a preset
  * - COPILOT: Workspace-level copilot assistant
  * - WORKFLOW: Workflow-initiated agent run (from action)
+ * - APPROVAL: Inbox approval continuation (hidden from main chat list)
  */
 export type AgentSessionEntity =
   | "case"
@@ -364,6 +367,17 @@ export type AgentSessionEntity =
   | "agent_preset_builder"
   | "copilot"
   | "workflow"
+  | "approval"
+
+/**
+ * Request schema for forking an agent session.
+ */
+export type AgentSessionForkRequest = {
+  /**
+   * Override entity type for the forked session. Use 'approval' for inbox forks to hide from main chat list.
+   */
+  entity_type?: AgentSessionEntity | null
+}
 
 /**
  * Response schema for agent session.
@@ -379,6 +393,7 @@ export type AgentSessionRead = {
   agent_preset_id: string | null
   harness_type: string | null
   last_stream_id?: string | null
+  parent_session_id?: string | null
   created_at: string
   updated_at: string
 }
@@ -397,6 +412,7 @@ export type AgentSessionReadVercel = {
   agent_preset_id: string | null
   harness_type: string | null
   last_stream_id?: string | null
+  parent_session_id?: string | null
   created_at: string
   updated_at: string
   /**
@@ -419,6 +435,7 @@ export type AgentSessionReadWithMessages = {
   agent_preset_id: string | null
   harness_type: string | null
   last_stream_id?: string | null
+  parent_session_id?: string | null
   created_at: string
   updated_at: string
   /**
@@ -1690,6 +1707,30 @@ export type CursorPaginatedResponse_CaseReadMinimal_ = {
   total_estimate?: number | null
 }
 
+export type CursorPaginatedResponse_InboxItemRead_ = {
+  items: Array<InboxItemRead>
+  /**
+   * Cursor for next page
+   */
+  next_cursor?: string | null
+  /**
+   * Cursor for previous page
+   */
+  prev_cursor?: string | null
+  /**
+   * Whether more items exist
+   */
+  has_more?: boolean
+  /**
+   * Whether previous items exist
+   */
+  has_previous?: boolean
+  /**
+   * Estimated total count from table statistics
+   */
+  total_estimate?: number | null
+}
+
 export type CursorPaginatedResponse_TableRowRead_ = {
   items: Array<TableRowRead>
   /**
@@ -1821,7 +1862,7 @@ export type DSLEntrypoint = {
    * Expected trigger input schema. Use this to specify the expected shape of the trigger input.
    */
   expects?: {
-    [key: string]: ExpectedField
+    [key: string]: ExpectedField_Output
   } | null
 }
 
@@ -2034,6 +2075,17 @@ export type EditorParamRead = {
   optional: boolean
 }
 
+/**
+ * TypedDict for tier entitlements stored in JSONB.
+ *
+ * All keys are optional (total=False) to support partial overrides.
+ */
+export type EntitlementsDict = {
+  custom_registry?: boolean
+  sso?: boolean
+  git_sync?: boolean
+}
+
 export type ErrorDetails = {
   type: string
   loc: Array<number | string>
@@ -2113,10 +2165,23 @@ export type ExecutionContext = {
  */
 export type ExecutionType = "draft" | "published"
 
-export type ExpectedField = {
+/**
+ * Schema for a field in a template action's expects definition.
+ *
+ * Note: The default field uses a sentinel to distinguish between
+ * "no default specified" (required field) and "default is explicitly None"
+ * (optional field).
+ */
+export type ExpectedField_Input = {
   type: string
   description?: string | null
-  default?: unknown | null
+  default?: unknown
+  enum?: Array<string> | null
+  optional?: boolean | null
+}
+
+export type ExpectedField_Output = {
+  [key: string]: unknown
 }
 
 export type ExprType =
@@ -2172,7 +2237,6 @@ export type FeatureFlag =
   | "agent-presets"
   | "case-durations"
   | "case-tasks"
-  | "executor-auth"
   | "registry-client"
   | "registry-sync-v2"
 
@@ -2476,6 +2540,72 @@ export type ImageUrl = {
    */
   readonly identifier: string
 }
+
+/**
+ * Read model for inbox items.
+ */
+export type InboxItemRead = {
+  /**
+   * Unique inbox item ID
+   */
+  id: string
+  /**
+   * Type of inbox item
+   */
+  type: InboxItemType
+  /**
+   * Display title
+   */
+  title: string
+  /**
+   * Preview text
+   */
+  preview: string
+  /**
+   * Item status
+   */
+  status: InboxItemStatus
+  /**
+   * Whether the item is unread
+   */
+  unread: boolean
+  /**
+   * Creation timestamp
+   */
+  created_at: string
+  /**
+   * Last update timestamp
+   */
+  updated_at: string
+  /**
+   * Associated workflow
+   */
+  workflow?: WorkflowSummary | null
+  /**
+   * ID of the source entity
+   */
+  source_id: string
+  /**
+   * Type of source entity (e.g., agent_session)
+   */
+  source_type: string
+  /**
+   * Type-specific metadata
+   */
+  metadata?: {
+    [key: string]: unknown
+  } | null
+}
+
+/**
+ * Status of inbox items.
+ */
+export type InboxItemStatus = "pending" | "completed" | "failed"
+
+/**
+ * Types of inbox items.
+ */
+export type InboxItemType = "approval"
 
 /**
  * Inferred column mapping between CSV headers and table columns.
@@ -2913,6 +3043,71 @@ export type OrgRead = {
 }
 
 /**
+ * Organization registry repository response.
+ */
+export type OrgRegistryRepositoryRead = {
+  id: string
+  origin: string
+  last_synced_at?: string | null
+  commit_sha?: string | null
+  current_version_id?: string | null
+}
+
+/**
+ * Organization registry sync request.
+ */
+export type OrgRegistrySyncRequest = {
+  /**
+   * Force sync by deleting the existing version first
+   */
+  force?: boolean
+}
+
+/**
+ * Organization registry sync response.
+ */
+export type OrgRegistrySyncResponse = {
+  success: boolean
+  repository_id: string
+  origin: string
+  version?: string | null
+  commit_sha?: string | null
+  actions_count?: number | null
+  forced?: boolean
+  skipped?: boolean
+  message?: string | null
+}
+
+/**
+ * Response from promoting an organization registry version.
+ */
+export type OrgRegistryVersionPromoteResponse = {
+  repository_id: string
+  origin: string
+  previous_version_id: string | null
+  previous_version: string | null
+  current_version_id: string
+  current_version: string
+}
+
+/**
+ * Organization registry version response.
+ */
+export type OrgRegistryVersionRead = {
+  id: string
+  repository_id: string
+  version: string
+  commit_sha?: string | null
+  tarball_uri?: string | null
+  created_at: string
+}
+
+/**
+ * Organization-level roles.
+ */
+export type OrgRole = "member" | "admin" | "owner"
+
+/**
  * Update organization request.
  */
 export type OrgUpdate = {
@@ -2937,6 +3132,43 @@ export type OrganizationSecretRead = {
   created_at: string
   updated_at: string
   organization_id: string
+}
+
+/**
+ * Organization tier assignment response.
+ */
+export type OrganizationTierRead = {
+  id: string
+  organization_id: string
+  tier_id: string
+  max_concurrent_workflows: number | null
+  max_action_executions_per_workflow: number | null
+  max_concurrent_actions: number | null
+  api_rate_limit: number | null
+  api_burst_capacity: number | null
+  entitlement_overrides: EntitlementsDict | null
+  stripe_customer_id: string | null
+  stripe_subscription_id: string | null
+  expires_at: string | null
+  created_at: string
+  updated_at: string
+  tier?: TierRead | null
+}
+
+/**
+ * Update organization tier assignment request.
+ */
+export type OrganizationTierUpdate = {
+  tier_id?: string | null
+  max_concurrent_workflows?: number | null
+  max_action_executions_per_workflow?: number | null
+  max_concurrent_actions?: number | null
+  api_rate_limit?: number | null
+  api_burst_capacity?: number | null
+  entitlement_overrides?: EntitlementsDict | null
+  stripe_customer_id?: string | null
+  stripe_subscription_id?: string | null
+  expires_at?: string | null
 }
 
 export type OutputType =
@@ -3185,6 +3417,11 @@ export type PullResult = {
   workflows_imported: number
   diagnostics: Array<PullDiagnostic>
   message: string
+}
+
+export type ReadinessResponse = {
+  status: string
+  registry: RegistryStatus
 }
 
 /**
@@ -3576,6 +3813,10 @@ export type RegistryRepositorySync = {
    * The specific commit SHA to sync to. If None, syncs to HEAD.
    */
   target_commit_sha?: string | null
+  /**
+   * Force sync by deleting the existing version first, allowing re-sync.
+   */
+  force?: boolean
 }
 
 export type RegistryRepositoryUpdate = {
@@ -3606,6 +3847,12 @@ export type RegistrySecretType_Output =
   | RegistrySecret
   | RegistryOAuthSecret_Output
 
+export type RegistryStatus = {
+  synced: boolean
+  expected_version: string
+  current_version: string | null
+}
+
 /**
  * Registry health status.
  */
@@ -3613,38 +3860,6 @@ export type RegistryStatusResponse = {
   total_repositories: number
   last_sync_at: string | null
   repositories: Array<RepositoryStatus>
-}
-
-/**
- * Response from sync operation.
- */
-export type RegistrySyncResponse = {
-  success: boolean
-  synced_at: string
-  repositories: Array<RepositorySyncResult>
-}
-
-/**
- * Response model for version promotion.
- */
-export type RegistryVersionPromoteResponse = {
-  repository_id: string
-  origin: string
-  previous_version_id: string | null
-  current_version_id: string
-  version: string
-}
-
-/**
- * Registry version details.
- */
-export type RegistryVersionRead = {
-  id: string
-  repository_id: string
-  version: string
-  commit_sha: string | null
-  tarball_uri: string | null
-  created_at: string
 }
 
 /**
@@ -3677,6 +3892,7 @@ export type RepositoryStatus = {
   origin: string
   last_synced_at: string | null
   commit_sha: string | null
+  current_version_id?: string | null
 }
 
 /**
@@ -3756,6 +3972,7 @@ export type Role = {
   workspace_id?: string | null
   organization_id?: string
   workspace_role?: WorkspaceRole | null
+  org_role?: OrgRole | null
   user_id?: string | null
   access_level?: AccessLevel
   service_id:
@@ -4621,7 +4838,7 @@ export type TemplateActionDefinition_Input = {
    * The arguments to pass to the action
    */
   expects: {
-    [key: string]: ExpectedField
+    [key: string]: ExpectedField_Input
   }
   /**
    * The sequence of steps for the action
@@ -4679,7 +4896,7 @@ export type TemplateActionDefinition_Output = {
    * The arguments to pass to the action
    */
   expects: {
-    [key: string]: ExpectedField
+    [key: string]: ExpectedField_Output
   }
   /**
    * The sequence of steps for the action
@@ -4748,6 +4965,56 @@ export type TextUIPart = {
 export type ThinkingBlock = {
   thinking: string
   signature: string
+}
+
+/**
+ * Create tier request.
+ */
+export type TierCreate = {
+  display_name: string
+  max_concurrent_workflows?: number | null
+  max_action_executions_per_workflow?: number | null
+  max_concurrent_actions?: number | null
+  api_rate_limit?: number | null
+  api_burst_capacity?: number | null
+  entitlements?: EntitlementsDict
+  is_default?: boolean
+  sort_order?: number
+}
+
+/**
+ * Tier response schema.
+ */
+export type TierRead = {
+  id: string
+  display_name: string
+  max_concurrent_workflows: number | null
+  max_action_executions_per_workflow: number | null
+  max_concurrent_actions: number | null
+  api_rate_limit: number | null
+  api_burst_capacity: number | null
+  entitlements: EntitlementsDict
+  is_default: boolean
+  sort_order: number
+  is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
+/**
+ * Update tier request.
+ */
+export type TierUpdate = {
+  display_name?: string | null
+  max_concurrent_workflows?: number | null
+  max_action_executions_per_workflow?: number | null
+  max_concurrent_actions?: number | null
+  api_rate_limit?: number | null
+  api_burst_capacity?: number | null
+  entitlements?: EntitlementsDict | null
+  is_default?: boolean | null
+  sort_order?: number | null
+  is_active?: boolean | null
 }
 
 export type Toggle = {
@@ -5210,7 +5477,7 @@ export type WorkflowDslPublish = {
 
 export type WorkflowEntrypointValidationRequest = {
   expects?: {
-    [key: string]: ExpectedField
+    [key: string]: ExpectedField_Input
   } | null
 }
 
@@ -5520,7 +5787,7 @@ export type WorkflowRead = {
   schedules: Array<ScheduleRead>
   entrypoint: string | null
   expects?: {
-    [key: string]: ExpectedField
+    [key: string]: ExpectedField_Output
   } | null
   expects_schema?: {
     [key: string]: unknown
@@ -5551,6 +5818,24 @@ export type WorkflowReadMinimal = {
   error_handler?: string | null
   latest_definition?: WorkflowDefinitionReadMinimal | null
   folder_id?: string | null
+}
+
+/**
+ * Summary of a workflow for inbox item context.
+ */
+export type WorkflowSummary = {
+  /**
+   * Workflow ID
+   */
+  id: string
+  /**
+   * Workflow title
+   */
+  title: string
+  /**
+   * Workflow alias
+   */
+  alias?: string | null
 }
 
 /**
@@ -5585,7 +5870,7 @@ export type WorkflowUpdate = {
   entrypoint?: string | null
   icon_url?: string | null
   expects?: {
-    [key: string]: ExpectedField
+    [key: string]: ExpectedField_Input
   } | null
   returns?: unknown | null
   config?: DSLConfig_Input | null
@@ -5685,6 +5970,76 @@ export type WorkspaceUpdate = {
 
 export type Yaml = {
   component_id?: "yaml"
+}
+
+/**
+ * Response model for registry sync operation.
+ */
+export type tracecat__registry__repositories__schemas__RegistrySyncResponse = {
+  success: boolean
+  repository_id: string
+  origin: string
+  version?: string | null
+  commit_sha?: string | null
+  actions_count?: number | null
+  forced?: boolean
+}
+
+/**
+ * Response model for version promotion.
+ */
+export type tracecat__registry__repositories__schemas__RegistryVersionPromoteResponse =
+  {
+    repository_id: string
+    origin: string
+    previous_version_id: string | null
+    current_version_id: string
+    version: string
+  }
+
+/**
+ * Response model for reading a registry version.
+ */
+export type tracecat__registry__repositories__schemas__RegistryVersionRead = {
+  id: string
+  repository_id: string
+  version: string
+  commit_sha: string | null
+  tarball_uri: string | null
+  created_at: string
+}
+
+/**
+ * Response from sync operation.
+ */
+export type tracecat_ee__admin__registry__schemas__RegistrySyncResponse = {
+  success: boolean
+  synced_at: string
+  repositories: Array<RepositorySyncResult>
+}
+
+/**
+ * Response from promoting a registry version.
+ */
+export type tracecat_ee__admin__registry__schemas__RegistryVersionPromoteResponse =
+  {
+    repository_id: string
+    origin: string
+    previous_version_id: string | null
+    current_version_id: string
+    version: string
+  }
+
+/**
+ * Registry version details.
+ */
+export type tracecat_ee__admin__registry__schemas__RegistryVersionRead = {
+  id: string
+  repository_id: string
+  version: string
+  commit_sha: string | null
+  tarball_uri: string | null
+  created_at: string
 }
 
 export type PublicIncomingWebhookPostData = {
@@ -6497,9 +6852,17 @@ export type AgentSessionsListSessionsData = {
    */
   entityType?: AgentSessionEntity | null
   /**
+   * Entity types to exclude from results
+   */
+  excludeEntityTypes?: Array<AgentSessionEntity> | null
+  /**
    * Maximum number of sessions to return
    */
   limit?: number
+  /**
+   * Filter by parent session ID (for finding forked sessions)
+   */
+  parentSessionId?: string | null
   workspaceId: string
 }
 
@@ -6559,6 +6922,14 @@ export type AgentSessionsStreamSessionEventsData = {
 
 export type AgentSessionsStreamSessionEventsResponse = unknown
 
+export type AgentSessionsForkSessionData = {
+  requestBody?: AgentSessionForkRequest | null
+  sessionId: string
+  workspaceId: string
+}
+
+export type AgentSessionsForkSessionResponse = AgentSessionRead
+
 export type ApprovalsSubmitApprovalsData = {
   requestBody: ApprovalSubmission
   sessionId: string
@@ -6594,13 +6965,57 @@ export type AdminDeleteOrganizationData = {
 
 export type AdminDeleteOrganizationResponse = void
 
-export type AdminSyncAllRepositoriesResponse = RegistrySyncResponse
+export type AdminListOrgRepositoriesData = {
+  orgId: string
+}
 
-export type AdminSyncRepositoryData = {
+export type AdminListOrgRepositoriesResponse = Array<OrgRegistryRepositoryRead>
+
+export type AdminListOrgRepositoryVersionsData = {
+  orgId: string
   repositoryId: string
 }
 
-export type AdminSyncRepositoryResponse = RegistrySyncResponse
+export type AdminListOrgRepositoryVersionsResponse =
+  Array<OrgRegistryVersionRead>
+
+export type AdminSyncOrgRepositoryData = {
+  orgId: string
+  repositoryId: string
+  requestBody?: OrgRegistrySyncRequest | null
+}
+
+export type AdminSyncOrgRepositoryResponse = OrgRegistrySyncResponse
+
+export type AdminPromoteOrgRepositoryVersionData = {
+  orgId: string
+  repositoryId: string
+  versionId: string
+}
+
+export type AdminPromoteOrgRepositoryVersionResponse =
+  OrgRegistryVersionPromoteResponse
+
+export type AdminSyncAllRepositoriesData = {
+  /**
+   * Force sync by deleting existing version
+   */
+  force?: boolean
+}
+
+export type AdminSyncAllRepositoriesResponse =
+  tracecat_ee__admin__registry__schemas__RegistrySyncResponse
+
+export type AdminSyncRepositoryData = {
+  /**
+   * Force sync by deleting existing version
+   */
+  force?: boolean
+  repositoryId: string
+}
+
+export type AdminSyncRepositoryResponse =
+  tracecat_ee__admin__registry__schemas__RegistrySyncResponse
 
 export type AdminGetRegistryStatusResponse = RegistryStatusResponse
 
@@ -6609,7 +7024,16 @@ export type AdminListRegistryVersionsData = {
   repositoryId?: string | null
 }
 
-export type AdminListRegistryVersionsResponse = Array<RegistryVersionRead>
+export type AdminListRegistryVersionsResponse =
+  Array<tracecat_ee__admin__registry__schemas__RegistryVersionRead>
+
+export type AdminPromoteRegistryVersionData = {
+  repositoryId: string
+  versionId: string
+}
+
+export type AdminPromoteRegistryVersionResponse =
+  tracecat_ee__admin__registry__schemas__RegistryVersionPromoteResponse
 
 export type AdminGetRegistrySettingsResponse = PlatformRegistrySettingsRead
 
@@ -6618,6 +7042,53 @@ export type AdminUpdateRegistrySettingsData = {
 }
 
 export type AdminUpdateRegistrySettingsResponse = PlatformRegistrySettingsRead
+
+export type AdminListTiersData = {
+  /**
+   * Include inactive tiers in results
+   */
+  includeInactive?: boolean
+}
+
+export type AdminListTiersResponse = Array<TierRead>
+
+export type AdminCreateTierData = {
+  requestBody: TierCreate
+}
+
+export type AdminCreateTierResponse = TierRead
+
+export type AdminGetTierData = {
+  tierId: string
+}
+
+export type AdminGetTierResponse = TierRead
+
+export type AdminUpdateTierData = {
+  requestBody: TierUpdate
+  tierId: string
+}
+
+export type AdminUpdateTierResponse = TierRead
+
+export type AdminDeleteTierData = {
+  tierId: string
+}
+
+export type AdminDeleteTierResponse = void
+
+export type AdminGetOrgTierData = {
+  orgId: string
+}
+
+export type AdminGetOrgTierResponse = OrganizationTierRead
+
+export type AdminUpdateOrgTierData = {
+  orgId: string
+  requestBody: OrganizationTierUpdate
+}
+
+export type AdminUpdateOrgTierResponse = OrganizationTierRead
 
 export type AdminListUsersResponse = Array<AdminUserRead>
 
@@ -6638,6 +7109,32 @@ export type AdminDemoteFromSuperuserData = {
 }
 
 export type AdminDemoteFromSuperuserResponse = AdminUserRead
+
+export type InboxListItemsData = {
+  limit?: number
+  offset?: number
+  workspaceId: string
+}
+
+export type InboxListItemsResponse = Array<InboxItemRead>
+
+export type InboxListItemsPaginatedData = {
+  cursor?: string | null
+  limit?: number
+  /**
+   * Column name to order by (created_at, updated_at, status)
+   */
+  orderBy?: string | null
+  reverse?: boolean
+  /**
+   * Sort direction (asc or desc)
+   */
+  sort?: "asc" | "desc" | null
+  workspaceId: string
+}
+
+export type InboxListItemsPaginatedResponse =
+  CursorPaginatedResponse_InboxItemRead_
 
 export type EditorListFunctionsData = {
   workspaceId: string
@@ -6668,7 +7165,15 @@ export type RegistryRepositoriesSyncRegistryRepositoryData = {
   requestBody?: RegistryRepositorySync | null
 }
 
-export type RegistryRepositoriesSyncRegistryRepositoryResponse = void
+export type RegistryRepositoriesSyncRegistryRepositoryResponse =
+  tracecat__registry__repositories__schemas__RegistrySyncResponse
+
+export type RegistryRepositoriesListRepositoryVersionsData = {
+  repositoryId: string
+}
+
+export type RegistryRepositoriesListRepositoryVersionsResponse =
+  Array<tracecat__registry__repositories__schemas__RegistryVersionRead>
 
 export type RegistryRepositoriesListRegistryRepositoriesResponse =
   Array<RegistryRepositoryReadMinimal>
@@ -6716,7 +7221,7 @@ export type RegistryRepositoriesPromoteRegistryVersionData = {
 }
 
 export type RegistryRepositoriesPromoteRegistryVersionResponse =
-  RegistryVersionPromoteResponse
+  tracecat__registry__repositories__schemas__RegistryVersionPromoteResponse
 
 export type RegistryActionsListRegistryActionsResponse =
   Array<RegistryActionReadMinimal>
@@ -7689,7 +8194,7 @@ export type AuthSsoAcsResponse = unknown
 
 export type PublicCheckHealthResponse = HealthResponse
 
-export type PublicCheckReadyResponse = HealthResponse
+export type PublicCheckReadyResponse = ReadinessResponse
 
 export type $OpenApiTs = {
   "/webhooks/{workflow_id}/{secret}": {
@@ -9253,6 +9758,21 @@ export type $OpenApiTs = {
       }
     }
   }
+  "/agent/sessions/{session_id}/fork": {
+    post: {
+      req: AgentSessionsForkSessionData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: AgentSessionRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
   "/approvals/{session_id}": {
     post: {
       req: ApprovalsSubmitApprovalsData
@@ -9332,13 +9852,78 @@ export type $OpenApiTs = {
       }
     }
   }
-  "/admin/registry/sync": {
-    post: {
+  "/admin/organizations/{org_id}/registry/repositories": {
+    get: {
+      req: AdminListOrgRepositoriesData
       res: {
         /**
          * Successful Response
          */
-        200: RegistrySyncResponse
+        200: Array<OrgRegistryRepositoryRead>
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/admin/organizations/{org_id}/registry/repositories/{repository_id}/versions": {
+    get: {
+      req: AdminListOrgRepositoryVersionsData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: Array<OrgRegistryVersionRead>
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/admin/organizations/{org_id}/registry/repositories/{repository_id}/sync": {
+    post: {
+      req: AdminSyncOrgRepositoryData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: OrgRegistrySyncResponse
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/admin/organizations/{org_id}/registry/repositories/{repository_id}/versions/{version_id}/promote": {
+    post: {
+      req: AdminPromoteOrgRepositoryVersionData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: OrgRegistryVersionPromoteResponse
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/admin/registry/sync": {
+    post: {
+      req: AdminSyncAllRepositoriesData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: tracecat_ee__admin__registry__schemas__RegistrySyncResponse
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
       }
     }
   }
@@ -9349,7 +9934,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        200: RegistrySyncResponse
+        200: tracecat_ee__admin__registry__schemas__RegistrySyncResponse
         /**
          * Validation Error
          */
@@ -9374,7 +9959,22 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        200: Array<RegistryVersionRead>
+        200: Array<tracecat_ee__admin__registry__schemas__RegistryVersionRead>
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/admin/registry/{repository_id}/versions/{version_id}/promote": {
+    post: {
+      req: AdminPromoteRegistryVersionData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: tracecat_ee__admin__registry__schemas__RegistryVersionPromoteResponse
         /**
          * Validation Error
          */
@@ -9398,6 +9998,103 @@ export type $OpenApiTs = {
          * Successful Response
          */
         200: PlatformRegistrySettingsRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/admin/tiers": {
+    get: {
+      req: AdminListTiersData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: Array<TierRead>
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+    post: {
+      req: AdminCreateTierData
+      res: {
+        /**
+         * Successful Response
+         */
+        201: TierRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/admin/tiers/{tier_id}": {
+    get: {
+      req: AdminGetTierData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: TierRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+    patch: {
+      req: AdminUpdateTierData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: TierRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+    delete: {
+      req: AdminDeleteTierData
+      res: {
+        /**
+         * Successful Response
+         */
+        204: void
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/admin/tiers/organizations/{org_id}": {
+    get: {
+      req: AdminGetOrgTierData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: OrganizationTierRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+    patch: {
+      req: AdminUpdateOrgTierData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: OrganizationTierRead
         /**
          * Validation Error
          */
@@ -9453,6 +10150,36 @@ export type $OpenApiTs = {
          * Successful Response
          */
         200: AdminUserRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/inbox": {
+    get: {
+      req: InboxListItemsData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: Array<InboxItemRead>
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/inbox/paginated": {
+    get: {
+      req: InboxListItemsPaginatedData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: CursorPaginatedResponse_InboxItemRead_
         /**
          * Validation Error
          */
@@ -9532,7 +10259,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        204: void
+        200: tracecat__registry__repositories__schemas__RegistrySyncResponse
         /**
          * Cannot sync repository
          */
@@ -9545,6 +10272,21 @@ export type $OpenApiTs = {
          * Registry sync validation error
          */
         422: RegistryRepositoryErrorDetail
+      }
+    }
+  }
+  "/registry/repos/{repository_id}/versions": {
+    get: {
+      req: RegistryRepositoriesListRepositoryVersionsData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: Array<tracecat__registry__repositories__schemas__RegistryVersionRead>
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
       }
     }
   }
@@ -9634,7 +10376,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        200: RegistryVersionPromoteResponse
+        200: tracecat__registry__repositories__schemas__RegistryVersionPromoteResponse
         /**
          * Validation Error
          */
@@ -11449,7 +12191,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        200: HealthResponse
+        200: ReadinessResponse
       }
     }
   }

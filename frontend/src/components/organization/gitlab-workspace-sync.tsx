@@ -34,7 +34,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { validateGitSshUrl } from "@/lib/git"
+import { validateGitLabUrl } from "@/lib/git"
 import { useWorkspaceManager, useWorkspaceSettings } from "@/lib/hooks"
 
 const gitlabWorkspaceSyncSchema = z.object({
@@ -42,7 +42,7 @@ const gitlabWorkspaceSyncSchema = z.object({
   git_repo_url: z
     .string()
     .min(1, "Repository URL is required")
-    .superRefine((url, ctx) => validateGitSshUrl(url, ctx)),
+    .superRefine((url, ctx) => validateGitLabUrl(url, ctx)),
 })
 
 type GitLabWorkspaceSyncForm = z.infer<typeof gitlabWorkspaceSyncSchema>
@@ -160,17 +160,21 @@ export function GitLabWorkspaceSync() {
                       <FormLabel>GitLab repository URL</FormLabel>
                       <FormControl>
                         <Input
-                          placeholder="git+ssh://git@gitlab.com/my-org/my-repo.git"
+                          placeholder="https://gitlab.com/my-org/my-repo.git"
                           className="max-w-md"
                           {...field}
                         />
                       </FormControl>
                       <FormDescription>
-                        Git URL of the GitLab repository. Must use{" "}
+                        Git URL of the GitLab repository. Supports{" "}
                         <span className="font-mono tracking-tighter">
-                          git+ssh
+                          https://
                         </span>{" "}
-                        scheme.
+                        or{" "}
+                        <span className="font-mono tracking-tighter">
+                          git+ssh://
+                        </span>{" "}
+                        schemes.
                       </FormDescription>
                       <FormMessage />
                     </FormItem>

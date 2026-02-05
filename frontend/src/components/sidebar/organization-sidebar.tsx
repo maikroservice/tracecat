@@ -92,10 +92,18 @@ export function OrganizationSidebar({
             title: "Workflow sync",
             url: "/organization/vcs",
             icon: GitBranchIcon,
-            isActive: pathname?.includes("/organization/vcs"),
+            isActive:
+              pathname?.includes("/organization/vcs") &&
+              !pathname?.includes("/organization/vcs/gitlab"),
           },
         ]
       : []),
+    {
+      title: "GitLab workflow sync",
+      url: "/organization/vcs/gitlab",
+      icon: GitBranchIcon,
+      isActive: pathname?.includes("/organization/vcs/gitlab"),
+    },
   ]
 
   const navSecrets = [

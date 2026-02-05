@@ -2578,6 +2578,48 @@ export function useGitLabCredentials() {
   }
 }
 
+export interface GitLabTestConnectionResponse {
+  success: boolean
+  project_name?: string | null
+  default_branch?: string | null
+  branches: string[]
+  branch_count: number
+  error?: string | null
+}
+
+export function useGitLabTestConnection() {
+  const testConnection = useMutation<
+    GitLabTestConnectionResponse,
+    ApiError,
+    { git_repo_url: string }
+  >({
+    mutationFn: async (data) => {
+      const response = await fetch("/api/organization/vcs/gitlab/test-connection", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        credentials: "include",
+        body: JSON.stringify(data),
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}))
+        throw new Error(errorData.detail || `HTTP error ${response.status}`)
+      }
+
+      return response.json()
+    },
+  })
+
+  return {
+    testConnection,
+    isTestingConnection: testConnection.isPending,
+    testConnectionError: testConnection.error,
+    testConnectionData: testConnection.data,
+  }
+}
+
 export function useOrgAgentSettings() {
   const queryClient = useQueryClient()
   // Get Agent settings

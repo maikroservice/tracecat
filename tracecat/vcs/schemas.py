@@ -64,3 +64,20 @@ class GitLabCredentialsStatus(BaseModel):
     exists: bool
     gitlab_url: str | None = None
     created_at: str | None = None
+
+
+class GitLabTestConnectionRequest(BaseModel):
+    """Request to test GitLab repository connection."""
+
+    git_repo_url: str = Field(..., description="GitLab repository URL to test")
+
+
+class GitLabTestConnectionResponse(BaseModel):
+    """Response from GitLab connection test."""
+
+    success: bool
+    project_name: str | None = None
+    default_branch: str | None = None
+    branches: list[str] = Field(default_factory=list)
+    branch_count: int = 0
+    error: str | None = None

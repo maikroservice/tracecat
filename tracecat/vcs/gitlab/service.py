@@ -329,3 +329,87 @@ class GitLabService(BaseService):
                 gitlab_url=credentials.gitlab_url,
             )
             raise GitLabError(f"GitLab API error: {e}") from e
+
+    async def list_branches(self, repo_url: GitUrl) -> list[str]:
+        """List branches from a GitLab repository.
+
+        Args:
+            repo_url: Git repository URL
+
+        Returns:
+            List of branch names
+
+        Raises:
+            GitLabError: If operation fails
+        """
+        import asyncio
+
+        gl = await self.get_gitlab_client_for_repo(repo_url)
+
+        try:
+            project_path = f"{repo_url.org}/{repo_url.repo}"
+            project = await asyncio.to_thread(gl.projects.get, project_path)
+
+            # Get branches
+            branches = await asyncio.to_thread(
+                project.branches.list, per_page=100, iterator=False
+            )
+
+            branch_names = [branch.name for branch in branches]
+
+            self.logger.debug(
+                "Listed branches from GitLab repository",
+                project=project_path,
+                branch_count=len(branch_names),
+            )
+
+            return branch_names
+
+        except GitlabError as e:
+            self.logger.error(
+                "Failed to list branches from GitLab repository",
+                error=str(e),
+                project=f"{repo_url.org}/{repo_url.repo}",
+            )
+            raise GitLabError(f"Failed to list branches: {e}") from e
+
+    async def test_connection(self, repo_url: GitUrl) -> dict[str, Any]:
+        """Test connection to a GitLab repository.
+
+        Args:
+            repo_url: Git repository URL
+
+        Returns:
+            Dictionary with connection test results
+
+        Raises:
+            GitLabError: If connection fails
+        """
+        import asyncio
+
+        gl = await self.get_gitlab_client_for_repo(repo_url)
+
+        try:
+            project_path = f"{repo_url.org}/{repo_url.repo}"
+            project = await asyncio.to_thread(gl.projects.get, project_path)
+
+            # Get default branch and branch count
+            branches = await asyncio.to_thread(
+                project.branches.list, per_page=100, iterator=False
+            )
+
+            return {
+                "success": True,
+                "project_name": project.name,
+                "default_branch": project.default_branch,
+                "branches": [branch.name for branch in branches],
+                "branch_count": len(branches),
+            }
+
+        except GitlabError as e:
+            self.logger.error(
+                "Connection test failed",
+                error=str(e),
+                project=f"{repo_url.org}/{repo_url.repo}",
+            )
+            raise GitLabError(f"Connection test failed: {e}") from e

@@ -13,12 +13,15 @@ from tracecat.vcs.github.app import GitHubAppError, GitHubAppService
 from tracecat.vcs.github.flows import handle_manifest_conversion
 from tracecat.vcs.github.manifest import generate_github_app_manifest
 from tracecat.vcs.gitlab.service import GitLabError, GitLabService
+from tracecat.git.utils import parse_git_url
 from tracecat.vcs.schemas import (
     GitHubAppCredentialsRequest,
     GitHubAppCredentialsStatus,
     GitHubAppManifestResponse,
     GitLabCredentialsRequest,
     GitLabCredentialsStatus,
+    GitLabTestConnectionRequest,
+    GitLabTestConnectionResponse,
 )
 
 org_router = APIRouter(prefix="/organization/vcs", tags=["vcs", "organization"])
@@ -280,6 +283,50 @@ async def delete_gitlab_credentials(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Internal server error while deleting credentials",
         ) from e
+
+
+@gitlab_router.post("/test-connection", response_model=GitLabTestConnectionResponse)
+async def test_gitlab_connection(
+    *,
+    session: AsyncDBSession,
+    role: OrgAdminUser,
+    request: GitLabTestConnectionRequest,
+) -> GitLabTestConnectionResponse:
+    """Test connection to a GitLab repository and list available branches."""
+    try:
+        # Parse and validate Git URL
+        git_url = parse_git_url(request.git_repo_url)
+
+        gitlab_service = GitLabService(session=session, role=role)
+        result = await gitlab_service.test_connection(git_url)
+
+        return GitLabTestConnectionResponse(
+            success=True,
+            project_name=result.get("project_name"),
+            default_branch=result.get("default_branch"),
+            branches=result.get("branches", []),
+            branch_count=result.get("branch_count", 0),
+        )
+
+    except ValueError as e:
+        # Invalid URL format
+        logger.warning("Invalid Git URL format", error=str(e))
+        return GitLabTestConnectionResponse(
+            success=False,
+            error=f"Invalid repository URL: {str(e)}",
+        )
+    except GitLabError as e:
+        logger.error("GitLab connection test failed", error=str(e))
+        return GitLabTestConnectionResponse(
+            success=False,
+            error=str(e),
+        )
+    except Exception as e:
+        logger.error("Error testing GitLab connection", error=str(e))
+        return GitLabTestConnectionResponse(
+            success=False,
+            error="Internal server error while testing connection",
+        )
 
 
 # Mount GitHub sub-router to organization VCS router (gated by git-sync feature flag)

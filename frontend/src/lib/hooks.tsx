@@ -246,15 +246,21 @@ import {
   type VariableUpdate,
   type VcsGetGithubAppCredentialsStatusResponse,
   type VcsGetGithubAppManifestResponse,
+  type VcsGetGitlabCredentialsStatusResponse,
   type VcsSaveGithubAppCredentialsData,
   type VcsSaveGithubAppCredentialsResponse,
+  type VcsSaveGitlabCredentialsData,
+  type VcsSaveGitlabCredentialsResponse,
   variablesCreateVariable,
   variablesDeleteVariableById,
   variablesListVariables,
   variablesUpdateVariableById,
+  vcsDeleteGitlabCredentials,
   vcsGetGithubAppCredentialsStatus,
   vcsGetGithubAppManifest,
+  vcsGetGitlabCredentialsStatus,
   vcsSaveGithubAppCredentials,
+  vcsSaveGitlabCredentials,
   type WebhookUpdate,
   type WorkflowDirectoryItem,
   type WorkflowExecutionCreate,
@@ -2510,6 +2516,65 @@ export function useGitHubAppCredentials() {
 
   return {
     saveCredentials,
+  }
+}
+
+export function useGitLabCredentialsStatus() {
+  // Get GitLab credentials status
+  const {
+    data: credentialsStatus,
+    isLoading: credentialsStatusIsLoading,
+    error: credentialsStatusError,
+    refetch: refetchCredentialsStatus,
+  } = useQuery<VcsGetGitlabCredentialsStatusResponse>({
+    queryKey: ["gitlab-credentials-status"],
+    queryFn: async () => await vcsGetGitlabCredentialsStatus(),
+  })
+
+  return {
+    credentialsStatus,
+    credentialsStatusIsLoading,
+    credentialsStatusError,
+    refetchCredentialsStatus,
+  }
+}
+
+export function useGitLabCredentials() {
+  const queryClient = useQueryClient()
+
+  // Save GitLab credentials mutation
+  const saveCredentials = useMutation<
+    VcsSaveGitlabCredentialsResponse,
+    ApiError,
+    VcsSaveGitlabCredentialsData["requestBody"]
+  >({
+    mutationFn: async (data) => {
+      return await vcsSaveGitlabCredentials({ requestBody: data })
+    },
+    onSuccess: () => {
+      // Invalidate and refetch credentials status
+      queryClient.invalidateQueries({
+        queryKey: ["gitlab-credentials-status"],
+      })
+    },
+  })
+
+  // Delete GitLab credentials mutation
+  const deleteCredentials = useMutation<void, ApiError>({
+    mutationFn: async () => {
+      await vcsDeleteGitlabCredentials()
+    },
+    onSuccess: () => {
+      // Invalidate and refetch credentials status
+      queryClient.invalidateQueries({
+        queryKey: ["gitlab-credentials-status"],
+      })
+    },
+  })
+
+  return {
+    saveCredentials,
+    deleteCredentials,
   }
 }
 

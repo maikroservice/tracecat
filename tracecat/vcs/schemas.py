@@ -41,3 +41,26 @@ class GitHubAppManifestResponse(BaseModel):
 
     manifest: GitHubAppManifest
     instructions: list[str]
+
+
+# GitLab schemas
+
+
+class GitLabCredentialsRequest(BaseModel):
+    """Request to register or update GitLab credentials."""
+
+    access_token: SecretStr = Field(
+        ..., description="GitLab Group Access Token or Personal Access Token"
+    )
+    gitlab_url: str = Field(
+        default="https://gitlab.com",
+        description="GitLab instance URL (for self-hosted instances)",
+    )
+
+
+class GitLabCredentialsStatus(BaseModel):
+    """Status of GitLab credentials."""
+
+    exists: bool
+    gitlab_url: str | None = None
+    created_at: str | None = None

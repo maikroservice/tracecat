@@ -12,10 +12,13 @@ from tracecat.logger import logger
 from tracecat.vcs.github.app import GitHubAppError, GitHubAppService
 from tracecat.vcs.github.flows import handle_manifest_conversion
 from tracecat.vcs.github.manifest import generate_github_app_manifest
+from tracecat.vcs.gitlab.service import GitLabError, GitLabService
 from tracecat.vcs.schemas import (
     GitHubAppCredentialsRequest,
     GitHubAppCredentialsStatus,
     GitHubAppManifestResponse,
+    GitLabCredentialsRequest,
+    GitLabCredentialsStatus,
 )
 
 org_router = APIRouter(prefix="/organization/vcs", tags=["vcs", "organization"])
@@ -186,5 +189,99 @@ async def get_github_app_credentials_status(
         ) from e
 
 
-# Mount GitHub sub-router to organization VCS router after all endpoints are defined
+# GitLab router
+
+gitlab_router = APIRouter(prefix="/gitlab", tags=["vcs", "gitlab", "organization"])
+"""Manage GitLab credentials for organization-level features."""
+
+
+@gitlab_router.post("/credentials", status_code=status.HTTP_201_CREATED)
+async def save_gitlab_credentials(
+    *,
+    session: AsyncDBSession,
+    role: OrgAdminUser,
+    request: GitLabCredentialsRequest,
+) -> dict[str, str]:
+    """Save GitLab credentials (register new or update existing)."""
+    try:
+        gitlab_service = GitLabService(session=session, role=role)
+        config, was_created = await gitlab_service.save_gitlab_credentials(
+            access_token=request.access_token,
+            gitlab_url=request.gitlab_url,
+        )
+
+        action = "created" if was_created else "updated"
+        logger.info(
+            f"GitLab credentials {action}",
+            gitlab_url=request.gitlab_url,
+        )
+
+        return {
+            "message": f"GitLab credentials {action} successfully",
+            "action": action,
+            "gitlab_url": config.gitlab_url,
+        }
+
+    except GitLabError as e:
+        logger.error("Failed to save GitLab credentials", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to save GitLab credentials: {str(e)}",
+        ) from e
+    except Exception as e:
+        logger.error("Error saving GitLab credentials", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error while saving credentials",
+        ) from e
+
+
+@gitlab_router.get("/credentials/status", response_model=GitLabCredentialsStatus)
+async def get_gitlab_credentials_status(
+    *,
+    session: AsyncDBSession,
+    role: OrgAdminUser,
+) -> GitLabCredentialsStatus:
+    """Get the status of GitLab credentials."""
+    try:
+        gitlab_service = GitLabService(session=session, role=role)
+        status_data = await gitlab_service.get_gitlab_credentials_status()
+        return GitLabCredentialsStatus(**status_data)
+
+    except Exception as e:
+        logger.error("Error getting GitLab credentials status", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error while getting credentials status",
+        ) from e
+
+
+@gitlab_router.delete("/credentials", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_gitlab_credentials(
+    *,
+    session: AsyncDBSession,
+    role: OrgAdminUser,
+) -> None:
+    """Delete GitLab credentials."""
+    try:
+        gitlab_service = GitLabService(session=session, role=role)
+        await gitlab_service.delete_gitlab_credentials()
+        logger.info("GitLab credentials deleted")
+
+    except GitLabError as e:
+        logger.error("Failed to delete GitLab credentials", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to delete GitLab credentials: {str(e)}",
+        ) from e
+    except Exception as e:
+        logger.error("Error deleting GitLab credentials", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal server error while deleting credentials",
+        ) from e
+
+
+# Mount sub-routers to organization VCS router after all endpoints are defined
 org_router.include_router(github_router)
+org_router.include_router(gitlab_router)

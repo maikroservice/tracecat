@@ -6,10 +6,12 @@ import asyncio
 import base64
 from collections.abc import Sequence
 from datetime import datetime
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 import yaml
 from github.GithubException import GithubException
+from gitlab.exceptions import GitlabError
 
 if TYPE_CHECKING:
     from github.ContentFile import ContentFile
@@ -30,9 +32,17 @@ from tracecat.sync import (
     PushOptions,
 )
 from tracecat.vcs.github.app import GitHubAppError, GitHubAppService
+from tracecat.vcs.gitlab.service import GitLabError, GitLabService
 from tracecat.workflow.store.import_service import WorkflowImportService
 from tracecat.workflow.store.schemas import RemoteWorkflowDefinition
 from tracecat.workspaces.service import WorkspaceService
+
+
+class VCSProvider(StrEnum):
+    """Supported VCS providers."""
+
+    GITHUB = "github"
+    GITLAB = "gitlab"
 
 
 # NOTE: Internal service called by higher level services, shouldn't use directly
@@ -44,6 +54,29 @@ class WorkflowSyncService(BaseWorkspaceService):
     """
 
     service_name = "workflow_sync"
+
+    def _detect_provider(self, url: GitUrl) -> VCSProvider:
+        """Detect the VCS provider from the Git URL.
+
+        Args:
+            url: Git repository URL
+
+        Returns:
+            VCSProvider enum value
+        """
+        host_lower = url.host.lower()
+        if "github" in host_lower:
+            return VCSProvider.GITHUB
+        elif "gitlab" in host_lower:
+            return VCSProvider.GITLAB
+        else:
+            # Default to GitLab for unknown hosts (self-hosted instances)
+            # as GitHub Enterprise is less common
+            logger.warning(
+                "Unknown VCS host, defaulting to GitLab",
+                host=url.host,
+            )
+            return VCSProvider.GITLAB
 
     async def pull(
         self,
@@ -141,6 +174,24 @@ class WorkflowSyncService(BaseWorkspaceService):
                 ],
                 message="GitHub API error",
             )
+        except GitLabError as e:
+            logger.error(f"GitLab API error during pull: {e}")
+            return PullResult(
+                success=False,
+                commit_sha=options.commit_sha or "",
+                workflows_found=0,
+                workflows_imported=0,
+                diagnostics=[
+                    PullDiagnostic(
+                        workflow_path="",
+                        workflow_title=None,
+                        error_type="gitlab",
+                        message=f"GitLab API error: {str(e)}",
+                        details={"error": str(e)},
+                    )
+                ],
+                message="GitLab API error",
+            )
         except Exception as e:
             logger.error(f"Unexpected error during pull: {e}", exc_info=True)
             return PullResult(
@@ -174,7 +225,19 @@ class WorkflowSyncService(BaseWorkspaceService):
 
         Raises:
             GitHubAppError: If GitHub API errors occur
+            GitLabError: If GitLab API errors occur
         """
+        provider = self._detect_provider(url)
+
+        if provider == VCSProvider.GITLAB:
+            return await self._fetch_repository_content_gitlab(url, commit_sha)
+
+        return await self._fetch_repository_content_github(url, commit_sha)
+
+    async def _fetch_repository_content_github(
+        self, url: GitUrl, commit_sha: str
+    ) -> dict[str, str]:
+        """Fetch workflow definitions from GitHub repository."""
         gh_svc = GitHubAppService(session=self.session, role=self.role)
         gh = await gh_svc.get_github_client_for_repo(url)
 
@@ -228,6 +291,62 @@ class WorkflowSyncService(BaseWorkspaceService):
             raise GitHubAppError(f"GitHub API error: {e.status} - {e.data}") from e
         finally:
             gh.close()
+
+    async def _fetch_repository_content_gitlab(
+        self, url: GitUrl, commit_sha: str
+    ) -> dict[str, str]:
+        """Fetch workflow definitions from GitLab repository."""
+        gl_svc = GitLabService(session=self.session, role=self.role)
+        gl = await gl_svc.get_gitlab_client_for_repo(url)
+
+        try:
+            # Get project by path (org/repo)
+            project_path = f"{url.org}/{url.repo}"
+            project = await asyncio.to_thread(gl.projects.get, project_path)
+
+            # Get the workflows directory at the specific commit
+            try:
+                # List items in workflows directory
+                workflows_items = await asyncio.to_thread(
+                    project.repository_tree,
+                    path="workflows",
+                    ref=commit_sha,
+                    iterator=False,
+                )
+
+                content_map = {}
+
+                for item in workflows_items:
+                    # Look for workflow directories
+                    if item["type"] == "tree":  # "tree" is GitLab's term for directory
+                        # Get definition.yml from each workflow directory
+                        definition_path = f"{item['path']}/definition.yml"
+                        try:
+                            # Get file content using repository_blob_raw
+                            file_content = await asyncio.to_thread(
+                                project.files.get,
+                                file_path=definition_path,
+                                ref=commit_sha,
+                            )
+                            # Decode content (GitLab returns base64-encoded content)
+                            content = base64.b64decode(file_content.content).decode(
+                                "utf-8"
+                            )
+                            content_map[definition_path] = content
+                        except GitlabError as e:
+                            if "404" not in str(e):  # Ignore missing definition.yml
+                                logger.warning(f"Failed to get {definition_path}: {e}")
+
+                return content_map
+
+            except GitlabError as e:
+                if "404" in str(e):
+                    # No workflows directory found
+                    return {}
+                raise
+
+        except GitlabError as e:
+            raise GitLabError(f"GitLab API error: {e}") from e
 
     async def _parse_workflow_definitions(
         self, content_map: dict[str, str]
@@ -306,7 +425,7 @@ class WorkflowSyncService(BaseWorkspaceService):
         url: GitUrl,
         options: PushOptions,
     ) -> CommitInfo:
-        """Push workflow definitions using GitHub App API operations.
+        """Push workflow definitions to a Git repository.
 
         Args:
             objects: PushObjects containing workflow definitions and target paths
@@ -319,6 +438,21 @@ class WorkflowSyncService(BaseWorkspaceService):
         if len(objects) != 1:
             raise ValueError("We only support pushing one workflow object at a time")
 
+        provider = self._detect_provider(url)
+
+        if provider == VCSProvider.GITLAB:
+            return await self._push_gitlab(objects=objects, url=url, options=options)
+
+        return await self._push_github(objects=objects, url=url, options=options)
+
+    async def _push_github(
+        self,
+        *,
+        objects: Sequence[PushObject[RemoteWorkflowDefinition]],
+        url: GitUrl,
+        options: PushOptions,
+    ) -> CommitInfo:
+        """Push workflow definitions using GitHub App API operations."""
         [obj] = objects
 
         gh_svc = GitHubAppService(session=self.session, role=self.role)
@@ -483,6 +617,171 @@ class WorkflowSyncService(BaseWorkspaceService):
         finally:
             gh.close()
 
+    async def _push_gitlab(
+        self,
+        *,
+        objects: Sequence[PushObject[RemoteWorkflowDefinition]],
+        url: GitUrl,
+        options: PushOptions,
+    ) -> CommitInfo:
+        """Push workflow definitions using GitLab API operations."""
+        [obj] = objects
+
+        gl_svc = GitLabService(session=self.session, role=self.role)
+        gl = await gl_svc.get_gitlab_client_for_repo(url)
+
+        try:
+            # Get project by path
+            project_path = f"{url.org}/{url.repo}"
+            project = await asyncio.to_thread(gl.projects.get, project_path)
+
+            # Get base branch
+            base_branch_name = url.ref or project.default_branch
+
+            # Create feature branch
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            branch_name = f"tracecat-sync-{timestamp}"
+
+            logger.info(
+                "Creating branch via GitLab API",
+                branch=branch_name,
+                base_branch=base_branch_name,
+                repo=project_path,
+            )
+
+            # Create branch from base
+            await asyncio.to_thread(
+                project.branches.create,
+                {"branch": branch_name, "ref": base_branch_name},
+            )
+
+            # Create/update workflow file
+            file_path = obj.path_str
+            yaml_content = yaml.dump(
+                obj.data.model_dump(mode="json", exclude_none=True, exclude_unset=True),
+                sort_keys=False,
+            )
+
+            try:
+                # Try to get existing file to update it
+                existing_file = await asyncio.to_thread(
+                    project.files.get, file_path=file_path, ref=branch_name
+                )
+                # File exists, update it
+                existing_file.content = yaml_content
+                existing_file.encoding = "text"
+                await asyncio.to_thread(
+                    existing_file.save,
+                    branch=branch_name,
+                    commit_message=options.message,
+                )
+                logger.debug(
+                    "Updated workflow file via GitLab API",
+                    path=file_path,
+                    branch=branch_name,
+                )
+            except GitlabError as e:
+                if "404" in str(e):
+                    # File doesn't exist, create it
+                    await asyncio.to_thread(
+                        project.files.create,
+                        {
+                            "file_path": file_path,
+                            "branch": branch_name,
+                            "content": yaml_content,
+                            "commit_message": options.message,
+                        },
+                    )
+                    logger.debug(
+                        "Created workflow file via GitLab API",
+                        path=file_path,
+                        branch=branch_name,
+                    )
+                else:
+                    raise
+
+            # Get the latest commit SHA from the branch
+            branch_obj = await asyncio.to_thread(
+                project.branches.get, branch_name
+            )
+            commit_sha = branch_obj.commit["id"]
+
+            # Create MR if requested
+            mr_url = None
+            if options.create_pr:
+                try:
+                    ws_svc = WorkspaceService(session=self.session)
+                    workspace = await ws_svc.get_workspace(self.workspace_id)
+                    if not workspace:
+                        raise TracecatNotFoundError("Workspace not found")
+
+                    try:
+                        title = obj.data.definition.title
+                        description = obj.data.definition.description
+                    except ValueError:
+                        title = "<An error occurred while determining the title>"
+                        description = (
+                            "<An error occurred while determining the description>"
+                        )
+
+                    try:
+                        current_user = await self.session.get(User, self.role.user_id)
+                    except Exception:
+                        current_user = None
+
+                    published_by = current_user.email if current_user else "<unknown>"
+
+                    mr = await asyncio.to_thread(
+                        project.mergerequests.create,
+                        {
+                            "source_branch": branch_name,
+                            "target_branch": base_branch_name,
+                            "title": options.message,
+                            "description": (
+                                f"Automated workflow sync from Tracecat\n\n"
+                                f"**Workspace:** {workspace.name}\n"
+                                f"**Published by:** {published_by}\n"
+                                f"**Workflow Title:** {title}\n"
+                                f"**Workflow Description:** {description}"
+                            ),
+                        },
+                    )
+                    mr_url = mr.web_url
+
+                    logger.info(
+                        "Created MR via GitLab API",
+                        mr_iid=mr.iid,
+                        mr_url=mr_url,
+                    )
+                except GitlabError as e:
+                    logger.error(
+                        "Failed to create MR via GitLab API",
+                        error=str(e),
+                        branch=branch_name,
+                    )
+                    # Don't fail the entire operation if MR creation fails
+
+            logger.info(
+                "Successfully pushed workflows via GitLab API",
+                count=1,
+                branch=branch_name,
+                commit_sha=commit_sha,
+                mr_created=mr_url is not None,
+            )
+
+            return CommitInfo(
+                sha=commit_sha,
+                ref=branch_name,
+            )
+
+        except GitlabError as e:
+            logger.error(
+                "GitLab API error during push",
+                error=str(e),
+                repo=f"{url.org}/{url.repo}",
+            )
+            raise GitLabError(f"GitLab API error: {e}") from e
+
     async def list_commits(
         self,
         *,
@@ -490,7 +789,7 @@ class WorkflowSyncService(BaseWorkspaceService):
         branch: str = "main",
         limit: int = 10,
     ) -> list[GitCommitInfo]:
-        """List commits from a Git repository using GitHub App API.
+        """List commits from a Git repository.
 
         Args:
             url: Git repository URL
@@ -502,7 +801,23 @@ class WorkflowSyncService(BaseWorkspaceService):
 
         Raises:
             GitHubAppError: If GitHub authentication or API errors occur
+            GitLabError: If GitLab authentication or API errors occur
         """
+        provider = self._detect_provider(url)
+
+        if provider == VCSProvider.GITLAB:
+            return await self._list_commits_gitlab(url=url, branch=branch, limit=limit)
+
+        return await self._list_commits_github(url=url, branch=branch, limit=limit)
+
+    async def _list_commits_github(
+        self,
+        *,
+        url: GitUrl,
+        branch: str = "main",
+        limit: int = 10,
+    ) -> list[GitCommitInfo]:
+        """List commits from a GitHub repository."""
         try:
             # Get authenticated GitHub client
             gh_svc = GitHubAppService(session=self.session, role=self.role)
@@ -569,3 +884,67 @@ class WorkflowSyncService(BaseWorkspaceService):
                 branch=branch,
             )
             raise GitHubAppError(f"GitHub API error: {e.status} - {e.data}") from e
+
+    async def _list_commits_gitlab(
+        self,
+        *,
+        url: GitUrl,
+        branch: str = "main",
+        limit: int = 10,
+    ) -> list[GitCommitInfo]:
+        """List commits from a GitLab repository."""
+        try:
+            # Get authenticated GitLab client
+            gl_svc = GitLabService(session=self.session, role=self.role)
+            gl = await gl_svc.get_gitlab_client_for_repo(url)
+
+            # Get project by path
+            project_path = f"{url.org}/{url.repo}"
+            project = await asyncio.to_thread(gl.projects.get, project_path)
+
+            # Fetch commits
+            commits_list = await asyncio.to_thread(
+                project.commits.list,
+                ref_name=branch,
+                per_page=limit,
+            )
+
+            # Get all tags to build SHA-to-tags mapping
+            tags_list = await asyncio.to_thread(
+                project.tags.list,
+                iterator=False,
+            )
+            sha_to_tags: dict[str, list[str]] = {}
+            for tag in tags_list:
+                tag_sha = tag.commit["id"]
+                if tag_sha not in sha_to_tags:
+                    sha_to_tags[tag_sha] = []
+                sha_to_tags[tag_sha].append(tag.name)
+
+            # Convert to GitCommitInfo objects
+            commits = []
+            for commit in commits_list:
+                # Get tags for this commit SHA, default to empty list
+                tags = sha_to_tags.get(commit.id, [])
+
+                commits.append(
+                    GitCommitInfo(
+                        sha=commit.id,
+                        message=commit.message,
+                        author=commit.author_name or "Unknown",
+                        author_email=commit.author_email or "",
+                        date=commit.created_at,
+                        tags=tags,
+                    )
+                )
+
+            return commits
+
+        except GitlabError as e:
+            logger.error(
+                "GitLab API error during commit listing",
+                error=str(e),
+                repo=f"{url.org}/{url.repo}",
+                branch=branch,
+            )
+            raise GitLabError(f"GitLab API error: {e}") from e

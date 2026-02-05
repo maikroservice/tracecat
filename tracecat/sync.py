@@ -106,10 +106,11 @@ class PullDiagnostic:
         "dependency",
         "parse",
         "github",
+        "gitlab",
         "system",
         "transaction",
     ]
-    """Type of error: 'conflict', 'validation', 'dependency', 'parse', 'github', 'system', 'transaction'"""
+    """Type of error: 'conflict', 'validation', 'dependency', 'parse', 'github', 'gitlab', 'system', 'transaction'"""
 
     message: str
     """Human-readable error message"""

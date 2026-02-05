@@ -8,7 +8,7 @@ from tracecat import config
 from tracecat.auth.schemas import UserRole
 from tracecat.authz.enums import WorkspaceRole
 from tracecat.core.schemas import Schema
-from tracecat.git.constants import GIT_SSH_URL_REGEX
+from tracecat.git.constants import GIT_HTTPS_URL_REGEX, GIT_SSH_URL_REGEX
 from tracecat.identifiers import OrganizationID, UserID, WorkspaceID
 
 # === Workspace === #
@@ -77,13 +77,14 @@ class WorkspaceSettingsUpdate(Schema):
     @field_validator("git_repo_url", mode="before")
     @classmethod
     def validate_git_repo_url(cls, value: str | None) -> str | None:
-        """Ensure workspace git repo URLs use the shared Git SSH format."""
+        """Ensure workspace git repo URLs use a valid Git URL format."""
         if value is None:
             return value
 
-        if not GIT_SSH_URL_REGEX.match(value):
+        # Accept both SSH and HTTPS URLs
+        if not GIT_SSH_URL_REGEX.match(value) and not GIT_HTTPS_URL_REGEX.match(value):
             raise ValueError(
-                "Must be a valid Git SSH URL (e.g., git+ssh://git@github.com/org/repo.git)"
+                "Must be a valid Git URL (e.g., git+ssh://git@github.com/org/repo.git or https://gitlab.com/org/repo.git)"
             )
 
         return value

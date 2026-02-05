@@ -282,6 +282,10 @@ async def delete_gitlab_credentials(
         ) from e
 
 
-# Mount sub-routers to organization VCS router after all endpoints are defined
+# Mount GitHub sub-router to organization VCS router (gated by git-sync feature flag)
 org_router.include_router(github_router)
-org_router.include_router(gitlab_router)
+
+# GitLab router is mounted separately in app.py (not gated by feature flag)
+# Export gitlab_router with the full prefix for standalone mounting
+gitlab_org_router = APIRouter(prefix="/organization/vcs", tags=["vcs", "organization"])
+gitlab_org_router.include_router(gitlab_router)

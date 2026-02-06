@@ -81,3 +81,16 @@ class GitLabTestConnectionResponse(BaseModel):
     branches: list[str] = Field(default_factory=list)
     branch_count: int = 0
     error: str | None = None
+
+
+class GitLabWorkspaceConfig(BaseModel):
+    """Minimal workspace info with git configuration for GitLab integration.
+
+    Used by GitLab VCS integration to show workspace git settings
+    without exposing other workspace configuration.
+    """
+
+    id: str = Field(..., description="Workspace ID")
+    name: str = Field(..., description="Workspace name")
+    git_repo_url: str | None = Field(None, description="Git repository URL")
+    git_branch: str | None = Field(None, description="Git branch for workflow sync")

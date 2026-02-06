@@ -5,9 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, status
+from sqlalchemy import select
+from sqlalchemy.orm import noload
 
 from tracecat.auth.dependencies import OrgAdminUser
 from tracecat.db.dependencies import AsyncDBSession
+from tracecat.db.models import Workspace
 from tracecat.logger import logger
 from tracecat.vcs.github.app import GitHubAppError, GitHubAppService
 from tracecat.vcs.github.flows import handle_manifest_conversion
@@ -22,6 +25,7 @@ from tracecat.vcs.schemas import (
     GitLabCredentialsStatus,
     GitLabTestConnectionRequest,
     GitLabTestConnectionResponse,
+    GitLabWorkspaceConfig,
 )
 
 org_router = APIRouter(prefix="/organization/vcs", tags=["vcs", "organization"])
@@ -327,6 +331,37 @@ async def test_gitlab_connection(
             success=False,
             error="Internal server error while testing connection",
         )
+
+
+@gitlab_router.get("/workspaces", response_model=list[GitLabWorkspaceConfig])
+async def list_gitlab_workspace_configs(
+    *,
+    session: AsyncDBSession,
+    role: OrgAdminUser,
+) -> list[GitLabWorkspaceConfig]:
+    """List all workspaces with their git repository configuration.
+
+    Returns only workspace id, name, git_repo_url, and git_branch for the GitLab
+    integration overview. This follows least privilege by not exposing
+    other workspace settings.
+    """
+    statement = (
+        select(Workspace)
+        .options(noload("*"))
+        .where(Workspace.organization_id == role.organization_id)
+    )
+    result = await session.execute(statement)
+    workspaces = result.scalars().all()
+
+    return [
+        GitLabWorkspaceConfig(
+            id=str(ws.id),
+            name=ws.name,
+            git_repo_url=ws.settings.get("git_repo_url") if ws.settings else None,
+            git_branch=ws.settings.get("git_branch") if ws.settings else None,
+        )
+        for ws in workspaces
+    ]
 
 
 # Mount GitHub sub-router to organization VCS router (gated by git-sync feature flag)

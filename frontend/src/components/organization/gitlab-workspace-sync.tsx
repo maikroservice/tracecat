@@ -59,7 +59,9 @@ import {
 import { validateGitLabUrl } from "@/lib/git"
 import {
   type GitLabTestConnectionResponse,
+  type GitLabWorkspaceConfig,
   useGitLabTestConnection,
+  useGitLabWorkspaceConfigs,
   useWorkspaceManager,
   useWorkspaceSettings,
 } from "@/lib/hooks"
@@ -81,8 +83,16 @@ type ConnectionStatusMap = Record<string, {
 }>
 
 export function GitLabWorkspaceSync() {
+  // For the form workspace selector (full workspace list)
   const { workspaces, workspacesIsLoading, workspacesError, refetchWorkspaces } =
     useWorkspaceManager()
+  // For the overview table (only git config fields, least privilege)
+  const {
+    workspaces: gitLabWorkspaces,
+    workspacesIsLoading: gitLabWorkspacesIsLoading,
+    refetchWorkspaces: refetchGitLabWorkspaces,
+  } = useGitLabWorkspaceConfigs()
+
   const [selectedWorkspace, setSelectedWorkspace] =
     useState<WorkspaceRead | null>(null)
   const [pullDialogOpen, setPullDialogOpen] = useState(false)
@@ -93,6 +103,7 @@ export function GitLabWorkspaceSync() {
     selectedWorkspace?.id ?? "",
     () => {
       refetchWorkspaces()
+      refetchGitLabWorkspaces()
     }
   )
 
@@ -112,15 +123,12 @@ export function GitLabWorkspaceSync() {
     setSelectedWorkspace(workspace)
     form.setValue("workspace_id", workspaceId)
     form.setValue("git_repo_url", workspace?.settings?.git_repo_url ?? "")
-    // Set branch from connection status if available, otherwise default
+    // Set branch: stored git_branch > connection test default_branch > "main"
+    const storedBranch = workspace?.settings?.git_branch
     const status = connectionStatuses[workspaceId]
-    if (status?.data?.default_branch) {
-      setSelectedBranch(status.data.default_branch)
-      form.setValue("default_branch", status.data.default_branch)
-    } else {
-      setSelectedBranch("main")
-      form.setValue("default_branch", "main")
-    }
+    const branch = storedBranch ?? status?.data?.default_branch ?? "main"
+    setSelectedBranch(branch)
+    form.setValue("default_branch", branch)
   }
 
   const handleTestConnection = async () => {
@@ -174,8 +182,8 @@ export function GitLabWorkspaceSync() {
   }
 
   const handleTestWorkspaceConnection = useCallback(
-    (workspace: WorkspaceRead) => {
-      const gitRepoUrl = workspace.settings?.git_repo_url
+    (workspace: GitLabWorkspaceConfig) => {
+      const gitRepoUrl = workspace.git_repo_url
       if (!gitRepoUrl) return
 
       setConnectionStatuses((prev) => ({
@@ -211,14 +219,14 @@ export function GitLabWorkspaceSync() {
   )
 
   const handleTestAllConnections = useCallback(() => {
-    const workspacesWithUrls = workspaces?.filter(
-      (w) => w.settings?.git_repo_url
+    const workspacesWithUrls = gitLabWorkspaces?.filter(
+      (w) => w.git_repo_url
     ) ?? []
 
     for (const workspace of workspacesWithUrls) {
       handleTestWorkspaceConnection(workspace)
     }
-  }, [workspaces, handleTestWorkspaceConnection])
+  }, [gitLabWorkspaces, handleTestWorkspaceConnection])
 
   const onSubmit = async (values: GitLabWorkspaceSyncForm) => {
     if (!selectedWorkspace) return
@@ -226,6 +234,7 @@ export function GitLabWorkspaceSync() {
     await updateWorkspace({
       settings: {
         git_repo_url: values.git_repo_url,
+        git_branch: values.default_branch,
       },
     })
 
@@ -235,6 +244,7 @@ export function GitLabWorkspaceSync() {
       settings: {
         ...selectedWorkspace.settings,
         git_repo_url: values.git_repo_url,
+        git_branch: values.default_branch,
       },
     })
   }
@@ -259,9 +269,9 @@ export function GitLabWorkspaceSync() {
   const branches = currentConnectionStatus?.data?.branches ?? []
   const hasValidConnection = currentConnectionStatus?.status === "success"
 
-  // Get workspaces with configured Git URLs for the overview
-  const configuredWorkspaces = workspaces?.filter(
-    (w) => w.settings?.git_repo_url
+  // Get workspaces with configured Git URLs for the overview (using GitLab-specific endpoint)
+  const configuredWorkspaces = gitLabWorkspaces?.filter(
+    (w) => w.git_repo_url
   ) ?? []
 
   const getStatusIcon = (workspaceId: string) => {
@@ -324,7 +334,8 @@ export function GitLabWorkspaceSync() {
               <TableBody>
                 {configuredWorkspaces.map((workspace) => {
                   const status = connectionStatuses[workspace.id]
-                  const defaultBranch = status?.data?.default_branch
+                  // Show stored branch, or fall back to connection test default
+                  const branch = workspace.git_branch ?? status?.data?.default_branch
                   return (
                     <TableRow key={workspace.id}>
                       <TableCell className="font-medium">
@@ -335,21 +346,21 @@ export function GitLabWorkspaceSync() {
                           <Tooltip>
                             <TooltipTrigger asChild>
                               <span className="font-mono text-xs truncate max-w-[300px] block">
-                                {workspace.settings?.git_repo_url}
+                                {workspace.git_repo_url}
                               </span>
                             </TooltipTrigger>
                             <TooltipContent>
                               <p className="font-mono text-xs">
-                                {workspace.settings?.git_repo_url}
+                                {workspace.git_repo_url}
                               </p>
                             </TooltipContent>
                           </Tooltip>
                         </TooltipProvider>
                       </TableCell>
                       <TableCell>
-                        {defaultBranch ? (
+                        {branch ? (
                           <Badge variant="secondary" className="font-mono text-xs">
-                            {defaultBranch}
+                            {branch}
                           </Badge>
                         ) : (
                           <span className="text-xs text-muted-foreground">-</span>

@@ -2620,6 +2620,45 @@ export function useGitLabTestConnection() {
   }
 }
 
+export interface GitLabWorkspaceConfig {
+  id: string
+  name: string
+  git_repo_url: string | null
+  git_branch: string | null
+}
+
+export function useGitLabWorkspaceConfigs() {
+  const {
+    data: workspaces,
+    error: workspacesError,
+    isLoading: workspacesIsLoading,
+    refetch: refetchWorkspaces,
+  } = useQuery<GitLabWorkspaceConfig[]>({
+    queryKey: ["gitlab-workspace-configs"],
+    queryFn: async () => {
+      const response = await fetch("/api/organization/vcs/gitlab/workspaces", {
+        method: "GET",
+        credentials: "include",
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}))
+        throw new Error(errorData.detail || `HTTP error ${response.status}`)
+      }
+
+      return response.json()
+    },
+    staleTime: 2 * 60 * 1000, // 2 minutes
+  })
+
+  return {
+    workspaces,
+    workspacesError,
+    workspacesIsLoading,
+    refetchWorkspaces,
+  }
+}
+
 export function useOrgAgentSettings() {
   const queryClient = useQueryClient()
   // Get Agent settings

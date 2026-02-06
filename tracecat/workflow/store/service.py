@@ -63,8 +63,10 @@ class WorkflowStoreService(BaseWorkspaceService):
         )
 
         # Parse the Git URL using workspace settings
+        # Note: We don't restrict allowed_domains here as the URL has already been
+        # validated when saved to workspace settings, and we support multiple VCS providers
         try:
-            git_url = parse_git_url(git_repo_url, allowed_domains={"github.com"})
+            git_url = parse_git_url(git_repo_url)
         except ValueError as e:
             raise TracecatSettingsError(
                 f"Invalid Git repository URL configured for this workspace: {e}. "

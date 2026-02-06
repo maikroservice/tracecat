@@ -101,6 +101,31 @@ async def list_workspaces(
     return [WorkspaceReadMinimal(id=ws.id, name=ws.name) for ws in workspaces]
 
 
+@router.get("/with-settings")
+async def list_workspaces_with_settings(
+    *,
+    role: OrgAdminUser,
+    session: AsyncDBSession,
+) -> list[WorkspaceRead]:
+    """List all workspaces with their settings.
+
+    Access Level
+    ------------
+    - Admin only: Returns all workspaces with full settings for admin operations.
+    """
+    service = WorkspaceService(session, role=role)
+    workspaces = await service.admin_list_workspaces()
+    return [
+        WorkspaceRead(
+            id=ws.id,
+            name=ws.name,
+            settings=WorkspaceSettingsRead.model_validate(ws.settings),
+            organization_id=ws.organization_id,
+        )
+        for ws in workspaces
+    ]
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_workspace(
     *,

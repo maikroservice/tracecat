@@ -2620,6 +2620,38 @@ export function useGitLabTestConnection() {
   }
 }
 
+export function useWorkspacesWithSettings() {
+  const {
+    data: workspaces,
+    error: workspacesError,
+    isLoading: workspacesIsLoading,
+    refetch: refetchWorkspaces,
+  } = useQuery<WorkspaceRead[]>({
+    queryKey: ["workspaces-with-settings"],
+    queryFn: async () => {
+      const response = await fetch("/api/workspaces/with-settings", {
+        method: "GET",
+        credentials: "include",
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}))
+        throw new Error(errorData.detail || `HTTP error ${response.status}`)
+      }
+
+      return response.json()
+    },
+    staleTime: 2 * 60 * 1000, // 2 minutes
+  })
+
+  return {
+    workspaces,
+    workspacesError,
+    workspacesIsLoading,
+    refetchWorkspaces,
+  }
+}
+
 export function useOrgAgentSettings() {
   const queryClient = useQueryClient()
   // Get Agent settings

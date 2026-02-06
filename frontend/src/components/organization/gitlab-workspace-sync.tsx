@@ -60,8 +60,8 @@ import { validateGitLabUrl } from "@/lib/git"
 import {
   type GitLabTestConnectionResponse,
   useGitLabTestConnection,
-  useWorkspaceManager,
   useWorkspaceSettings,
+  useWorkspacesWithSettings,
 } from "@/lib/hooks"
 
 const gitlabWorkspaceSyncSchema = z.object({
@@ -82,7 +82,7 @@ type ConnectionStatusMap = Record<string, {
 
 export function GitLabWorkspaceSync() {
   const { workspaces, workspacesIsLoading, workspacesError, refetchWorkspaces } =
-    useWorkspaceManager()
+    useWorkspacesWithSettings()
   const [selectedWorkspace, setSelectedWorkspace] =
     useState<WorkspaceRead | null>(null)
   const [pullDialogOpen, setPullDialogOpen] = useState(false)

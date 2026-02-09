@@ -72,6 +72,9 @@ class PushOptions:
     author: Author
     """Author of the commit"""
 
+    branch: str | None = None
+    """Target branch for the push. If None, uses repository default branch."""
+
     create_pr: bool = False
     """Create a pull request if supported"""
 

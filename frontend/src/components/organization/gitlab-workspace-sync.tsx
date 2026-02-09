@@ -247,6 +247,9 @@ export function GitLabWorkspaceSync() {
         git_branch: values.default_branch,
       },
     })
+
+    // Refetch GitLab workspace configs to update the overview table immediately
+    refetchGitLabWorkspaces()
   }
 
   if (workspacesIsLoading) {

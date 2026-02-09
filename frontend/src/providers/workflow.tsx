@@ -43,6 +43,7 @@ type WorkflowContextType = {
   >
   publishWorkflow: MutateFunction<void, ApiError, WorkflowDslPublish, unknown>
   updateWorkflow: MutateFunction<void, ApiError, WorkflowUpdate, unknown>
+  isUpdatingWorkflow: boolean
   validationErrors: ValidationResult[] | null
   setValidationErrors: React.Dispatch<SetStateAction<ValidationResult[] | null>>
 }
@@ -191,7 +192,8 @@ export function WorkflowProvider({
     },
   })
 
-  const { mutateAsync: updateWorkflow } = useMutation({
+  const { mutateAsync: updateWorkflow, isPending: isUpdatingWorkflow } = useMutation({
+    mutationKey: ["updateWorkflow", workflowId],
     mutationFn: async (values: WorkflowUpdate) =>
       await workflowsUpdateWorkflow({
         workspaceId,
@@ -234,6 +236,7 @@ export function WorkflowProvider({
         commitWorkflow,
         publishWorkflow,
         updateWorkflow,
+        isUpdatingWorkflow,
         validationErrors,
         setValidationErrors,
       }}

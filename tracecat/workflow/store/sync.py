@@ -463,26 +463,40 @@ class WorkflowSyncService(BaseWorkspaceService):
         try:
             repo = await asyncio.to_thread(gh.get_repo, f"{url.org}/{url.repo}")
 
-            # Get base branch
-            base_branch_name = url.ref or repo.default_branch
+            # Get base branch (priority: options.branch > url.ref > repo default)
+            base_branch_name = options.branch or url.ref or repo.default_branch
             base_branch = await asyncio.to_thread(repo.get_branch, base_branch_name)
 
-            # Create feature branch
-            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            branch_name = f"tracecat-sync-{timestamp}"
+            # Use stable branch name per workflow (allows reusing existing PRs)
+            workflow_id = obj.data.id
+            branch_name = f"tracecat-sync/{workflow_id}"
 
-            logger.info(
-                "Creating branch via GitHub API",
-                branch=branch_name,
-                base_branch=base_branch_name,
-                repo=f"{url.org}/{url.repo}",
-            )
-
-            await asyncio.to_thread(
-                repo.create_git_ref,
-                ref=f"refs/heads/{branch_name}",
-                sha=base_branch.commit.sha,
-            )
+            # Check if branch already exists
+            branch_exists = False
+            try:
+                await asyncio.to_thread(repo.get_branch, branch_name)
+                branch_exists = True
+                logger.info(
+                    "Reusing existing branch via GitHub API",
+                    branch=branch_name,
+                    base_branch=base_branch_name,
+                    repo=f"{url.org}/{url.repo}",
+                )
+            except GithubException as e:
+                if e.status != 404:
+                    raise
+                # Branch doesn't exist, create it
+                logger.info(
+                    "Creating new branch via GitHub API",
+                    branch=branch_name,
+                    base_branch=base_branch_name,
+                    repo=f"{url.org}/{url.repo}",
+                )
+                await asyncio.to_thread(
+                    repo.create_git_ref,
+                    ref=f"refs/heads/{branch_name}",
+                    sha=base_branch.commit.sha,
+                )
 
             # Create/update workflow files via API
             file_path = obj.path_str
@@ -540,54 +554,79 @@ class WorkflowSyncService(BaseWorkspaceService):
             branch = await asyncio.to_thread(repo.get_branch, branch_name)
             commit_sha = branch.commit.sha
 
-            # Create PR if requested
+            # Create PR if requested (only if one doesn't already exist)
             pr_url = None
             if options.create_pr:
                 try:
-                    ws_svc = WorkspaceService(session=self.session)
-                    workspace = await ws_svc.get_workspace(self.workspace_id)
-                    if not workspace:
-                        raise TracecatNotFoundError("Workspace not found")
-
-                    try:
-                        title = obj.data.definition.title
-                        description = obj.data.definition.description
-                    except ValueError:
-                        title = "<An error occurred while determining the title>"
-                        description = (
-                            "<An error occurred while determining the description>"
-                        )
-
-                    try:
-                        current_user = await self.session.get(User, self.role.user_id)
-                    except Exception:
-                        current_user = None
-
-                    published_by = current_user.email if current_user else "<unknown>"
-
-                    pr = await asyncio.to_thread(
-                        repo.create_pull,
-                        title=options.message,
-                        body=(
-                            f"Automated workflow sync from Tracecat\n\n"
-                            f"**Workspace:** {workspace.name}\n"
-                            f"**Published by:** {published_by}\n"
-                            f"**Workflow Title:** {title}\n"
-                            f"**Workflow Description:** {description}"
-                        ),
-                        head=branch_name,
+                    # Check for existing open PR from this branch
+                    existing_prs = await asyncio.to_thread(
+                        repo.get_pulls,
+                        head=f"{url.org}:{branch_name}",
                         base=base_branch_name,
+                        state="open",
                     )
-                    pr_url = pr.html_url
+                    existing_pr_list = list(existing_prs)
 
-                    logger.info(
-                        "Created PR via GitHub API",
-                        pr_number=pr.number,
-                        pr_url=pr_url,
-                    )
+                    if existing_pr_list:
+                        # PR already exists, reuse it
+                        pr_url = existing_pr_list[0].html_url
+                        logger.info(
+                            "Reusing existing open PR via GitHub API",
+                            pr_number=existing_pr_list[0].number,
+                            pr_url=pr_url,
+                        )
+                    else:
+                        # No existing PR, create a new one
+                        ws_svc = WorkspaceService(session=self.session)
+                        workspace = await ws_svc.get_workspace(self.workspace_id)
+                        if not workspace:
+                            raise TracecatNotFoundError("Workspace not found")
+
+                        try:
+                            workflow_title = obj.data.definition.title
+                            workflow_description = obj.data.definition.description
+                        except ValueError:
+                            workflow_title = "<An error occurred while determining the title>"
+                            workflow_description = (
+                                "<An error occurred while determining the description>"
+                            )
+
+                        try:
+                            current_user = await self.session.get(User, self.role.user_id)
+                        except Exception:
+                            current_user = None
+
+                        published_by = current_user.email if current_user else "<unknown>"
+
+                        # Use workflow title in PR title for human readability
+                        pr_title = f"Publish workflow: {workflow_title}"
+                        if options.message:
+                            pr_title = f"{pr_title} - {options.message}"
+
+                        pr = await asyncio.to_thread(
+                            repo.create_pull,
+                            title=pr_title,
+                            body=(
+                                f"Automated workflow sync from Tracecat\n\n"
+                                f"**Workspace:** {workspace.name}\n"
+                                f"**Published by:** {published_by}\n"
+                                f"**Workflow ID:** {workflow_id}\n"
+                                f"**Workflow Title:** {workflow_title}\n"
+                                f"**Workflow Description:** {workflow_description}"
+                            ),
+                            head=branch_name,
+                            base=base_branch_name,
+                        )
+                        pr_url = pr.html_url
+
+                        logger.info(
+                            "Created PR via GitHub API",
+                            pr_number=pr.number,
+                            pr_url=pr_url,
+                        )
                 except GithubException as e:
                     logger.error(
-                        "Failed to create PR via GitHub API",
+                        "Failed to create/find PR via GitHub API",
                         error=str(e),
                         branch=branch_name,
                     )
@@ -635,25 +674,38 @@ class WorkflowSyncService(BaseWorkspaceService):
             project_path = f"{url.org}/{url.repo}"
             project = await asyncio.to_thread(gl.projects.get, project_path)
 
-            # Get base branch
-            base_branch_name = url.ref or project.default_branch
+            # Get base branch (priority: options.branch > url.ref > project default)
+            base_branch_name = options.branch or url.ref or project.default_branch
 
-            # Create feature branch
-            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-            branch_name = f"tracecat-sync-{timestamp}"
+            # Use stable branch name per workflow (allows reusing existing MRs)
+            workflow_id = obj.data.id
+            branch_name = f"tracecat-sync/{workflow_id}"
 
-            logger.info(
-                "Creating branch via GitLab API",
-                branch=branch_name,
-                base_branch=base_branch_name,
-                repo=project_path,
-            )
-
-            # Create branch from base
-            await asyncio.to_thread(
-                project.branches.create,
-                {"branch": branch_name, "ref": base_branch_name},
-            )
+            # Check if branch already exists
+            branch_exists = False
+            try:
+                await asyncio.to_thread(project.branches.get, branch_name)
+                branch_exists = True
+                logger.info(
+                    "Reusing existing branch via GitLab API",
+                    branch=branch_name,
+                    base_branch=base_branch_name,
+                    repo=project_path,
+                )
+            except GitlabError as e:
+                if "404" not in str(e):
+                    raise
+                # Branch doesn't exist, create it
+                logger.info(
+                    "Creating new branch via GitLab API",
+                    branch=branch_name,
+                    base_branch=base_branch_name,
+                    repo=project_path,
+                )
+                await asyncio.to_thread(
+                    project.branches.create,
+                    {"branch": branch_name, "ref": base_branch_name},
+                )
 
             # Create/update workflow file
             file_path = obj.path_str
@@ -706,56 +758,80 @@ class WorkflowSyncService(BaseWorkspaceService):
             )
             commit_sha = branch_obj.commit["id"]
 
-            # Create MR if requested
+            # Create MR if requested (only if one doesn't already exist)
             mr_url = None
             if options.create_pr:
                 try:
-                    ws_svc = WorkspaceService(session=self.session)
-                    workspace = await ws_svc.get_workspace(self.workspace_id)
-                    if not workspace:
-                        raise TracecatNotFoundError("Workspace not found")
+                    # Check for existing open MR from this branch
+                    existing_mrs = await asyncio.to_thread(
+                        project.mergerequests.list,
+                        source_branch=branch_name,
+                        target_branch=base_branch_name,
+                        state="opened",
+                    )
 
-                    try:
-                        title = obj.data.definition.title
-                        description = obj.data.definition.description
-                    except ValueError:
-                        title = "<An error occurred while determining the title>"
-                        description = (
-                            "<An error occurred while determining the description>"
+                    if existing_mrs:
+                        # MR already exists, reuse it
+                        mr_url = existing_mrs[0].web_url
+                        logger.info(
+                            "Reusing existing open MR via GitLab API",
+                            mr_iid=existing_mrs[0].iid,
+                            mr_url=mr_url,
                         )
+                    else:
+                        # No existing MR, create a new one
+                        ws_svc = WorkspaceService(session=self.session)
+                        workspace = await ws_svc.get_workspace(self.workspace_id)
+                        if not workspace:
+                            raise TracecatNotFoundError("Workspace not found")
 
-                    try:
-                        current_user = await self.session.get(User, self.role.user_id)
-                    except Exception:
-                        current_user = None
+                        try:
+                            workflow_title = obj.data.definition.title
+                            workflow_description = obj.data.definition.description
+                        except ValueError:
+                            workflow_title = "<An error occurred while determining the title>"
+                            workflow_description = (
+                                "<An error occurred while determining the description>"
+                            )
 
-                    published_by = current_user.email if current_user else "<unknown>"
+                        try:
+                            current_user = await self.session.get(User, self.role.user_id)
+                        except Exception:
+                            current_user = None
 
-                    mr = await asyncio.to_thread(
-                        project.mergerequests.create,
-                        {
-                            "source_branch": branch_name,
-                            "target_branch": base_branch_name,
-                            "title": options.message,
-                            "description": (
-                                f"Automated workflow sync from Tracecat\n\n"
-                                f"**Workspace:** {workspace.name}\n"
-                                f"**Published by:** {published_by}\n"
-                                f"**Workflow Title:** {title}\n"
-                                f"**Workflow Description:** {description}"
-                            ),
-                        },
-                    )
-                    mr_url = mr.web_url
+                        published_by = current_user.email if current_user else "<unknown>"
 
-                    logger.info(
-                        "Created MR via GitLab API",
-                        mr_iid=mr.iid,
-                        mr_url=mr_url,
-                    )
+                        # Use workflow title in MR title for human readability
+                        mr_title = f"Publish workflow: {workflow_title}"
+                        if options.message:
+                            mr_title = f"{mr_title} - {options.message}"
+
+                        mr = await asyncio.to_thread(
+                            project.mergerequests.create,
+                            {
+                                "source_branch": branch_name,
+                                "target_branch": base_branch_name,
+                                "title": mr_title,
+                                "description": (
+                                    f"Automated workflow sync from Tracecat\n\n"
+                                    f"**Workspace:** {workspace.name}\n"
+                                    f"**Published by:** {published_by}\n"
+                                    f"**Workflow ID:** {workflow_id}\n"
+                                    f"**Workflow Title:** {workflow_title}\n"
+                                    f"**Workflow Description:** {workflow_description}"
+                                ),
+                            },
+                        )
+                        mr_url = mr.web_url
+
+                        logger.info(
+                            "Created MR via GitLab API",
+                            mr_iid=mr.iid,
+                            mr_url=mr_url,
+                        )
                 except GitlabError as e:
                     logger.error(
-                        "Failed to create MR via GitLab API",
+                        "Failed to create/find MR via GitLab API",
                         error=str(e),
                         branch=branch_name,
                     )

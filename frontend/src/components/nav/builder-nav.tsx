@@ -1,6 +1,7 @@
 "use client"
 
 import { zodResolver } from "@hookform/resolvers/zod"
+import { useIsMutating } from "@tanstack/react-query"
 import {
   AlertTriangleIcon,
   ChevronDownIcon,
@@ -72,6 +73,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { ValidationErrorView } from "@/components/validation-errors"
 import { useFeatureFlag } from "@/hooks/use-feature-flags"
 import { useWorkspaceDetails } from "@/hooks/use-workspace"
+import { useGitLabCredentialsStatus } from "@/lib/hooks"
 import type { TracecatApiError } from "@/lib/errors"
 import {
   useCreateDraftWorkflowExecution,
@@ -87,6 +89,7 @@ export function BuilderNav() {
   const {
     workflow,
     isLoading: workflowLoading,
+    workflowId,
     commitWorkflow,
     publishWorkflow,
     validationErrors,
@@ -95,10 +98,25 @@ export function BuilderNav() {
 
   const workspaceId = useWorkspaceId()
   const { workspace, workspaceLoading } = useWorkspaceDetails()
+  const { credentialsStatus: gitLabCredentialsStatus } = useGitLabCredentialsStatus()
   const workflowTitle = workflow?.title ?? "Untitled workflow"
+
+  // Track if there are pending workflow updates (e.g., title/description changes)
+  const pendingUpdates = useIsMutating({
+    mutationKey: ["updateWorkflow", workflowId],
+  })
+  const hasPendingUpdates = pendingUpdates > 0
 
   const handleCommit = async () => {
     console.log("Saving changes...")
+
+    // If there are pending updates, wait a moment for them to complete
+    // This ensures title/description changes are saved to DB before committing
+    if (hasPendingUpdates) {
+      console.log("Waiting for pending updates to complete...")
+      await new Promise((resolve) => setTimeout(resolve, 500))
+    }
+
     try {
       const response = await commitWorkflow()
       const { status, errors } = response
@@ -106,6 +124,15 @@ export function BuilderNav() {
         setValidationErrors(errors || null)
       } else {
         setValidationErrors(null)
+        // If GitLab credentials are configured, also publish to Git
+        if (gitLabCredentialsStatus?.exists) {
+          console.log("Publishing to Git...")
+          try {
+            await publishWorkflow({})
+          } catch (publishError) {
+            console.error("Failed to publish workflow to Git:", publishError)
+          }
+        }
       }
     } catch (error) {
       console.error("Failed to save workflow:", error)
@@ -168,6 +195,7 @@ export function BuilderNav() {
           validationErrors={validationErrors}
           onSave={handleCommit}
           onPublish={publishWorkflow}
+          hasPendingUpdates={hasPendingUpdates}
         />
 
         {/* Workflow options */}
@@ -457,13 +485,16 @@ function WorkflowSaveActions({
   validationErrors,
   onSave,
   onPublish,
+  hasPendingUpdates = false,
 }: {
   workflow: { version?: number | null }
   validationErrors: ValidationResult[] | null
   onSave: () => Promise<void>
   onPublish: (params: { message?: string }) => Promise<void>
+  hasPendingUpdates?: boolean
 }) {
   const { isFeatureEnabled } = useFeatureFlag()
+  const { credentialsStatus: gitLabCredentialsStatus } = useGitLabCredentialsStatus()
   const [publishOpen, setPublishOpen] = React.useState(false)
   const [isPublishing, setIsPublishing] = React.useState(false)
 
@@ -485,7 +516,11 @@ function WorkflowSaveActions({
     }
   }
 
-  const isGitSyncEnabled = isFeatureEnabled("git-sync")
+  // Show Git publish dropdown if either:
+  // - GitHub git-sync feature is enabled (enterprise feature), OR
+  // - GitLab credentials are configured (always available)
+  const isGitSyncEnabled =
+    isFeatureEnabled("git-sync") || gitLabCredentialsStatus?.exists === true
 
   return (
     <div className="flex items-center space-x-2">
@@ -496,13 +531,16 @@ function WorkflowSaveActions({
           validationErrors={validationErrors || []}
           noErrorTooltip={
             <span>
-              Publish workflow v{(workflow.version || 0) + 1} with your changes.
+              {hasPendingUpdates
+                ? "Saving changes..."
+                : `Publish workflow v${(workflow.version || 0) + 1} with your changes.`}
             </span>
           }
         >
           <Button
             variant="outline"
             onClick={onSave}
+            disabled={hasPendingUpdates}
             className={cn(
               "h-full border-none px-3 py-0 text-xs text-muted-foreground",
               isGitSyncEnabled ? "rounded-r-none" : "rounded-lg",
@@ -515,7 +553,7 @@ function WorkflowSaveActions({
             ) : (
               <LayersPlusIcon className="mr-2 size-3.5" />
             )}
-            Publish
+            {hasPendingUpdates ? "Saving..." : "Publish"}
           </Button>
         </ValidationErrorView>
 

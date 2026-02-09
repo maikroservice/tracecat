@@ -55,10 +55,14 @@ class WorkflowStoreService(BaseWorkspaceService):
                 "Please contact your administrator to configure it."
             )
 
+        # Get the target branch from workspace settings (defaults to None, which uses repo default)
+        git_branch = workspace.settings.get("git_branch")
+
         logger.info(
             "Publishing workflow to store",
             workflow_title=dsl.title,
             repo_url=git_repo_url,
+            target_branch=git_branch or "(repo default)",
             workspace_id=self.workspace_id,
         )
 
@@ -115,6 +119,7 @@ class WorkflowStoreService(BaseWorkspaceService):
         push_options = PushOptions(
             message=params.message or f"Publish workflow: {dsl.title}",
             author=author,
+            branch=git_branch,  # Use branch from workspace settings
             create_pr=True,  # Create PR for review
         )
 

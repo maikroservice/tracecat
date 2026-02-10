@@ -2594,14 +2594,17 @@ export function useGitLabTestConnection() {
     { git_repo_url: string }
   >({
     mutationFn: async (data) => {
-      const response = await fetch("/api/organization/vcs/gitlab/test-connection", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        credentials: "include",
-        body: JSON.stringify(data),
-      })
+      const response = await fetch(
+        "/api/organization/vcs/gitlab/test-connection",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          credentials: "include",
+          body: JSON.stringify(data),
+        }
+      )
 
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}))

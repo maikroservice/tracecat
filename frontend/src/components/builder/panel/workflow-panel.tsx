@@ -18,6 +18,7 @@ import {
 } from "@/client"
 import { ControlledYamlField } from "@/components/builder/panel/action-panel-fields"
 import { CopyButton } from "@/components/copy-button"
+import { CodeEditor } from "@/components/editor/codemirror/code-editor"
 import { SimpleEditor } from "@/components/tiptap-templates/simple/simple-editor"
 import {
   Form,
@@ -33,7 +34,6 @@ import {
   HoverCardTrigger,
 } from "@/components/ui/hover-card"
 import { Input } from "@/components/ui/input"
-import { CodeEditor } from "@/components/editor/codemirror/code-editor"
 import { Separator } from "@/components/ui/separator"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
@@ -221,11 +221,13 @@ function WorkflowSettingsPanel({
     async (values: WorkflowUpdateForm) => {
       console.log("Saving changes...", values)
       try {
+        const { environment, timeout, ...rest } = values
         const updateData: WorkflowUpdate = {
-          ...values,
+          ...rest,
+          sample_data: rest.sample_data as WorkflowUpdate["sample_data"],
           config: {
-            environment: values.environment,
-            timeout: values.timeout,
+            environment,
+            timeout,
           },
         }
 
@@ -574,9 +576,9 @@ function WorkflowSettingsPanel({
                             </span>
                           </div>
                           <span className="text-muted-foreground">
-                            Sample input data for testing the workflow. This can be
-                            used to preview how the workflow will process example
-                            inputs.
+                            Sample input data for testing the workflow. This can
+                            be used to preview how the workflow will process
+                            example inputs.
                           </span>
                         </div>
                       </HoverCardContent>
@@ -586,11 +588,13 @@ function WorkflowSettingsPanel({
                   <FormControl>
                     <CodeEditor
                       language="json"
-                      value={field.value ? JSON.stringify(field.value, null, 2) : ""}
+                      value={
+                        field.value ? JSON.stringify(field.value, null, 2) : ""
+                      }
                       onChange={(value) => {
                         try {
-                          const parsed = JSON.parse(value);
-                          field.onChange(parsed);
+                          const parsed = JSON.parse(value)
+                          field.onChange(parsed)
                         } catch {
                           // Keep typing, don't update if invalid JSON
                         }

@@ -73,10 +73,10 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { ValidationErrorView } from "@/components/validation-errors"
 import { useFeatureFlag } from "@/hooks/use-feature-flags"
 import { useWorkspaceDetails } from "@/hooks/use-workspace"
-import { useGitLabCredentialsStatus } from "@/lib/hooks"
 import type { TracecatApiError } from "@/lib/errors"
 import {
   useCreateDraftWorkflowExecution,
+  useGitLabCredentialsStatus,
   useOrgAppSettings,
   useWorkflowManager,
 } from "@/lib/hooks"
@@ -98,7 +98,8 @@ export function BuilderNav() {
 
   const workspaceId = useWorkspaceId()
   const { workspace, workspaceLoading } = useWorkspaceDetails()
-  const { credentialsStatus: gitLabCredentialsStatus } = useGitLabCredentialsStatus()
+  const { credentialsStatus: gitLabCredentialsStatus } =
+    useGitLabCredentialsStatus()
   const workflowTitle = workflow?.title ?? "Untitled workflow"
 
   // Track if there are pending workflow updates (e.g., title/description changes)
@@ -494,7 +495,8 @@ function WorkflowSaveActions({
   hasPendingUpdates?: boolean
 }) {
   const { isFeatureEnabled } = useFeatureFlag()
-  const { credentialsStatus: gitLabCredentialsStatus } = useGitLabCredentialsStatus()
+  const { credentialsStatus: gitLabCredentialsStatus } =
+    useGitLabCredentialsStatus()
   const [publishOpen, setPublishOpen] = React.useState(false)
   const [isPublishing, setIsPublishing] = React.useState(false)
 

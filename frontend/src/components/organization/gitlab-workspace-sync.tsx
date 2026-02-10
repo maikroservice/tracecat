@@ -9,10 +9,10 @@ import {
   RefreshCwIcon,
   XCircleIcon,
 } from "lucide-react"
-import { useCallback, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { useForm } from "react-hook-form"
 import { z } from "zod"
-import type { WorkspaceRead } from "@/client"
+import type { WorkspaceReadMinimal } from "@/client"
 import { CenteredSpinner } from "@/components/loading/spinner"
 import { AlertNotification } from "@/components/notifications"
 import { WorkflowPullDialog } from "@/components/organization/workflow-pull-dialog"
@@ -77,32 +77,34 @@ const gitlabWorkspaceSyncSchema = z.object({
 
 type GitLabWorkspaceSyncForm = z.infer<typeof gitlabWorkspaceSyncSchema>
 
-type ConnectionStatusMap = Record<string, {
-  status: "idle" | "testing" | "success" | "error"
-  data?: GitLabTestConnectionResponse
-}>
+type ConnectionStatusMap = Record<
+  string,
+  {
+    status: "idle" | "testing" | "success" | "error"
+    data?: GitLabTestConnectionResponse
+  }
+>
 
 export function GitLabWorkspaceSync() {
   // For the form workspace selector (full workspace list)
-  const { workspaces, workspacesIsLoading, workspacesError, refetchWorkspaces } =
+  const { workspaces, workspacesLoading, workspacesError } =
     useWorkspaceManager()
   // For the overview table (only git config fields, least privilege)
   const {
     workspaces: gitLabWorkspaces,
-    workspacesIsLoading: gitLabWorkspacesIsLoading,
     refetchWorkspaces: refetchGitLabWorkspaces,
   } = useGitLabWorkspaceConfigs()
 
   const [selectedWorkspace, setSelectedWorkspace] =
-    useState<WorkspaceRead | null>(null)
+    useState<WorkspaceReadMinimal | null>(null)
   const [pullDialogOpen, setPullDialogOpen] = useState(false)
   const [selectedBranch, setSelectedBranch] = useState<string>("main")
-  const [connectionStatuses, setConnectionStatuses] = useState<ConnectionStatusMap>({})
+  const [connectionStatuses, setConnectionStatuses] =
+    useState<ConnectionStatusMap>({})
 
   const { updateWorkspace, isUpdating } = useWorkspaceSettings(
     selectedWorkspace?.id ?? "",
     () => {
-      refetchWorkspaces()
       refetchGitLabWorkspaces()
     }
   )
@@ -122,9 +124,11 @@ export function GitLabWorkspaceSync() {
     const workspace = workspaces?.find((w) => w.id === workspaceId) ?? null
     setSelectedWorkspace(workspace)
     form.setValue("workspace_id", workspaceId)
-    form.setValue("git_repo_url", workspace?.settings?.git_repo_url ?? "")
+    // Get git settings from the GitLab workspace configs (least privilege)
+    const gitConfig = gitLabWorkspaces?.find((w) => w.id === workspaceId)
+    form.setValue("git_repo_url", gitConfig?.git_repo_url ?? "")
     // Set branch: stored git_branch > connection test default_branch > "main"
-    const storedBranch = workspace?.settings?.git_branch
+    const storedBranch = gitConfig?.git_branch
     const status = connectionStatuses[workspaceId]
     const branch = storedBranch ?? status?.data?.default_branch ?? "main"
     setSelectedBranch(branch)
@@ -173,7 +177,12 @@ export function GitLabWorkspaceSync() {
             ...prev,
             [workspaceId]: {
               status: "error",
-              data: { success: false, branches: [], branch_count: 0, error: "Connection failed" },
+              data: {
+                success: false,
+                branches: [],
+                branch_count: 0,
+                error: "Connection failed",
+              },
             },
           }))
         },
@@ -208,7 +217,12 @@ export function GitLabWorkspaceSync() {
               ...prev,
               [workspace.id]: {
                 status: "error",
-                data: { success: false, branches: [], branch_count: 0, error: "Connection failed" },
+                data: {
+                  success: false,
+                  branches: [],
+                  branch_count: 0,
+                  error: "Connection failed",
+                },
               },
             }))
           },
@@ -219,14 +233,29 @@ export function GitLabWorkspaceSync() {
   )
 
   const handleTestAllConnections = useCallback(() => {
-    const workspacesWithUrls = gitLabWorkspaces?.filter(
-      (w) => w.git_repo_url
-    ) ?? []
+    const workspacesWithUrls =
+      gitLabWorkspaces?.filter((w) => w.git_repo_url) ?? []
 
     for (const workspace of workspacesWithUrls) {
       handleTestWorkspaceConnection(workspace)
     }
   }, [gitLabWorkspaces, handleTestWorkspaceConnection])
+
+  // Auto-check all connections 10s after the page loads and workspace configs are available
+  const hasAutoChecked = useRef(false)
+  useEffect(() => {
+    if (hasAutoChecked.current) return
+    const workspacesWithUrls =
+      gitLabWorkspaces?.filter((w) => w.git_repo_url) ?? []
+    if (workspacesWithUrls.length === 0) return
+
+    hasAutoChecked.current = true
+    const timer = setTimeout(() => {
+      handleTestAllConnections()
+    }, 10_000)
+
+    return () => clearTimeout(timer)
+  }, [gitLabWorkspaces, handleTestAllConnections])
 
   const onSubmit = async (values: GitLabWorkspaceSyncForm) => {
     if (!selectedWorkspace) return
@@ -238,21 +267,11 @@ export function GitLabWorkspaceSync() {
       },
     })
 
-    // Update local state
-    setSelectedWorkspace({
-      ...selectedWorkspace,
-      settings: {
-        ...selectedWorkspace.settings,
-        git_repo_url: values.git_repo_url,
-        git_branch: values.default_branch,
-      },
-    })
-
     // Refetch GitLab workspace configs to update the overview table immediately
     refetchGitLabWorkspaces()
   }
 
-  if (workspacesIsLoading) {
+  if (workspacesLoading) {
     return <CenteredSpinner />
   }
 
@@ -265,7 +284,10 @@ export function GitLabWorkspaceSync() {
     )
   }
 
-  const currentGitRepoUrl = selectedWorkspace?.settings?.git_repo_url
+  const currentGitConfig = selectedWorkspace
+    ? gitLabWorkspaces?.find((w) => w.id === selectedWorkspace.id)
+    : undefined
+  const currentGitRepoUrl = currentGitConfig?.git_repo_url
   const currentConnectionStatus = selectedWorkspace
     ? connectionStatuses[selectedWorkspace.id]
     : undefined
@@ -273,9 +295,8 @@ export function GitLabWorkspaceSync() {
   const hasValidConnection = currentConnectionStatus?.status === "success"
 
   // Get workspaces with configured Git URLs for the overview (using GitLab-specific endpoint)
-  const configuredWorkspaces = gitLabWorkspaces?.filter(
-    (w) => w.git_repo_url
-  ) ?? []
+  const configuredWorkspaces =
+    gitLabWorkspaces?.filter((w) => w.git_repo_url) ?? []
 
   const getStatusIcon = (workspaceId: string) => {
     const status = connectionStatuses[workspaceId]
@@ -318,7 +339,9 @@ export function GitLabWorkspaceSync() {
                 onClick={handleTestAllConnections}
                 disabled={isTestingConnection}
               >
-                <RefreshCwIcon className={`mr-2 size-4 ${isTestingConnection ? "animate-spin" : ""}`} />
+                <RefreshCwIcon
+                  className={`mr-2 size-4 ${isTestingConnection ? "animate-spin" : ""}`}
+                />
                 Test all connections
               </Button>
             </div>
@@ -338,7 +361,8 @@ export function GitLabWorkspaceSync() {
                 {configuredWorkspaces.map((workspace) => {
                   const status = connectionStatuses[workspace.id]
                   // Show stored branch, or fall back to connection test default
-                  const branch = workspace.git_branch ?? status?.data?.default_branch
+                  const branch =
+                    workspace.git_branch ?? status?.data?.default_branch
                   return (
                     <TableRow key={workspace.id}>
                       <TableCell className="font-medium">
@@ -362,11 +386,16 @@ export function GitLabWorkspaceSync() {
                       </TableCell>
                       <TableCell>
                         {branch ? (
-                          <Badge variant="secondary" className="font-mono text-xs">
+                          <Badge
+                            variant="secondary"
+                            className="font-mono text-xs"
+                          >
                             {branch}
                           </Badge>
                         ) : (
-                          <span className="text-xs text-muted-foreground">-</span>
+                          <span className="text-xs text-muted-foreground">
+                            -
+                          </span>
                         )}
                       </TableCell>
                       <TableCell>
@@ -381,10 +410,16 @@ export function GitLabWorkspaceSync() {
                         <Button
                           variant="ghost"
                           size="sm"
-                          onClick={() => handleTestWorkspaceConnection(workspace)}
-                          disabled={connectionStatuses[workspace.id]?.status === "testing"}
+                          onClick={() =>
+                            handleTestWorkspaceConnection(workspace)
+                          }
+                          disabled={
+                            connectionStatuses[workspace.id]?.status ===
+                            "testing"
+                          }
                         >
-                          {connectionStatuses[workspace.id]?.status === "testing" ? (
+                          {connectionStatuses[workspace.id]?.status ===
+                          "testing" ? (
                             <Loader2Icon className="size-4 animate-spin" />
                           ) : (
                             <RefreshCwIcon className="size-4" />
@@ -529,13 +564,20 @@ export function GitLabWorkspaceSync() {
                           </h4>
                           {currentConnectionStatus.data.success ? (
                             <div className="mt-1 text-sm text-green-700 dark:text-green-300 space-y-1">
-                              <p>Project: {currentConnectionStatus.data.project_name}</p>
                               <p>
-                                Default branch: {currentConnectionStatus.data.default_branch}
+                                Project:{" "}
+                                {currentConnectionStatus.data.project_name}
                               </p>
                               <p>
-                                {currentConnectionStatus.data.branch_count} branch
-                                {currentConnectionStatus.data.branch_count !== 1 ? "es" : ""}{" "}
+                                Default branch:{" "}
+                                {currentConnectionStatus.data.default_branch}
+                              </p>
+                              <p>
+                                {currentConnectionStatus.data.branch_count}{" "}
+                                branch
+                                {currentConnectionStatus.data.branch_count !== 1
+                                  ? "es"
+                                  : ""}{" "}
                                 available
                               </p>
                             </div>
@@ -573,7 +615,9 @@ export function GitLabWorkspaceSync() {
                               {branches.map((branch) => (
                                 <SelectItem key={branch} value={branch}>
                                   {branch}
-                                  {branch === currentConnectionStatus?.data?.default_branch && (
+                                  {branch ===
+                                    currentConnectionStatus?.data
+                                      ?.default_branch && (
                                     <span className="ml-2 text-xs text-muted-foreground">
                                       (default)
                                     </span>
@@ -648,7 +692,7 @@ export function GitLabWorkspaceSync() {
               open={pullDialogOpen}
               onOpenChange={setPullDialogOpen}
               workspaceId={selectedWorkspace.id}
-              gitRepoUrl={currentGitRepoUrl}
+              gitRepoUrl={currentGitRepoUrl ?? undefined}
             />
           )}
         </CardContent>

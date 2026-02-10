@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections.abc import Sequence
-from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
@@ -472,10 +471,10 @@ class WorkflowSyncService(BaseWorkspaceService):
             branch_name = f"tracecat-sync/{workflow_id}"
 
             # Check if branch already exists
-            branch_exists = False
+            branch_exists = False  # noqa: F841
             try:
                 await asyncio.to_thread(repo.get_branch, branch_name)
-                branch_exists = True
+                branch_exists = True  # noqa: F841
                 logger.info(
                     "Reusing existing branch via GitHub API",
                     branch=branch_name,
@@ -586,17 +585,23 @@ class WorkflowSyncService(BaseWorkspaceService):
                             workflow_title = obj.data.definition.title
                             workflow_description = obj.data.definition.description
                         except ValueError:
-                            workflow_title = "<An error occurred while determining the title>"
+                            workflow_title = (
+                                "<An error occurred while determining the title>"
+                            )
                             workflow_description = (
                                 "<An error occurred while determining the description>"
                             )
 
                         try:
-                            current_user = await self.session.get(User, self.role.user_id)
+                            current_user = await self.session.get(
+                                User, self.role.user_id
+                            )
                         except Exception:
                             current_user = None
 
-                        published_by = current_user.email if current_user else "<unknown>"
+                        published_by = (
+                            current_user.email if current_user else "<unknown>"
+                        )
 
                         # Use workflow title in PR title for human readability
                         pr_title = f"Publish workflow: {workflow_title}"
@@ -682,10 +687,10 @@ class WorkflowSyncService(BaseWorkspaceService):
             branch_name = f"tracecat-sync/{workflow_id}"
 
             # Check if branch already exists
-            branch_exists = False
+            branch_exists = False  # noqa: F841
             try:
                 await asyncio.to_thread(project.branches.get, branch_name)
-                branch_exists = True
+                branch_exists = True  # noqa: F841
                 logger.info(
                     "Reusing existing branch via GitLab API",
                     branch=branch_name,
@@ -753,9 +758,7 @@ class WorkflowSyncService(BaseWorkspaceService):
                     raise
 
             # Get the latest commit SHA from the branch
-            branch_obj = await asyncio.to_thread(
-                project.branches.get, branch_name
-            )
+            branch_obj = await asyncio.to_thread(project.branches.get, branch_name)
             commit_sha = branch_obj.commit["id"]
 
             # Create MR if requested (only if one doesn't already exist)
@@ -789,17 +792,23 @@ class WorkflowSyncService(BaseWorkspaceService):
                             workflow_title = obj.data.definition.title
                             workflow_description = obj.data.definition.description
                         except ValueError:
-                            workflow_title = "<An error occurred while determining the title>"
+                            workflow_title = (
+                                "<An error occurred while determining the title>"
+                            )
                             workflow_description = (
                                 "<An error occurred while determining the description>"
                             )
 
                         try:
-                            current_user = await self.session.get(User, self.role.user_id)
+                            current_user = await self.session.get(
+                                User, self.role.user_id
+                            )
                         except Exception:
                             current_user = None
 
-                        published_by = current_user.email if current_user else "<unknown>"
+                        published_by = (
+                            current_user.email if current_user else "<unknown>"
+                        )
 
                         # Use workflow title in MR title for human readability
                         mr_title = f"Publish workflow: {workflow_title}"

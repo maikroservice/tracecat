@@ -192,38 +192,39 @@ export function WorkflowProvider({
     },
   })
 
-  const { mutateAsync: updateWorkflow, isPending: isUpdatingWorkflow } = useMutation({
-    mutationKey: ["updateWorkflow", workflowId],
-    mutationFn: async (values: WorkflowUpdate) =>
-      await workflowsUpdateWorkflow({
-        workspaceId,
-        workflowId,
-        requestBody: values,
-      }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["workflow", workflowId] })
-    },
-    onError: (error: TracecatApiError) => {
-      console.error("Failed to update workflow:", error)
-      switch (error.status) {
-        case 409:
-          toast({
-            title: "Failed to update workflow",
-            description:
-              String(error.body.detail) ||
-              "There was a conflict updating the workflow. Please try again.",
-          })
-          break
-        default:
-          toast({
-            title: "Failed to update workflow",
-            description:
-              String(error.body.detail) ||
-              "Could not update workflow. Please the logs for more details.",
-          })
-      }
-    },
-  })
+  const { mutateAsync: updateWorkflow, isPending: isUpdatingWorkflow } =
+    useMutation({
+      mutationKey: ["updateWorkflow", workflowId],
+      mutationFn: async (values: WorkflowUpdate) =>
+        await workflowsUpdateWorkflow({
+          workspaceId,
+          workflowId,
+          requestBody: values,
+        }),
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: ["workflow", workflowId] })
+      },
+      onError: (error: TracecatApiError) => {
+        console.error("Failed to update workflow:", error)
+        switch (error.status) {
+          case 409:
+            toast({
+              title: "Failed to update workflow",
+              description:
+                String(error.body.detail) ||
+                "There was a conflict updating the workflow. Please try again.",
+            })
+            break
+          default:
+            toast({
+              title: "Failed to update workflow",
+              description:
+                String(error.body.detail) ||
+                "Could not update workflow. Please the logs for more details.",
+            })
+        }
+      },
+    })
 
   return (
     <WorkflowContext.Provider

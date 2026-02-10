@@ -11,12 +11,12 @@ from sqlalchemy.orm import noload
 from tracecat.auth.dependencies import OrgAdminUser
 from tracecat.db.dependencies import AsyncDBSession
 from tracecat.db.models import Workspace
+from tracecat.git.utils import parse_git_url
 from tracecat.logger import logger
 from tracecat.vcs.github.app import GitHubAppError, GitHubAppService
 from tracecat.vcs.github.flows import handle_manifest_conversion
 from tracecat.vcs.github.manifest import generate_github_app_manifest
 from tracecat.vcs.gitlab.service import GitLabError, GitLabService
-from tracecat.git.utils import parse_git_url
 from tracecat.vcs.schemas import (
     GitHubAppCredentialsRequest,
     GitHubAppCredentialsStatus,

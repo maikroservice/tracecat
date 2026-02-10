@@ -35,6 +35,7 @@ const secretTypeLabels: Record<SecretReadMinimal["type"], string> = {
   mtls: "mTLS",
   "ca-cert": "CA certificate",
   "github-app": "GitHub app",
+  "gitlab-token": "GitLab token",
 }
 
 export function WorkspaceSecretsTable() {

@@ -246,15 +246,21 @@ import {
   type VariableUpdate,
   type VcsGetGithubAppCredentialsStatusResponse,
   type VcsGetGithubAppManifestResponse,
+  type VcsGetGitlabCredentialsStatusResponse,
   type VcsSaveGithubAppCredentialsData,
   type VcsSaveGithubAppCredentialsResponse,
+  type VcsSaveGitlabCredentialsData,
+  type VcsSaveGitlabCredentialsResponse,
   variablesCreateVariable,
   variablesDeleteVariableById,
   variablesListVariables,
   variablesUpdateVariableById,
+  vcsDeleteGitlabCredentials,
   vcsGetGithubAppCredentialsStatus,
   vcsGetGithubAppManifest,
+  vcsGetGitlabCredentialsStatus,
   vcsSaveGithubAppCredentials,
+  vcsSaveGitlabCredentials,
   type WebhookUpdate,
   type WorkflowDirectoryItem,
   type WorkflowExecutionCreate,
@@ -2510,6 +2516,146 @@ export function useGitHubAppCredentials() {
 
   return {
     saveCredentials,
+  }
+}
+
+export function useGitLabCredentialsStatus() {
+  // Get GitLab credentials status
+  const {
+    data: credentialsStatus,
+    isLoading: credentialsStatusIsLoading,
+    error: credentialsStatusError,
+    refetch: refetchCredentialsStatus,
+  } = useQuery<VcsGetGitlabCredentialsStatusResponse>({
+    queryKey: ["gitlab-credentials-status"],
+    queryFn: async () => await vcsGetGitlabCredentialsStatus(),
+  })
+
+  return {
+    credentialsStatus,
+    credentialsStatusIsLoading,
+    credentialsStatusError,
+    refetchCredentialsStatus,
+  }
+}
+
+export function useGitLabCredentials() {
+  const queryClient = useQueryClient()
+
+  // Save GitLab credentials mutation
+  const saveCredentials = useMutation<
+    VcsSaveGitlabCredentialsResponse,
+    ApiError,
+    VcsSaveGitlabCredentialsData["requestBody"]
+  >({
+    mutationFn: async (data) => {
+      return await vcsSaveGitlabCredentials({ requestBody: data })
+    },
+    onSuccess: () => {
+      // Invalidate and refetch credentials status
+      queryClient.invalidateQueries({
+        queryKey: ["gitlab-credentials-status"],
+      })
+    },
+  })
+
+  // Delete GitLab credentials mutation
+  const deleteCredentials = useMutation<void, ApiError>({
+    mutationFn: async () => {
+      await vcsDeleteGitlabCredentials()
+    },
+    onSuccess: () => {
+      // Invalidate and refetch credentials status
+      queryClient.invalidateQueries({
+        queryKey: ["gitlab-credentials-status"],
+      })
+    },
+  })
+
+  return {
+    saveCredentials,
+    deleteCredentials,
+  }
+}
+
+export interface GitLabTestConnectionResponse {
+  success: boolean
+  project_name?: string | null
+  default_branch?: string | null
+  branches: string[]
+  branch_count: number
+  error?: string | null
+}
+
+export function useGitLabTestConnection() {
+  const testConnection = useMutation<
+    GitLabTestConnectionResponse,
+    ApiError,
+    { git_repo_url: string }
+  >({
+    mutationFn: async (data) => {
+      const response = await fetch("/api/organization/vcs/gitlab/test-connection", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        credentials: "include",
+        body: JSON.stringify(data),
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}))
+        throw new Error(errorData.detail || `HTTP error ${response.status}`)
+      }
+
+      return response.json()
+    },
+  })
+
+  return {
+    testConnection,
+    isTestingConnection: testConnection.isPending,
+    testConnectionError: testConnection.error,
+    testConnectionData: testConnection.data,
+  }
+}
+
+export interface GitLabWorkspaceConfig {
+  id: string
+  name: string
+  git_repo_url: string | null
+  git_branch: string | null
+}
+
+export function useGitLabWorkspaceConfigs() {
+  const {
+    data: workspaces,
+    error: workspacesError,
+    isLoading: workspacesIsLoading,
+    refetch: refetchWorkspaces,
+  } = useQuery<GitLabWorkspaceConfig[]>({
+    queryKey: ["gitlab-workspace-configs"],
+    queryFn: async () => {
+      const response = await fetch("/api/organization/vcs/gitlab/workspaces", {
+        method: "GET",
+        credentials: "include",
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}))
+        throw new Error(errorData.detail || `HTTP error ${response.status}`)
+      }
+
+      return response.json()
+    },
+    staleTime: 2 * 60 * 1000, // 2 minutes
+  })
+
+  return {
+    workspaces,
+    workspacesError,
+    workspacesIsLoading,
+    refetchWorkspaces,
   }
 }
 

@@ -98,6 +98,7 @@ from tracecat.tables.internal_router import router as internal_tables_router
 from tracecat.tables.router import router as tables_router
 from tracecat.tags.router import router as tags_router
 from tracecat.variables.router import router as variables_router
+from tracecat.vcs.router import gitlab_org_router as gitlab_vcs_router
 from tracecat.vcs.router import org_router as vcs_router
 from tracecat.webhooks.router import router as webhook_router
 from tracecat.workflow.actions.router import router as workflow_actions_router
@@ -367,6 +368,8 @@ def create_app(**kwargs) -> FastAPI:
         vcs_router,
         dependencies=[Depends(feature_flag_dep(FeatureFlag.GIT_SYNC))],
     )
+    # GitLab VCS router is always available (not gated by git-sync feature flag)
+    app.include_router(gitlab_vcs_router)
     app.include_router(
         fastapi_users.get_users_router(UserRead, UserUpdate),
         prefix="/users",

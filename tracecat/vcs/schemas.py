@@ -41,3 +41,56 @@ class GitHubAppManifestResponse(BaseModel):
 
     manifest: GitHubAppManifest
     instructions: list[str]
+
+
+# GitLab schemas
+
+
+class GitLabCredentialsRequest(BaseModel):
+    """Request to register or update GitLab credentials."""
+
+    access_token: SecretStr = Field(
+        ..., description="GitLab Group Access Token or Personal Access Token"
+    )
+    gitlab_url: str = Field(
+        default="https://gitlab.com",
+        description="GitLab instance URL (for self-hosted instances)",
+    )
+
+
+class GitLabCredentialsStatus(BaseModel):
+    """Status of GitLab credentials."""
+
+    exists: bool
+    gitlab_url: str | None = None
+    created_at: str | None = None
+
+
+class GitLabTestConnectionRequest(BaseModel):
+    """Request to test GitLab repository connection."""
+
+    git_repo_url: str = Field(..., description="GitLab repository URL to test")
+
+
+class GitLabTestConnectionResponse(BaseModel):
+    """Response from GitLab connection test."""
+
+    success: bool
+    project_name: str | None = None
+    default_branch: str | None = None
+    branches: list[str] = Field(default_factory=list)
+    branch_count: int = 0
+    error: str | None = None
+
+
+class GitLabWorkspaceConfig(BaseModel):
+    """Minimal workspace info with git configuration for GitLab integration.
+
+    Used by GitLab VCS integration to show workspace git settings
+    without exposing other workspace configuration.
+    """
+
+    id: str = Field(..., description="Workspace ID")
+    name: str = Field(..., description="Workspace name")
+    git_repo_url: str | None = Field(None, description="Git repository URL")
+    git_branch: str | None = Field(None, description="Git branch for workflow sync")

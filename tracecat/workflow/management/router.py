@@ -307,6 +307,7 @@ async def get_workflow(
         schedules=ScheduleRead.list_adapter().validate_python(workflow.schedules),
         alias=workflow.alias,
         error_handler=workflow.error_handler,
+        sample_data=workflow.sample_data,
         trigger_position_x=workflow.trigger_position_x,
         trigger_position_y=workflow.trigger_position_y,
         graph_version=workflow.graph_version,

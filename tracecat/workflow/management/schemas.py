@@ -41,6 +41,7 @@ class WorkflowRead(Schema):
     config: DSLConfig | None
     alias: str | None = None
     error_handler: str | None = None
+    sample_data: dict[str, Any] | None = None
     trigger_position_x: float = 0.0
     trigger_position_y: float = 0.0
     graph_version: int = 1
@@ -103,6 +104,10 @@ class WorkflowUpdate(BaseModel):
     config: DSLConfig | None = None
     alias: str | None = None
     error_handler: str | None = None
+    sample_data: dict[str, Any] | None = Field(
+        default=None,
+        description="Sample input data for testing the workflow",
+    )
 
 
 class WorkflowCreate(BaseModel):

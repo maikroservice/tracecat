@@ -8,7 +8,7 @@ from tracecat import config
 from tracecat.auth.schemas import UserRole
 from tracecat.authz.enums import WorkspaceRole
 from tracecat.core.schemas import Schema
-from tracecat.git.constants import GIT_SSH_URL_REGEX
+from tracecat.git.constants import GIT_HTTPS_URL_REGEX, GIT_SSH_URL_REGEX
 from tracecat.identifiers import OrganizationID, UserID, WorkspaceID
 
 # === Workspace === #
@@ -17,6 +17,7 @@ from tracecat.identifiers import OrganizationID, UserID, WorkspaceID
 # DTO
 class WorkspaceSettings(TypedDict):
     git_repo_url: NotRequired[str | None]
+    git_branch: NotRequired[str | None]
     workflow_unlimited_timeout_enabled: NotRequired[bool | None]
     workflow_default_timeout_seconds: NotRequired[int | None]
     allowed_attachment_extensions: NotRequired[list[str] | None]
@@ -27,6 +28,7 @@ class WorkspaceSettings(TypedDict):
 # Schema
 class WorkspaceSettingsRead(Schema):
     git_repo_url: str | None = None
+    git_branch: str | None = None
     workflow_unlimited_timeout_enabled: bool | None = None
     workflow_default_timeout_seconds: int | None = None
     allowed_attachment_extensions: list[str] | None = None
@@ -52,6 +54,10 @@ class WorkspaceSettingsRead(Schema):
 
 class WorkspaceSettingsUpdate(Schema):
     git_repo_url: str | None = None
+    git_branch: str | None = Field(
+        default=None,
+        description="Git branch to use for workflow sync (e.g., 'main', 'develop').",
+    )
     workflow_unlimited_timeout_enabled: bool | None = Field(
         default=None,
         description="Allow workflows to run indefinitely without timeout constraints. When enabled, individual workflow timeout settings are ignored.",
@@ -77,13 +83,14 @@ class WorkspaceSettingsUpdate(Schema):
     @field_validator("git_repo_url", mode="before")
     @classmethod
     def validate_git_repo_url(cls, value: str | None) -> str | None:
-        """Ensure workspace git repo URLs use the shared Git SSH format."""
+        """Ensure workspace git repo URLs use a valid Git URL format."""
         if value is None:
             return value
 
-        if not GIT_SSH_URL_REGEX.match(value):
+        # Accept both SSH and HTTPS URLs
+        if not GIT_SSH_URL_REGEX.match(value) and not GIT_HTTPS_URL_REGEX.match(value):
             raise ValueError(
-                "Must be a valid Git SSH URL (e.g., git+ssh://git@github.com/org/repo.git)"
+                "Must be a valid Git URL (e.g., git+ssh://git@github.com/org/repo.git or https://gitlab.com/org/repo.git)"
             )
 
         return value

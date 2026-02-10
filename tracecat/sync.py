@@ -72,6 +72,9 @@ class PushOptions:
     author: Author
     """Author of the commit"""
 
+    branch: str | None = None
+    """Target branch for the push. If None, uses repository default branch."""
+
     create_pr: bool = False
     """Create a pull request if supported"""
 
@@ -106,10 +109,11 @@ class PullDiagnostic:
         "dependency",
         "parse",
         "github",
+        "gitlab",
         "system",
         "transaction",
     ]
-    """Type of error: 'conflict', 'validation', 'dependency', 'parse', 'github', 'system', 'transaction'"""
+    """Type of error: 'conflict', 'validation', 'dependency', 'parse', 'github', 'gitlab', 'system', 'transaction'"""
 
     message: str
     """Human-readable error message"""

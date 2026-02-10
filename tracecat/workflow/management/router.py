@@ -27,7 +27,11 @@ from tracecat.db.dependencies import AsyncDBSession
 from tracecat.db.models import Webhook, WebhookApiKey, Workflow
 from tracecat.dsl.common import DSLInput
 from tracecat.dsl.schemas import DSLConfig
-from tracecat.exceptions import TracecatNotFoundError, TracecatValidationError
+from tracecat.exceptions import (
+    TracecatAuthorizationError,
+    TracecatNotFoundError,
+    TracecatValidationError,
+)
 from tracecat.identifiers.workflow import AnyWorkflowIDPath, WorkflowUUID
 from tracecat.logger import logger
 from tracecat.pagination import CursorPaginatedResponse, CursorPaginationParams
@@ -163,6 +167,7 @@ def wfs_and_defns_to_response(
                 error_handler=workflow.error_handler,
                 latest_definition=latest_defn,
                 folder_id=workflow.folder_id,
+                created_by=workflow.created_by,
             )
         )
     return res
@@ -259,6 +264,7 @@ async def create_workflow(
         updated_at=workflow.updated_at,
         version=workflow.version,
         error_handler=workflow.error_handler,
+        created_by=workflow.created_by,
     )
 
 
@@ -313,6 +319,7 @@ async def get_workflow(
         graph_version=workflow.graph_version,
         folder_id=workflow.folder_id,
         folder_path=workflow.folder.path if workflow.folder else None,
+        created_by=workflow.created_by,
     )
 
 
@@ -367,6 +374,8 @@ async def delete_workflow(
     service = WorkflowsManagementService(session, role=role)
     try:
         await service.delete_workflow(workflow_id)
+    except TracecatAuthorizationError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e)) from e
     except NoResultFound as e:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Resource not found"

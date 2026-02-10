@@ -311,6 +311,8 @@ async def get_workflow(
         trigger_position_x=workflow.trigger_position_x,
         trigger_position_y=workflow.trigger_position_y,
         graph_version=workflow.graph_version,
+        folder_id=workflow.folder_id,
+        folder_path=workflow.folder.path if workflow.folder else None,
     )
 
 

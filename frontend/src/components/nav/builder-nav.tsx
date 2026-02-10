@@ -85,6 +85,23 @@ import { useWorkflowBuilder } from "@/providers/builder"
 import { useWorkflow } from "@/providers/workflow"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
+/**
+ * Parse a materialized folder path (e.g. "/parent/child/") into breadcrumb segments.
+ * Each segment includes the folder name and the full path up to that point.
+ */
+function getFolderSegments(
+  folderPath: string
+): Array<{ name: string; path: string }> {
+  const parts = folderPath.split("/").filter(Boolean)
+  const segments: Array<{ name: string; path: string }> = []
+  let accumulated = "/"
+  for (const part of parts) {
+    accumulated += `${part}/`
+    segments.push({ name: part, path: accumulated })
+  }
+  return segments
+}
+
 export function BuilderNav() {
   const {
     workflow,
@@ -159,6 +176,24 @@ export function BuilderNav() {
                 </Link>
               </BreadcrumbLink>
             </BreadcrumbItem>
+            {/* Folder breadcrumb segments */}
+            {workflow.folder_path &&
+              getFolderSegments(workflow.folder_path).map((segment) => (
+                <React.Fragment key={segment.path}>
+                  <BreadcrumbSeparator className="shrink-0 font-semibold">
+                    {"/"}
+                  </BreadcrumbSeparator>
+                  <BreadcrumbItem>
+                    <BreadcrumbLink asChild>
+                      <Link
+                        href={`/workspaces/${workspaceId}/workflows?path=${encodeURIComponent(segment.path)}`}
+                      >
+                        {segment.name}
+                      </Link>
+                    </BreadcrumbLink>
+                  </BreadcrumbItem>
+                </React.Fragment>
+              ))}
             <BreadcrumbSeparator className="shrink-0 font-semibold">
               {"/"}
             </BreadcrumbSeparator>

@@ -341,6 +341,7 @@ class WorkflowsManagementService(BaseWorkspaceService):
                 selectinload(Workflow.actions),
                 selectinload(Workflow.webhook).options(selectinload(Webhook.api_key)),
                 selectinload(Workflow.schedules),
+                selectinload(Workflow.folder),
             )
         )
         result = await self.session.execute(statement)

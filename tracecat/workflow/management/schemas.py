@@ -45,6 +45,8 @@ class WorkflowRead(Schema):
     trigger_position_x: float = 0.0
     trigger_position_y: float = 0.0
     graph_version: int = 1
+    folder_id: uuid.UUID | None = None
+    folder_path: str | None = None
 
 
 class WorkflowDefinitionReadMinimal(Schema):

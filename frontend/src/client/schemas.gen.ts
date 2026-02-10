@@ -18633,6 +18633,29 @@ export const $WorkflowRead = {
       title: "Graph Version",
       default: 1,
     },
+    folder_id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Folder Id",
+    },
+    folder_path: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Folder Path",
+    },
   },
   type: "object",
   required: [

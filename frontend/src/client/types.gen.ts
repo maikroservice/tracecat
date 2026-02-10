@@ -5875,6 +5875,8 @@ export type WorkflowRead = {
   trigger_position_x?: number
   trigger_position_y?: number
   graph_version?: number
+  folder_id?: string | null
+  folder_path?: string | null
 }
 
 /**

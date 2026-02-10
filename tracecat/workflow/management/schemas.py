@@ -47,6 +47,7 @@ class WorkflowRead(Schema):
     graph_version: int = 1
     folder_id: uuid.UUID | None = None
     folder_path: str | None = None
+    created_by: uuid.UUID | None = None
 
 
 class WorkflowDefinitionReadMinimal(Schema):
@@ -83,6 +84,7 @@ class WorkflowReadMinimal(Schema):
     error_handler: str | None = None
     latest_definition: WorkflowDefinitionReadMinimal | None = None
     folder_id: uuid.UUID | None = None
+    created_by: uuid.UUID | None = None
 
 
 class WorkflowUpdate(BaseModel):

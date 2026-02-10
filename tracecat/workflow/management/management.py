@@ -13,6 +13,8 @@ from sqlalchemy.orm import selectinload
 from temporalio import activity
 
 from tracecat.audit.logger import audit_log
+from tracecat.auth.types import AccessLevel
+from tracecat.authz.enums import WorkspaceRole
 from tracecat.contexts import ctx_logical_time
 from tracecat.db.models import (
     Action,
@@ -30,7 +32,7 @@ from tracecat.dsl.common import (
 )
 from tracecat.dsl.schemas import DSLConfig, ExecutionContext, RunContext
 from tracecat.dsl.view import RFGraph
-from tracecat.exceptions import TracecatValidationError
+from tracecat.exceptions import TracecatAuthorizationError, TracecatValidationError
 from tracecat.expressions.eval import eval_templated_object
 from tracecat.identifiers import WorkflowID
 from tracecat.identifiers.workflow import (
@@ -474,6 +476,17 @@ class WorkflowsManagementService(BaseWorkspaceService):
         result = await self.session.execute(statement)
         workflow = result.scalar_one()
 
+        # Admins can delete any workflow; editors only their own
+        if (
+            self.role.access_level != AccessLevel.ADMIN
+            and self.role.workspace_role != WorkspaceRole.ADMIN
+        ):
+            if workflow.created_by is None or workflow.created_by != self.role.user_id:
+                raise TracecatAuthorizationError(
+                    "You do not have permission to delete this workflow. "
+                    "Only the workflow creator or an admin can delete it."
+                )
+
         # Clean up Temporal schedules before cascade deletion
         # This prevents orphaned schedules in Temporal
         schedule_service = WorkflowSchedulesService(self.session, role=self.role)
@@ -512,6 +525,7 @@ class WorkflowsManagementService(BaseWorkspaceService):
             title=title,
             description=description,
             workspace_id=self.workspace_id,
+            created_by=self.role.user_id,
         )
         # When we create a workflow, we automatically create a webhook
         # Add the Workflow to the session first to generate an ID
@@ -655,6 +669,7 @@ class WorkflowsManagementService(BaseWorkspaceService):
             "config": dsl.config.model_dump(),
             "expects": entrypoint.get("expects"),
             "registry_lock": registry_lock,
+            "created_by": self.role.user_id,
         }
         if workflow_id:
             workflow_kwargs["id"] = workflow_id

@@ -31,6 +31,8 @@ import {
   DropdownMenuSubTrigger,
 } from "@/components/ui/dropdown-menu"
 import { toast } from "@/components/ui/use-toast"
+import { useAuth } from "@/hooks/use-auth"
+import { useCurrentUserRole } from "@/hooks/use-workspace"
 import {
   useOrgAppSettings,
   useWorkflowManager,
@@ -53,8 +55,13 @@ export function WorkflowActions({
   const workspaceId = useWorkspaceId()
   const { tags } = useWorkflowTags(workspaceId)
 
+  const { user } = useAuth()
+  const { role } = useCurrentUserRole(workspaceId)
   const { addWorkflowTag, removeWorkflowTag } = useWorkflowManager()
   const enabledExport = appSettings?.app_workflow_export_enabled ?? false
+  const isAdmin = role === "admin" || user?.isOrgAdmin()
+  const canDelete =
+    isAdmin || (item.created_by != null && item.created_by === user?.id)
 
   return (
     <DropdownMenuGroup>
@@ -207,20 +214,24 @@ export function WorkflowActions({
         <Copy className="mr-2 size-3.5" />
         Copy workflow ID
       </DropdownMenuItem>
-      <DropdownMenuSeparator />
-      <DeleteWorkflowAlertDialogTrigger asChild>
-        <DropdownMenuItem
-          className="text-xs text-rose-500 focus:text-rose-600"
-          onClick={(e) => {
-            e.stopPropagation() // Prevent row click
-            setSelectedWorkflow(item)
-            console.debug("Selected workflow to delete", item)
-          }}
-        >
-          <Trash2 className="mr-2 size-3.5" />
-          Delete
-        </DropdownMenuItem>
-      </DeleteWorkflowAlertDialogTrigger>
+      {canDelete && (
+        <>
+          <DropdownMenuSeparator />
+          <DeleteWorkflowAlertDialogTrigger asChild>
+            <DropdownMenuItem
+              className="text-xs text-rose-500 focus:text-rose-600"
+              onClick={(e) => {
+                e.stopPropagation() // Prevent row click
+                setSelectedWorkflow(item)
+                console.debug("Selected workflow to delete", item)
+              }}
+            >
+              <Trash2 className="mr-2 size-3.5" />
+              Delete
+            </DropdownMenuItem>
+          </DeleteWorkflowAlertDialogTrigger>
+        </>
+      )}
     </DropdownMenuGroup>
   )
 }

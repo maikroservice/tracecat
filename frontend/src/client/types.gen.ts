@@ -5541,7 +5541,6 @@ export type WorkflowDirectoryItem = {
   error_handler?: string | null
   latest_definition?: WorkflowDefinitionReadMinimal | null
   folder_id?: string | null
-  created_by?: string | null
   type: "workflow"
 }
 
@@ -5878,7 +5877,6 @@ export type WorkflowRead = {
   graph_version?: number
   folder_id?: string | null
   folder_path?: string | null
-  created_by?: string | null
 }
 
 /**
@@ -5898,7 +5896,6 @@ export type WorkflowReadMinimal = {
   error_handler?: string | null
   latest_definition?: WorkflowDefinitionReadMinimal | null
   folder_id?: string | null
-  created_by?: string | null
 }
 
 /**

@@ -669,13 +669,6 @@ export function useWorkflowManager(filter?: WorkflowFilter) {
             description: String(error.body.detail),
           })
           break
-        case 403:
-          toast({
-            title: "Permission denied",
-            description: String(error.body.detail),
-            variant: "destructive",
-          })
-          break
         default:
           console.error("Failed to delete workflow:", error)
           toast({

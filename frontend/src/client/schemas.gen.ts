@@ -17556,18 +17556,6 @@ export const $WorkflowDirectoryItem = {
       ],
       title: "Folder Id",
     },
-    created_by: {
-      anyOf: [
-        {
-          type: "string",
-          format: "uuid",
-        },
-        {
-          type: "null",
-        },
-      ],
-      title: "Created By",
-    },
     type: {
       type: "string",
       const: "workflow",
@@ -18668,18 +18656,6 @@ export const $WorkflowRead = {
       ],
       title: "Folder Path",
     },
-    created_by: {
-      anyOf: [
-        {
-          type: "string",
-          format: "uuid",
-        },
-        {
-          type: "null",
-        },
-      ],
-      title: "Created By",
-    },
   },
   type: "object",
   required: [
@@ -18806,18 +18782,6 @@ export const $WorkflowReadMinimal = {
         },
       ],
       title: "Folder Id",
-    },
-    created_by: {
-      anyOf: [
-        {
-          type: "string",
-          format: "uuid",
-        },
-        {
-          type: "null",
-        },
-      ],
-      title: "Created By",
     },
   },
   type: "object",

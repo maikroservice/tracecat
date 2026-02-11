@@ -806,12 +806,6 @@ class Workflow(WorkspaceModel):
         ForeignKey("workflow_folder.id", ondelete="CASCADE"),
         nullable=True,
     )
-    created_by: Mapped[uuid.UUID | None] = mapped_column(
-        UUID,
-        ForeignKey("user.id", ondelete="SET NULL"),
-        nullable=True,
-        doc="User who created this workflow (nullable for pre-existing or service-created workflows)",
-    )
 
     workspace: Mapped[Workspace] = relationship(back_populates="workflows")
     folder: Mapped[WorkflowFolder | None] = relationship(back_populates="workflows")

@@ -71,9 +71,8 @@ import {
 } from "@/components/ui/popover"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { ValidationErrorView } from "@/components/validation-errors"
-import { useAuth } from "@/hooks/use-auth"
 import { useFeatureFlag } from "@/hooks/use-feature-flags"
-import { useCurrentUserRole, useWorkspaceDetails } from "@/hooks/use-workspace"
+import { useWorkspaceDetails } from "@/hooks/use-workspace"
 import type { TracecatApiError } from "@/lib/errors"
 import {
   useCreateDraftWorkflowExecution,
@@ -676,13 +675,6 @@ function BuilderNavOptions({
   const { appSettings } = useOrgAppSettings()
   const { deleteWorkflow } = useWorkflowManager()
   const enabledExport = appSettings?.app_workflow_export_enabled
-  const { workflow } = useWorkflow()
-  const { user } = useAuth()
-  const { role } = useCurrentUserRole(workspaceId)
-  const isAdmin = role === "admin" || user?.isOrgAdmin()
-  const canDelete =
-    isAdmin ||
-    (workflow?.created_by != null && workflow.created_by === user?.id)
 
   const handleDelete = async () => {
     await deleteWorkflow(workflowId)
@@ -728,17 +720,13 @@ function BuilderNavOptions({
             <CopyIcon className="mr-2 size-3.5" />
             Copy workflow ID
           </DropdownMenuItem>
-          {canDelete && (
-            <>
-              <DropdownMenuSeparator />
-              <AlertDialogTrigger asChild>
-                <DropdownMenuItem className="text-destructive focus:text-destructive">
-                  <Trash2Icon className="mr-2 size-3.5" />
-                  Delete workflow
-                </DropdownMenuItem>
-              </AlertDialogTrigger>
-            </>
-          )}
+          <DropdownMenuSeparator />
+          <AlertDialogTrigger asChild>
+            <DropdownMenuItem className="text-destructive focus:text-destructive">
+              <Trash2Icon className="mr-2 size-3.5" />
+              Delete workflow
+            </DropdownMenuItem>
+          </AlertDialogTrigger>
         </DropdownMenuContent>
       </DropdownMenu>
       <AlertDialogContent>

@@ -7,6 +7,9 @@ Objectives
 3. Test that workflows with both action and workflow failures show both event types
 4. Test edge cases and error conditions in event processing
 5. Test workspace timeout resolution logic
+6. Test full event history (list_workflow_execution_events) with activity events
+7. Test that scatter activities are silently dropped in full event history
+8. Test cascading event loss in full event history
 
 """
 
@@ -24,8 +27,11 @@ from tracecat.workflow.executions.enums import (
     WorkflowEventType,
     WorkflowExecutionEventStatus,
 )
+from tracecat.ee.interactions.schemas import InteractionResult
 from tracecat.workflow.executions.schemas import (
     EventFailure,
+    EventGroup,
+    WorkflowExecutionEvent,
     WorkflowExecutionEventCompact,
 )
 from tracecat.workflow.executions.service import (
@@ -888,3 +894,732 @@ class TestTimeoutResolution:
             result = await service._resolve_execution_timeout(seconds=300)
 
             assert result is None
+
+
+# === Full Event History Tests ===
+
+
+def _make_mock_history_event(
+    event_id: int,
+    event_type: EventType,
+    event_time_seconds: int = 1640995200,
+    task_id: int = 0,
+    **attributes,
+) -> Mock:
+    """Create a mock Temporal HistoryEvent for full event history tests.
+
+    Unlike create_mock_history_event, this also sets task_id and provides
+    additional attribute mocking needed by list_workflow_execution_events.
+    """
+    event = Mock()
+    event.event_id = event_id
+    event.event_type = event_type
+    event.task_id = task_id
+
+    # Mock timestamp - use ToDatetime for protobuf-style access
+    mock_timestamp = Mock()
+    mock_timestamp.ToDatetime.return_value = datetime.datetime.fromtimestamp(
+        event_time_seconds, tz=datetime.UTC
+    )
+    event.event_time = mock_timestamp
+
+    if event_type == EventType.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED:
+        started_attrs = Mock()
+        started_attrs.input = attributes.get("input", Mock())
+        parent_exec = Mock()
+        parent_exec.workflow_id = attributes.get("parent_wf_exec_id", "")
+        started_attrs.parent_workflow_execution = parent_exec
+        event.workflow_execution_started_event_attributes = started_attrs
+
+    elif event_type == EventType.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED:
+        completed_attrs = Mock()
+        completed_attrs.result = attributes.get("result", Mock())
+        event.workflow_execution_completed_event_attributes = completed_attrs
+
+    elif event_type == EventType.EVENT_TYPE_WORKFLOW_EXECUTION_FAILED:
+        failed_attrs = Mock()
+        mock_failure = Mock()
+        mock_failure.message = attributes.get(
+            "failure_message", "Workflow execution failed"
+        )
+        mock_failure.cause = attributes.get("failure_cause")
+        failed_attrs.failure = mock_failure
+        event.workflow_execution_failed_event_attributes = failed_attrs
+
+    elif event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED:
+        scheduled_attrs = Mock()
+        scheduled_attrs.activity_id = attributes.get("activity_id", "test-activity")
+        scheduled_attrs.activity_type = Mock()
+        scheduled_attrs.activity_type.name = attributes.get(
+            "activity_name", "execute_action_activity"
+        )
+        scheduled_attrs.input = attributes.get("input", Mock())
+        event.activity_task_scheduled_event_attributes = scheduled_attrs
+
+    elif event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_STARTED:
+        started_attrs = Mock()
+        started_attrs.scheduled_event_id = attributes.get("scheduled_event_id", 1)
+        started_attrs.attempt = attributes.get("attempt", 1)
+        event.activity_task_started_event_attributes = started_attrs
+
+    elif event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED:
+        completed_attrs = Mock()
+        completed_attrs.scheduled_event_id = attributes.get("scheduled_event_id", 1)
+        completed_attrs.result = attributes.get("result", Mock())
+        event.activity_task_completed_event_attributes = completed_attrs
+
+    elif event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED:
+        failed_attrs = Mock()
+        mock_failure = Mock()
+        mock_failure.message = attributes.get(
+            "failure_message", "Activity task failed"
+        )
+        mock_failure.cause = attributes.get("failure_cause")
+        failed_attrs.failure = mock_failure
+        failed_attrs.scheduled_event_id = attributes.get("scheduled_event_id", 1)
+        event.activity_task_failed_event_attributes = failed_attrs
+
+    elif event_type == EventType.EVENT_TYPE_ACTIVITY_TASK_TIMED_OUT:
+        timed_out_attrs = Mock()
+        timed_out_attrs.scheduled_event_id = attributes.get("scheduled_event_id", 1)
+        event.activity_task_timed_out_event_attributes = timed_out_attrs
+
+    return event
+
+
+def _make_mock_event_group(
+    event_id: int,
+    action_ref: str = "action_1",
+    action_name: str = "tools.test.action",
+) -> EventGroup:
+    """Create a mock EventGroup for full event history tests."""
+    return EventGroup(
+        event_id=event_id,
+        udf_namespace="tools.test",
+        udf_name="action",
+        udf_key=action_name,
+        action_ref=action_ref,
+        action_title="Test Action",
+        action_description="A test action",
+        action_input=InteractionResult(message="test"),
+    )
+
+
+@pytest.mark.anyio
+class TestFullWorkflowExecutionEvents:
+    """Tests for list_workflow_execution_events (full event history).
+
+    These tests verify the full event history endpoint that is used by
+    the execution detail page, as opposed to the compact events used
+    by the workflow builder sidebar.
+    """
+
+    async def test_workflow_start_and_complete_events(
+        self,
+        workflow_executions_service: WorkflowExecutionsService,
+        workflow_exec_id: WorkflowExecutionID,
+    ) -> None:
+        """Test that workflow start and complete events are returned."""
+        wf_started = _make_mock_history_event(
+            event_id=1,
+            event_type=EventType.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,  # type: ignore
+        )
+        wf_completed = _make_mock_history_event(
+            event_id=10,
+            event_type=EventType.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED,  # type: ignore
+            event_time_seconds=1640995260,
+        )
+
+        mock_history = Mock()
+        mock_history.events = [wf_started, wf_completed]
+
+        mock_handle = Mock(spec=WorkflowHandle)
+        mock_handle.fetch_history = AsyncMock(return_value=mock_history)
+        workflow_executions_service._client.get_workflow_handle_for = Mock(
+            return_value=mock_handle
+        )
+
+        mock_run_args = Mock()
+        mock_run_args.role = Role(
+            type="service",
+            workspace_id=None,
+            user_id=None,
+            service_id="tracecat-service",
+        )
+        mock_run_args.runtime_config = Mock(timeout=300)
+
+        with patch(
+            "tracecat.workflow.executions.service.extract_first",
+            new_callable=AsyncMock,
+        ) as mock_extract:
+            mock_extract.side_effect = [
+                mock_run_args.__dict__,  # workflow started input
+                {"result": "success"},  # workflow completed result
+            ]
+
+            with patch(
+                "tracecat.workflow.executions.service.DSLRunArgs"
+            ) as mock_dsl_run_args:
+                mock_dsl_run_args.return_value = mock_run_args
+
+                events = await workflow_executions_service.list_workflow_execution_events(
+                    workflow_exec_id
+                )
+
+        assert len(events) == 2
+        assert events[0].event_type == WorkflowEventType.WORKFLOW_EXECUTION_STARTED
+        assert events[0].event_id == 1
+        assert events[1].event_type == WorkflowEventType.WORKFLOW_EXECUTION_COMPLETED
+        assert events[1].event_id == 10
+
+    async def test_activity_scheduled_started_completed_flow(
+        self,
+        workflow_executions_service: WorkflowExecutionsService,
+        workflow_exec_id: WorkflowExecutionID,
+    ) -> None:
+        """Test the full lifecycle of an activity: SCHEDULED -> STARTED -> COMPLETED.
+
+        This verifies that all three activity events appear in the output and
+        that event group propagation works correctly.
+        """
+        scheduled = _make_mock_history_event(
+            event_id=5,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED,  # type: ignore
+            activity_name="execute_action_activity",
+        )
+        started = _make_mock_history_event(
+            event_id=6,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_STARTED,  # type: ignore
+            scheduled_event_id=5,
+            event_time_seconds=1640995210,
+        )
+        completed = _make_mock_history_event(
+            event_id=7,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED,  # type: ignore
+            scheduled_event_id=5,
+            event_time_seconds=1640995220,
+        )
+
+        mock_history = Mock()
+        mock_history.events = [scheduled, started, completed]
+
+        mock_handle = Mock(spec=WorkflowHandle)
+        mock_handle.fetch_history = AsyncMock(return_value=mock_history)
+        workflow_executions_service._client.get_workflow_handle_for = Mock(
+            return_value=mock_handle
+        )
+
+        mock_group = _make_mock_event_group(event_id=5)
+
+        with patch.object(
+            EventGroup, "from_scheduled_activity", new_callable=AsyncMock
+        ) as mock_from_scheduled:
+            mock_from_scheduled.return_value = mock_group
+
+            with patch(
+                "tracecat.workflow.executions.service.extract_first",
+                new_callable=AsyncMock,
+            ) as mock_extract:
+                mock_extract.return_value = {"data": "result_value"}
+
+                events = await workflow_executions_service.list_workflow_execution_events(
+                    workflow_exec_id
+                )
+
+        assert len(events) == 3
+        assert events[0].event_type == WorkflowEventType.ACTIVITY_TASK_SCHEDULED
+        assert events[0].event_group == mock_group
+        assert events[1].event_type == WorkflowEventType.ACTIVITY_TASK_STARTED
+        assert events[1].event_group is not None
+        assert events[2].event_type == WorkflowEventType.ACTIVITY_TASK_COMPLETED
+        assert events[2].event_group == mock_group
+        assert events[2].result == {"data": "result_value"}
+
+    async def test_activity_scheduled_started_failed_flow(
+        self,
+        workflow_executions_service: WorkflowExecutionsService,
+        workflow_exec_id: WorkflowExecutionID,
+    ) -> None:
+        """Test activity failure lifecycle: SCHEDULED -> STARTED -> FAILED."""
+        scheduled = _make_mock_history_event(
+            event_id=5,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED,  # type: ignore
+            activity_name="execute_action_activity",
+        )
+        started = _make_mock_history_event(
+            event_id=6,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_STARTED,  # type: ignore
+            scheduled_event_id=5,
+        )
+        failed = _make_mock_history_event(
+            event_id=7,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED,  # type: ignore
+            scheduled_event_id=5,
+            failure_message="Action execution failed",
+        )
+
+        mock_history = Mock()
+        mock_history.events = [scheduled, started, failed]
+
+        mock_handle = Mock(spec=WorkflowHandle)
+        mock_handle.fetch_history = AsyncMock(return_value=mock_history)
+        workflow_executions_service._client.get_workflow_handle_for = Mock(
+            return_value=mock_handle
+        )
+
+        mock_group = _make_mock_event_group(event_id=5)
+        mock_failure = EventFailure(
+            message="Action execution failed", cause=None
+        )
+
+        with patch.object(
+            EventGroup, "from_scheduled_activity", new_callable=AsyncMock
+        ) as mock_from_scheduled:
+            mock_from_scheduled.return_value = mock_group
+
+            with patch(
+                "tracecat.workflow.executions.service.EventFailure.from_history_event"
+            ) as mock_event_failure:
+                mock_event_failure.return_value = mock_failure
+
+                events = await workflow_executions_service.list_workflow_execution_events(
+                    workflow_exec_id
+                )
+
+        assert len(events) == 3
+        assert events[0].event_type == WorkflowEventType.ACTIVITY_TASK_SCHEDULED
+        assert events[1].event_type == WorkflowEventType.ACTIVITY_TASK_STARTED
+        assert events[2].event_type == WorkflowEventType.ACTIVITY_TASK_FAILED
+        assert events[2].failure == mock_failure
+        assert events[2].event_group == mock_group
+
+    async def test_scatter_activity_silently_dropped(
+        self,
+        workflow_executions_service: WorkflowExecutionsService,
+        workflow_exec_id: WorkflowExecutionID,
+    ) -> None:
+        """Test that scatter activities (handle_scatter_input_activity) are silently dropped.
+
+        EventGroup.from_scheduled_activity returns None for scatter activities
+        because it tries to parse ScatterActionInput as RunActionInput, which fails.
+        This documents the known bug where scatter activity events are lost.
+        """
+        scatter_scheduled = _make_mock_history_event(
+            event_id=5,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED,  # type: ignore
+            activity_name="handle_scatter_input_activity",
+        )
+        scatter_started = _make_mock_history_event(
+            event_id=6,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_STARTED,  # type: ignore
+            scheduled_event_id=5,
+        )
+        scatter_completed = _make_mock_history_event(
+            event_id=7,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED,  # type: ignore
+            scheduled_event_id=5,
+        )
+
+        mock_history = Mock()
+        mock_history.events = [scatter_scheduled, scatter_started, scatter_completed]
+
+        mock_handle = Mock(spec=WorkflowHandle)
+        mock_handle.fetch_history = AsyncMock(return_value=mock_history)
+        workflow_executions_service._client.get_workflow_handle_for = Mock(
+            return_value=mock_handle
+        )
+
+        # from_scheduled_activity returns None for scatter activities
+        with patch.object(
+            EventGroup, "from_scheduled_activity", new_callable=AsyncMock
+        ) as mock_from_scheduled:
+            mock_from_scheduled.return_value = None
+
+            events = await workflow_executions_service.list_workflow_execution_events(
+                workflow_exec_id
+            )
+
+        # All 3 events are lost: scheduled returns None -> started and completed
+        # can't find their parent in event_group_names -> also skipped
+        assert len(events) == 0
+
+    async def test_cascading_event_loss_when_scheduled_skipped(
+        self,
+        workflow_executions_service: WorkflowExecutionsService,
+        workflow_exec_id: WorkflowExecutionID,
+    ) -> None:
+        """Test cascading event loss: when SCHEDULED is skipped, STARTED and COMPLETED are also lost.
+
+        This documents the cascading skip behavior: if from_scheduled_activity
+        returns None for a scheduled event, the event_id is never added to
+        event_group_names. When subsequent STARTED/COMPLETED/FAILED events look
+        up their parent scheduled_event_id, they find nothing and are also skipped.
+        """
+        # First activity: successfully parsed
+        good_scheduled = _make_mock_history_event(
+            event_id=5,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED,  # type: ignore
+            activity_name="execute_action_activity",
+        )
+        good_completed = _make_mock_history_event(
+            event_id=8,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED,  # type: ignore
+            scheduled_event_id=5,
+        )
+
+        # Second activity: from_scheduled_activity will return None
+        bad_scheduled = _make_mock_history_event(
+            event_id=10,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED,  # type: ignore
+            activity_name="handle_scatter_input_activity",
+        )
+        bad_started = _make_mock_history_event(
+            event_id=11,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_STARTED,  # type: ignore
+            scheduled_event_id=10,
+        )
+        bad_completed = _make_mock_history_event(
+            event_id=12,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED,  # type: ignore
+            scheduled_event_id=10,
+        )
+
+        mock_history = Mock()
+        mock_history.events = [
+            good_scheduled,
+            good_completed,
+            bad_scheduled,
+            bad_started,
+            bad_completed,
+        ]
+
+        mock_handle = Mock(spec=WorkflowHandle)
+        mock_handle.fetch_history = AsyncMock(return_value=mock_history)
+        workflow_executions_service._client.get_workflow_handle_for = Mock(
+            return_value=mock_handle
+        )
+
+        good_group = _make_mock_event_group(event_id=5, action_ref="good_action")
+
+        with patch.object(
+            EventGroup, "from_scheduled_activity", new_callable=AsyncMock
+        ) as mock_from_scheduled:
+            # First call (good_scheduled): returns group
+            # Second call (bad_scheduled): returns None
+            mock_from_scheduled.side_effect = [good_group, None]
+
+            with patch(
+                "tracecat.workflow.executions.service.extract_first",
+                new_callable=AsyncMock,
+            ) as mock_extract:
+                mock_extract.return_value = {"result": "ok"}
+
+                events = await workflow_executions_service.list_workflow_execution_events(
+                    workflow_exec_id
+                )
+
+        # Only the good activity's events (SCHEDULED + COMPLETED) should appear
+        # The bad activity's 3 events (SCHEDULED + STARTED + COMPLETED) are all lost
+        assert len(events) == 2
+        assert events[0].event_type == WorkflowEventType.ACTIVITY_TASK_SCHEDULED
+        assert events[0].event_group.action_ref == "good_action"
+        assert events[1].event_type == WorkflowEventType.ACTIVITY_TASK_COMPLETED
+
+    async def test_full_workflow_lifecycle_with_activity(
+        self,
+        workflow_executions_service: WorkflowExecutionsService,
+        workflow_exec_id: WorkflowExecutionID,
+    ) -> None:
+        """Test a complete workflow lifecycle: WF_STARTED -> ACTIVITY -> WF_COMPLETED.
+
+        This is the most common happy-path scenario where all 5 events should appear.
+        """
+        wf_started = _make_mock_history_event(
+            event_id=1,
+            event_type=EventType.EVENT_TYPE_WORKFLOW_EXECUTION_STARTED,  # type: ignore
+        )
+        act_scheduled = _make_mock_history_event(
+            event_id=5,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED,  # type: ignore
+            event_time_seconds=1640995210,
+        )
+        act_started = _make_mock_history_event(
+            event_id=6,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_STARTED,  # type: ignore
+            scheduled_event_id=5,
+            event_time_seconds=1640995220,
+        )
+        act_completed = _make_mock_history_event(
+            event_id=7,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED,  # type: ignore
+            scheduled_event_id=5,
+            event_time_seconds=1640995230,
+        )
+        wf_completed = _make_mock_history_event(
+            event_id=10,
+            event_type=EventType.EVENT_TYPE_WORKFLOW_EXECUTION_COMPLETED,  # type: ignore
+            event_time_seconds=1640995240,
+        )
+
+        mock_history = Mock()
+        mock_history.events = [
+            wf_started,
+            act_scheduled,
+            act_started,
+            act_completed,
+            wf_completed,
+        ]
+
+        mock_handle = Mock(spec=WorkflowHandle)
+        mock_handle.fetch_history = AsyncMock(return_value=mock_history)
+        workflow_executions_service._client.get_workflow_handle_for = Mock(
+            return_value=mock_handle
+        )
+
+        mock_run_args = Mock()
+        mock_run_args.role = Role(
+            type="service",
+            workspace_id=None,
+            user_id=None,
+            service_id="tracecat-service",
+        )
+        mock_run_args.runtime_config = Mock(timeout=300)
+
+        mock_group = _make_mock_event_group(event_id=5)
+
+        with patch.object(
+            EventGroup, "from_scheduled_activity", new_callable=AsyncMock
+        ) as mock_from_scheduled:
+            mock_from_scheduled.return_value = mock_group
+
+            with patch(
+                "tracecat.workflow.executions.service.extract_first",
+                new_callable=AsyncMock,
+            ) as mock_extract:
+                mock_extract.side_effect = [
+                    {"role": "service"},  # WF started input
+                    {"result": "action_output"},  # Activity completed result
+                    {"result": "wf_output"},  # WF completed result
+                ]
+
+                with patch(
+                    "tracecat.workflow.executions.service.DSLRunArgs"
+                ) as mock_dsl_run_args:
+                    mock_dsl_run_args.return_value = mock_run_args
+
+                    events = await workflow_executions_service.list_workflow_execution_events(
+                        workflow_exec_id
+                    )
+
+        assert len(events) == 5
+
+        event_types = [e.event_type for e in events]
+        assert event_types == [
+            WorkflowEventType.WORKFLOW_EXECUTION_STARTED,
+            WorkflowEventType.ACTIVITY_TASK_SCHEDULED,
+            WorkflowEventType.ACTIVITY_TASK_STARTED,
+            WorkflowEventType.ACTIVITY_TASK_COMPLETED,
+            WorkflowEventType.WORKFLOW_EXECUTION_COMPLETED,
+        ]
+
+        # Verify activity events have event_group
+        assert events[1].event_group == mock_group
+        assert events[2].event_group is not None
+        assert events[3].event_group == mock_group
+
+    async def test_activity_timed_out_flow(
+        self,
+        workflow_executions_service: WorkflowExecutionsService,
+        workflow_exec_id: WorkflowExecutionID,
+    ) -> None:
+        """Test activity timeout lifecycle: SCHEDULED -> STARTED -> TIMED_OUT."""
+        scheduled = _make_mock_history_event(
+            event_id=5,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED,  # type: ignore
+        )
+        started = _make_mock_history_event(
+            event_id=6,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_STARTED,  # type: ignore
+            scheduled_event_id=5,
+        )
+        timed_out = _make_mock_history_event(
+            event_id=7,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_TIMED_OUT,  # type: ignore
+            scheduled_event_id=5,
+        )
+
+        mock_history = Mock()
+        mock_history.events = [scheduled, started, timed_out]
+
+        mock_handle = Mock(spec=WorkflowHandle)
+        mock_handle.fetch_history = AsyncMock(return_value=mock_history)
+        workflow_executions_service._client.get_workflow_handle_for = Mock(
+            return_value=mock_handle
+        )
+
+        mock_group = _make_mock_event_group(event_id=5)
+
+        with patch.object(
+            EventGroup, "from_scheduled_activity", new_callable=AsyncMock
+        ) as mock_from_scheduled:
+            mock_from_scheduled.return_value = mock_group
+
+            events = await workflow_executions_service.list_workflow_execution_events(
+                workflow_exec_id
+            )
+
+        assert len(events) == 3
+        assert events[0].event_type == WorkflowEventType.ACTIVITY_TASK_SCHEDULED
+        assert events[1].event_type == WorkflowEventType.ACTIVITY_TASK_STARTED
+        assert events[2].event_type == WorkflowEventType.ACTIVITY_TASK_TIMED_OUT
+
+    async def test_workflow_failure_event_in_full_history(
+        self,
+        workflow_executions_service: WorkflowExecutionsService,
+        workflow_exec_id: WorkflowExecutionID,
+    ) -> None:
+        """Test that workflow failure events include failure details."""
+        wf_failed = _make_mock_history_event(
+            event_id=10,
+            event_type=EventType.EVENT_TYPE_WORKFLOW_EXECUTION_FAILED,  # type: ignore
+            failure_message="Workflow timed out",
+        )
+
+        mock_history = Mock()
+        mock_history.events = [wf_failed]
+
+        mock_handle = Mock(spec=WorkflowHandle)
+        mock_handle.fetch_history = AsyncMock(return_value=mock_history)
+        workflow_executions_service._client.get_workflow_handle_for = Mock(
+            return_value=mock_handle
+        )
+
+        mock_failure = EventFailure(message="Workflow timed out", cause=None)
+
+        with patch(
+            "tracecat.workflow.executions.service.EventFailure.from_history_event"
+        ) as mock_event_failure:
+            mock_event_failure.return_value = mock_failure
+
+            events = await workflow_executions_service.list_workflow_execution_events(
+                workflow_exec_id
+            )
+
+        assert len(events) == 1
+        assert events[0].event_type == WorkflowEventType.WORKFLOW_EXECUTION_FAILED
+        assert events[0].failure == mock_failure
+
+    async def test_empty_history_returns_empty_list(
+        self,
+        workflow_executions_service: WorkflowExecutionsService,
+        workflow_exec_id: WorkflowExecutionID,
+    ) -> None:
+        """Test that empty workflow history returns empty event list."""
+        mock_history = Mock()
+        mock_history.events = []
+
+        mock_handle = Mock(spec=WorkflowHandle)
+        mock_handle.fetch_history = AsyncMock(return_value=mock_history)
+        workflow_executions_service._client.get_workflow_handle_for = Mock(
+            return_value=mock_handle
+        )
+
+        events = await workflow_executions_service.list_workflow_execution_events(
+            workflow_exec_id
+        )
+
+        assert len(events) == 0
+
+    async def test_multiple_activities_with_mixed_outcomes(
+        self,
+        workflow_executions_service: WorkflowExecutionsService,
+        workflow_exec_id: WorkflowExecutionID,
+    ) -> None:
+        """Test multiple activities where one succeeds and one fails.
+
+        Verifies that the event_group_names dict correctly tracks
+        multiple independent activity groups.
+        """
+        # Activity 1: succeeds
+        act1_scheduled = _make_mock_history_event(
+            event_id=5,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED,  # type: ignore
+        )
+        act1_started = _make_mock_history_event(
+            event_id=6,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_STARTED,  # type: ignore
+            scheduled_event_id=5,
+        )
+        act1_completed = _make_mock_history_event(
+            event_id=7,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_COMPLETED,  # type: ignore
+            scheduled_event_id=5,
+        )
+
+        # Activity 2: fails
+        act2_scheduled = _make_mock_history_event(
+            event_id=10,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED,  # type: ignore
+        )
+        act2_started = _make_mock_history_event(
+            event_id=11,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_STARTED,  # type: ignore
+            scheduled_event_id=10,
+        )
+        act2_failed = _make_mock_history_event(
+            event_id=12,
+            event_type=EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED,  # type: ignore
+            scheduled_event_id=10,
+            failure_message="Second action failed",
+        )
+
+        mock_history = Mock()
+        mock_history.events = [
+            act1_scheduled,
+            act1_started,
+            act1_completed,
+            act2_scheduled,
+            act2_started,
+            act2_failed,
+        ]
+
+        mock_handle = Mock(spec=WorkflowHandle)
+        mock_handle.fetch_history = AsyncMock(return_value=mock_history)
+        workflow_executions_service._client.get_workflow_handle_for = Mock(
+            return_value=mock_handle
+        )
+
+        group1 = _make_mock_event_group(event_id=5, action_ref="action_1")
+        group2 = _make_mock_event_group(event_id=10, action_ref="action_2")
+        mock_failure = EventFailure(message="Second action failed", cause=None)
+
+        with patch.object(
+            EventGroup, "from_scheduled_activity", new_callable=AsyncMock
+        ) as mock_from_scheduled:
+            mock_from_scheduled.side_effect = [group1, group2]
+
+            with patch(
+                "tracecat.workflow.executions.service.extract_first",
+                new_callable=AsyncMock,
+            ) as mock_extract:
+                mock_extract.return_value = {"result": "ok"}
+
+                with patch(
+                    "tracecat.workflow.executions.service.EventFailure.from_history_event"
+                ) as mock_event_failure:
+                    mock_event_failure.return_value = mock_failure
+
+                    events = await workflow_executions_service.list_workflow_execution_events(
+                        workflow_exec_id
+                    )
+
+        assert len(events) == 6
+
+        # First activity completed successfully
+        assert events[0].event_group.action_ref == "action_1"
+        assert events[2].event_type == WorkflowEventType.ACTIVITY_TASK_COMPLETED
+
+        # Second activity failed
+        assert events[3].event_group.action_ref == "action_2"
+        assert events[5].event_type == WorkflowEventType.ACTIVITY_TASK_FAILED
+        assert events[5].failure == mock_failure

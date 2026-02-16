@@ -140,7 +140,7 @@ class WorkflowImportService(BaseWorkspaceService):
     ) -> list[PullDiagnostic]:
         """Validate a single workflow. Returns list of diagnostics."""
         diagnostics: list[PullDiagnostic] = []
-        workflow_path = f"workflows/{remote_workflow.id}/definition.yml"
+        workflow_path = f"workflow:{remote_workflow.id}"
 
         try:
             # Validate DSL structure
@@ -218,7 +218,7 @@ class WorkflowImportService(BaseWorkspaceService):
 
         # Validate each workflow's child workflow references
         for remote_workflow in remote_workflows:
-            workflow_path = f"workflows/{remote_workflow.id}/definition.yml"
+            workflow_path = f"workflow:{remote_workflow.id}"
 
             for action in remote_workflow.definition.actions:
                 try:

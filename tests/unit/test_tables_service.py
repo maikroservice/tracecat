@@ -972,6 +972,98 @@ class TestTableRows:
 
 
 @pytest.mark.anyio
+class TestGetUniqueValues:
+    """Test suite for get_unique_values method."""
+
+    @pytest.fixture
+    async def table(self, tables_service: TablesService) -> Table:
+        """Create a table with text and integer columns for unique value tests."""
+        table = await tables_service.create_table(
+            TableCreate(
+                name="unique_values_table",
+                columns=[
+                    TableColumnCreate(name="status", type=SqlType.TEXT),
+                    TableColumnCreate(name="priority", type=SqlType.INTEGER),
+                ],
+            )
+        )
+        return table
+
+    async def test_unique_text_values(
+        self, tables_service: TablesService, table: Table
+    ) -> None:
+        """Test getting unique values from a text column with duplicates."""
+        for status in ["open", "closed", "open", "pending", "closed", "open"]:
+            await tables_service.insert_row(
+                table, TableRowInsert(data={"status": status, "priority": 1})
+            )
+
+        values = await tables_service.get_unique_values(
+            table_name=table.name, column="status"
+        )
+        assert sorted(values) == ["closed", "open", "pending"]
+
+    async def test_unique_integer_values(
+        self, tables_service: TablesService, table: Table
+    ) -> None:
+        """Test getting unique values from an integer column."""
+        for priority in [3, 1, 2, 1, 3, 2, 1]:
+            await tables_service.insert_row(
+                table, TableRowInsert(data={"status": "open", "priority": priority})
+            )
+
+        values = await tables_service.get_unique_values(
+            table_name=table.name, column="priority"
+        )
+        assert values == [1, 2, 3]
+
+    async def test_unique_values_empty_table(
+        self, tables_service: TablesService, table: Table
+    ) -> None:
+        """Test getting unique values from an empty table returns empty list."""
+        values = await tables_service.get_unique_values(
+            table_name=table.name, column="status"
+        )
+        assert values == []
+
+    async def test_unique_values_with_limit(
+        self, tables_service: TablesService, table: Table
+    ) -> None:
+        """Test that the limit parameter restricts the number of unique values."""
+        for status in ["alpha", "beta", "gamma", "delta"]:
+            await tables_service.insert_row(
+                table, TableRowInsert(data={"status": status, "priority": 1})
+            )
+
+        values = await tables_service.get_unique_values(
+            table_name=table.name, column="status", limit=2
+        )
+        assert len(values) == 2
+        # Ordered alphabetically, so first two should be alpha, beta
+        assert values == ["alpha", "beta"]
+
+    async def test_unique_values_excludes_nulls(
+        self, tables_service: TablesService, table: Table
+    ) -> None:
+        """Test that null values are excluded from unique values."""
+        await tables_service.insert_row(
+            table, TableRowInsert(data={"status": "open", "priority": 1})
+        )
+        # Omit the status key entirely so the column gets a SQL NULL
+        await tables_service.insert_row(
+            table, TableRowInsert(data={"priority": 2})
+        )
+        await tables_service.insert_row(
+            table, TableRowInsert(data={"status": "closed", "priority": 3})
+        )
+
+        values = await tables_service.get_unique_values(
+            table_name=table.name, column="status"
+        )
+        assert sorted(values) == ["closed", "open"]
+
+
+@pytest.mark.anyio
 class TestTableDataTypes:
     """Test suite for verifying all supported SQL data types."""
 

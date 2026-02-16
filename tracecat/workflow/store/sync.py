@@ -33,6 +33,11 @@ from tracecat.sync import (
 from tracecat.vcs.github.app import GitHubAppError, GitHubAppService
 from tracecat.vcs.gitlab.service import GitLabError, GitLabService
 from tracecat.workflow.store.import_service import WorkflowImportService
+from tracecat.workflow.store.paths import (
+    deduplicate_content_map,
+    is_old_format_path,
+    parse_workflow_id_from_filename,
+)
 from tracecat.workflow.store.schemas import RemoteWorkflowDefinition
 from tracecat.workspaces.service import WorkspaceService
 
@@ -229,7 +234,8 @@ class WorkflowSyncService(BaseWorkspaceService):
         provider = self._detect_provider(url)
 
         if provider == VCSProvider.GITLAB:
-            return await self._fetch_repository_content_gitlab(url, commit_sha)
+            content_map = await self._fetch_repository_content_gitlab(url, commit_sha)
+            return deduplicate_content_map(content_map)
 
         return await self._fetch_repository_content_github(url, commit_sha)
 
@@ -294,55 +300,63 @@ class WorkflowSyncService(BaseWorkspaceService):
     async def _fetch_repository_content_gitlab(
         self, url: GitUrl, commit_sha: str
     ) -> dict[str, str]:
-        """Fetch workflow definitions from GitLab repository."""
+        """Fetch workflow definitions from GitLab repository.
+
+        Supports both new format (<workspace>/<path>/<slug>__<wf_id>.yml)
+        and legacy format (workflows/<wf_id>/definition.yml).
+        """
         gl_svc = GitLabService(session=self.session, role=self.role)
         gl = await gl_svc.get_gitlab_client_for_repo(url)
 
         try:
-            # Get project by path (org/repo)
             project_path = f"{url.org}/{url.repo}"
             project = await asyncio.to_thread(gl.projects.get, project_path)
 
-            # Get the workflows directory at the specific commit
+            # Use recursive tree walk to find all workflow files
             try:
-                # List items in workflows directory
-                workflows_items = await asyncio.to_thread(
+                all_items = await asyncio.to_thread(
                     project.repository_tree,
-                    path="workflows",
                     ref=commit_sha,
+                    recursive=True,
                     iterator=False,
+                    all=True,
                 )
-
-                content_map = {}
-
-                for item in workflows_items:
-                    # Look for workflow directories
-                    if item["type"] == "tree":  # "tree" is GitLab's term for directory
-                        # Get definition.yml from each workflow directory
-                        definition_path = f"{item['path']}/definition.yml"
-                        try:
-                            # Get file content using repository_blob_raw
-                            file_content = await asyncio.to_thread(
-                                project.files.get,
-                                file_path=definition_path,
-                                ref=commit_sha,
-                            )
-                            # Decode content (GitLab returns base64-encoded content)
-                            content = base64.b64decode(file_content.content).decode(
-                                "utf-8"
-                            )
-                            content_map[definition_path] = content
-                        except GitlabError as e:
-                            if "404" not in str(e):  # Ignore missing definition.yml
-                                logger.warning(f"Failed to get {definition_path}: {e}")
-
-                return content_map
-
             except GitlabError as e:
                 if "404" in str(e):
-                    # No workflows directory found
                     return {}
                 raise
+
+            # Identify candidate workflow files
+            candidate_paths: list[str] = []
+            for item in all_items:
+                if item["type"] != "blob":
+                    continue
+                path = item["path"]
+                filename = path.rsplit("/", 1)[-1] if "/" in path else path
+
+                # New format: *__wf_*.yml
+                if parse_workflow_id_from_filename(filename) is not None:
+                    candidate_paths.append(path)
+                # Old format: workflows/*/definition.yml
+                elif is_old_format_path(path):
+                    candidate_paths.append(path)
+
+            # Fetch content for each candidate
+            content_map: dict[str, str] = {}
+            for file_path in candidate_paths:
+                try:
+                    file_content = await asyncio.to_thread(
+                        project.files.get,
+                        file_path=file_path,
+                        ref=commit_sha,
+                    )
+                    content = base64.b64decode(file_content.content).decode("utf-8")
+                    content_map[file_path] = content
+                except GitlabError as e:
+                    if "404" not in str(e):
+                        logger.warning(f"Failed to get {file_path}: {e}")
+
+            return content_map
 
         except GitlabError as e:
             raise GitLabError(f"GitLab API error: {e}") from e

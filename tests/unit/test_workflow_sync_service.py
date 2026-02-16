@@ -10,8 +10,16 @@ from tracecat.auth.types import Role
 from tracecat.dsl.common import DSLEntrypoint, DSLInput
 from tracecat.dsl.schemas import ActionStatement
 from tracecat.git.types import GitUrl
+from tracecat.identifiers.workflow import WorkflowUUID
 from tracecat.sync import Author, PushObject, PushOptions
 from tracecat.workflow.store.import_service import WorkflowImportService
+from tracecat.workflow.store.paths import (
+    build_workflow_file_path,
+    deduplicate_content_map,
+    extract_wf_id_from_old_path,
+    is_old_format_path,
+    parse_workflow_id_from_filename,
+)
 from tracecat.workflow.store.schemas import RemoteWorkflowDefinition
 from tracecat.workflow.store.sync import WorkflowSyncService
 
@@ -569,3 +577,220 @@ class TestWorkflowImportServiceFolders:
         # Verify folder creation was not called and folder_id was not set
         workflow_import_service._ensure_folder_exists.assert_not_called()
         # folder_id should not be set (remains None by default)
+
+
+class TestBuildWorkflowFilePath:
+    """Tests for build_workflow_file_path utility."""
+
+    def _make_wf_id(self) -> WorkflowUUID:
+        """Create a deterministic WorkflowUUID for testing."""
+        return WorkflowUUID.new(uuid.UUID("550e8400-e29b-41d4-a716-446655440000"))
+
+    def test_basic_path_with_folder(self):
+        wf_id = self._make_wf_id()
+        result = build_workflow_file_path(
+            workspace_name="My Workspace",
+            folder_path="/security/detections/",
+            title="My Detection Rule",
+            workflow_id=wf_id,
+        )
+        parts = result.parts
+        assert parts[0] == "my-workspace"
+        assert parts[1] == "security"
+        assert parts[2] == "detections"
+        filename = parts[3]
+        assert filename.startswith("my-detection-rule__wf_")
+        assert filename.endswith(".yml")
+
+    def test_path_without_folder(self):
+        wf_id = self._make_wf_id()
+        result = build_workflow_file_path(
+            workspace_name="My Workspace",
+            folder_path=None,
+            title="Quick Test",
+            workflow_id=wf_id,
+        )
+        parts = result.parts
+        assert parts[0] == "my-workspace"
+        # File should be directly in workspace root
+        assert len(parts) == 2
+        assert parts[1].startswith("quick-test__wf_")
+
+    def test_path_with_root_folder(self):
+        wf_id = self._make_wf_id()
+        result = build_workflow_file_path(
+            workspace_name="My Workspace",
+            folder_path="/",
+            title="Quick Test",
+            workflow_id=wf_id,
+        )
+        parts = result.parts
+        assert parts[0] == "my-workspace"
+        assert len(parts) == 2
+
+    def test_workspace_name_slugified(self):
+        wf_id = self._make_wf_id()
+        result = build_workflow_file_path(
+            workspace_name="My   Special!! Workspace",
+            folder_path=None,
+            title="test",
+            workflow_id=wf_id,
+        )
+        assert result.parts[0] == "my-special-workspace"
+
+    def test_title_with_special_characters(self):
+        wf_id = self._make_wf_id()
+        result = build_workflow_file_path(
+            workspace_name="ws",
+            folder_path=None,
+            title="My Detection!!! (v2) @special",
+            workflow_id=wf_id,
+        )
+        filename = result.parts[-1]
+        assert "__wf_" in filename
+        assert filename.endswith(".yml")
+        # slug should not contain special chars
+        slug_part = filename.split("__")[0]
+        assert "!" not in slug_part
+        assert "(" not in slug_part
+        assert "@" not in slug_part
+
+    def test_title_truncated_to_max_length(self):
+        wf_id = self._make_wf_id()
+        long_title = "a" * 200
+        result = build_workflow_file_path(
+            workspace_name="ws",
+            folder_path=None,
+            title=long_title,
+            workflow_id=wf_id,
+        )
+        filename = result.parts[-1]
+        slug_part = filename.split("__")[0]
+        assert len(slug_part) <= 80
+
+    def test_deeply_nested_folder(self):
+        wf_id = self._make_wf_id()
+        result = build_workflow_file_path(
+            workspace_name="ws",
+            folder_path="/a/b/c/d/",
+            title="test",
+            workflow_id=wf_id,
+        )
+        parts = result.parts
+        assert parts == ("ws", "a", "b", "c", "d", f"test__{wf_id.short()}.yml")
+
+
+class TestParseWorkflowIdFromFilename:
+    """Tests for parse_workflow_id_from_filename utility."""
+
+    def test_valid_new_format(self):
+        assert (
+            parse_workflow_id_from_filename(
+                "my-detection__wf_4itKqkgCZrLhgYiq5L211X.yml"
+            )
+            == "wf_4itKqkgCZrLhgYiq5L211X"
+        )
+
+    def test_valid_simple(self):
+        assert parse_workflow_id_from_filename("test__wf_abc123.yml") == "wf_abc123"
+
+    def test_old_format_returns_none(self):
+        assert parse_workflow_id_from_filename("definition.yml") is None
+
+    def test_no_double_underscore_returns_none(self):
+        assert parse_workflow_id_from_filename("wf_abc123.yml") is None
+
+    def test_not_yml_returns_none(self):
+        assert parse_workflow_id_from_filename("test__wf_abc123.yaml") is None
+
+    def test_empty_string(self):
+        assert parse_workflow_id_from_filename("") is None
+
+    def test_random_file(self):
+        assert parse_workflow_id_from_filename("README.md") is None
+
+
+class TestIsOldFormatPath:
+    """Tests for is_old_format_path utility."""
+
+    def test_valid_old_format(self):
+        assert is_old_format_path("workflows/wf_abc123/definition.yml") is True
+
+    def test_new_format_returns_false(self):
+        assert is_old_format_path("my-ws/security/test__wf_abc123.yml") is False
+
+    def test_wrong_directory(self):
+        assert is_old_format_path("other/wf_abc123/definition.yml") is False
+
+    def test_wrong_filename(self):
+        assert is_old_format_path("workflows/wf_abc123/other.yml") is False
+
+    def test_too_many_parts(self):
+        assert is_old_format_path("workflows/wf_abc123/sub/definition.yml") is False
+
+    def test_too_few_parts(self):
+        assert is_old_format_path("workflows/definition.yml") is False
+
+
+class TestExtractWfIdFromOldPath:
+    """Tests for extract_wf_id_from_old_path utility."""
+
+    def test_valid_old_path(self):
+        assert (
+            extract_wf_id_from_old_path("workflows/wf_abc123/definition.yml")
+            == "wf_abc123"
+        )
+
+    def test_invalid_path_returns_none(self):
+        assert extract_wf_id_from_old_path("other/wf_abc123/definition.yml") is None
+
+    def test_new_format_returns_none(self):
+        assert extract_wf_id_from_old_path("my-ws/test__wf_abc123.yml") is None
+
+
+class TestDeduplicateContentMap:
+    """Tests for deduplicate_content_map utility."""
+
+    def test_no_duplicates(self):
+        content_map = {
+            "my-ws/test__wf_abc123.yml": "content1",
+            "my-ws/other__wf_def456.yml": "content2",
+        }
+        result = deduplicate_content_map(content_map)
+        assert result == content_map
+
+    def test_old_format_only(self):
+        content_map = {
+            "workflows/wf_abc123/definition.yml": "content1",
+            "workflows/wf_def456/definition.yml": "content2",
+        }
+        result = deduplicate_content_map(content_map)
+        assert result == content_map
+
+    def test_removes_old_when_new_exists(self):
+        content_map = {
+            "workflows/wf_abc123/definition.yml": "old_content",
+            "my-ws/test__wf_abc123.yml": "new_content",
+            "workflows/wf_def456/definition.yml": "only_old",
+        }
+        result = deduplicate_content_map(content_map)
+        assert "workflows/wf_abc123/definition.yml" not in result
+        assert result["my-ws/test__wf_abc123.yml"] == "new_content"
+        assert result["workflows/wf_def456/definition.yml"] == "only_old"
+
+    def test_empty_map(self):
+        assert deduplicate_content_map({}) == {}
+
+    def test_mixed_formats_multiple_overlaps(self):
+        content_map = {
+            "workflows/wf_a/definition.yml": "old_a",
+            "workflows/wf_b/definition.yml": "old_b",
+            "ws/test-a__wf_a.yml": "new_a",
+            "ws/test-b__wf_b.yml": "new_b",
+            "workflows/wf_c/definition.yml": "only_old_c",
+        }
+        result = deduplicate_content_map(content_map)
+        assert len(result) == 3
+        assert "ws/test-a__wf_a.yml" in result
+        assert "ws/test-b__wf_b.yml" in result
+        assert "workflows/wf_c/definition.yml" in result

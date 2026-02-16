@@ -974,6 +974,76 @@ class BaseTablesService(BaseWorkspaceService):
         wait=wait_exponential(multiplier=0.1, min=0.2, max=2),
         reraise=True,
     )
+    async def get_unique_values(
+        self,
+        table_name: str,
+        *,
+        column: str,
+        limit: int | None = None,
+    ) -> list[Any]:
+        """Get distinct values for a column in a table."""
+        schema_name = self._get_schema_name()
+        sanitized_table_name = self._sanitize_identifier(table_name)
+        sanitized_col = self._sanitize_identifier(column)
+
+        col = sa.column(sanitized_col)
+        stmt = (
+            sa.select(col)
+            .select_from(sa.table(sanitized_table_name, schema=schema_name))
+            .where(col.isnot(None))
+            .distinct()
+            .order_by(col)
+        )
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        txn_cm = (
+            self.session.begin_nested()
+            if self.session.in_transaction()
+            else self.session.begin()
+        )
+        async with txn_cm as txn:
+            conn = await txn.session.connection()
+            try:
+                result = await conn.execute(
+                    stmt,
+                    execution_options={
+                        "isolation_level": "READ COMMITTED",
+                    },
+                )
+                return [row[0] for row in result.all()]
+            except _RETRYABLE_DB_EXCEPTIONS as e:
+                self.logger.warning(
+                    "Retryable DB exception occurred",
+                    kind=type(e).__name__,
+                    error=str(e),
+                    table=table_name,
+                    schema=schema_name,
+                )
+                raise
+            except ProgrammingError as e:
+                while (cause := e.__cause__) is not None:
+                    e = cause
+                if isinstance(e, UndefinedTableError):
+                    raise TracecatNotFoundError(
+                        f"Table '{table_name}' does not exist"
+                    ) from e
+                raise ValueError(str(e)) from e
+            except Exception as e:
+                self.logger.error(
+                    "Unexpected DB exception occurred",
+                    kind=type(e).__name__,
+                    error=str(e),
+                    table=table_name,
+                    schema=schema_name,
+                )
+                raise
+
+    @retry(
+        retry=retry_if_exception_type(_RETRYABLE_DB_EXCEPTIONS),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.1, min=0.2, max=2),
+        reraise=True,
+    )
     async def exists_rows(
         self,
         table_name: str,

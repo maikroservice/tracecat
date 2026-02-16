@@ -162,6 +162,48 @@ async def lookup_many(
 
 
 @registry.register(
+    default_title="Get unique values",
+    description="Get distinct values for a column in a table, excluding nulls.",
+    display_group="Tables",
+    namespace="core.table",
+)
+async def get_unique_values(
+    table: Annotated[
+        str,
+        Doc("The table to get unique values from."),
+    ],
+    column: Annotated[
+        str,
+        Doc("The column to get unique values for."),
+    ],
+    limit: Annotated[
+        int,
+        Doc("The maximum number of unique values to return."),
+    ] = 100,
+) -> list[Any]:
+    if limit > config.MAX_ROWS_CLIENT_POSTGRES:
+        raise ValueError(
+            f"Limit cannot be greater than {config.MAX_ROWS_CLIENT_POSTGRES}"
+        )
+
+    if config.flags.registry_client:
+        params: dict[str, Any] = {
+            "table": table,
+            "column": column,
+        }
+        if limit is not None:
+            params["limit"] = limit
+        return await get_context().tables.get_unique_values(**params)
+
+    async with TablesService.with_session() as service:
+        return await service.get_unique_values(
+            table_name=table,
+            column=column,
+            limit=limit,
+        )
+
+
+@registry.register(
     default_title="Search rows",
     description="Search for rows in a table with optional filtering.",
     display_group="Tables",

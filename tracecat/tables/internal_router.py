@@ -63,6 +63,11 @@ class TableSearchRequest(BaseModel):
     limit: int = Field(default=100, ge=1)
 
 
+class TableUniqueValuesRequest(BaseModel):
+    column: str
+    limit: int = Field(default=100, ge=1)
+
+
 class TableRowUpdate(BaseModel):
     data: dict[str, Any]
 
@@ -260,6 +265,41 @@ async def search_rows(
             limit=params.limit,
             offset=params.offset,
         )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+
+@router.post("/{table_name}/unique-values")
+async def get_unique_values(
+    *,
+    role: ExecutorWorkspaceRole,
+    session: AsyncDBSession,
+    table_name: str,
+    params: TableUniqueValuesRequest,
+) -> list[Any]:
+    """Get distinct values for a column in a table."""
+    if params.limit > config.TRACECAT__MAX_ROWS_CLIENT_POSTGRES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Limit cannot be greater than {config.TRACECAT__MAX_ROWS_CLIENT_POSTGRES}"
+            ),
+        )
+    service = TablesService(session, role=role)
+    try:
+        return await service.get_unique_values(
+            table_name,
+            column=params.column,
+            limit=params.limit,
+        )
+    except TracecatNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

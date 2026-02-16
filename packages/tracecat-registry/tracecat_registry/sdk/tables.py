@@ -144,6 +144,22 @@ class TablesClient:
             raise ValueError("Unexpected search response")
         return rows
 
+    async def get_unique_values(
+        self,
+        *,
+        table: str,
+        column: str,
+        limit: int | Unset = UNSET,
+    ) -> list[Any]:
+        """Get distinct values for a column in a table."""
+        data: dict[str, Any] = {"column": column}
+        if is_set(limit):
+            data["limit"] = limit
+        values = await self._client.post(f"/tables/{table}/unique-values", json=data)
+        if not isinstance(values, list):
+            raise ValueError("Unexpected unique values response")
+        return values
+
     async def insert_row(
         self,
         *,

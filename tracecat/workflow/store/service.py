@@ -1,4 +1,3 @@
-from pathlib import Path
 from typing import cast
 
 from tracecat.db.models import Workflow
@@ -9,6 +8,7 @@ from tracecat.identifiers.workflow import WorkflowUUID
 from tracecat.logger import logger
 from tracecat.service import BaseWorkspaceService
 from tracecat.sync import Author, PushObject, PushOptions
+from tracecat.workflow.store.paths import build_workflow_file_path
 from tracecat.workflow.store.schemas import (
     RemoteWebhook,
     RemoteWorkflowDefinition,
@@ -78,15 +78,23 @@ class WorkflowStoreService(BaseWorkspaceService):
             ) from e
         # Note: We could add ref support later if needed via params or workspace settings
 
-        stable_path = get_definition_path(workflow_id)
         webhook = workflow.webhook
 
+        # Refresh relationships needed for path computation and serialization
         await self.session.refresh(workflow, ["tags", "folder"])
 
         # Get folder path if workflow is in a folder
         folder_path = None
         if workflow.folder:
             folder_path = workflow.folder.path
+
+        # Build workspace-aware file path: <workspace>/<folder>/<title>__<wf_id>.yml
+        stable_path = build_workflow_file_path(
+            workspace_name=workspace.name,
+            folder_path=folder_path,
+            title=dsl.title,
+            workflow_id=workflow_id,
+        )
 
         # Create PushObject with data and stable path
         defn = RemoteWorkflowDefinition(
@@ -137,8 +145,3 @@ class WorkflowStoreService(BaseWorkspaceService):
             commit_sha=commit_info.sha,
             ref=commit_info.ref,
         )
-
-
-def get_definition_path(workflow_id: WorkflowUUID) -> Path:
-    """Get the path to the definition file for a workflow."""
-    return Path("workflows").joinpath(workflow_id.short(), "definition.yml")

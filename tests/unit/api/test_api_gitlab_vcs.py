@@ -15,7 +15,7 @@ from fastapi import HTTPException, status
 from fastapi.testclient import TestClient
 
 from tracecat.api.app import app
-from tracecat.auth.dependencies import OrgAdminUser, WorkspaceUserRole
+from tracecat.auth.dependencies import OrgAdminUser, OrgMemberUser
 from tracecat.auth.types import AccessLevel, Role
 from tracecat.authz.enums import WorkspaceRole
 from tracecat.db.engine import get_async_session
@@ -50,12 +50,12 @@ def vcs_client_factory() -> Generator[Callable[[Role], TestClient], None, None]:
     Uses closures over the role so that overrides work correctly regardless
     of thread context propagation.
 
-    - WorkspaceUserRole: passes through any role (no min_access_level)
+    - OrgMemberUser: passes through any role (no min_access_level, no workspace required)
     - OrgAdminUser (from tracecat.auth.dependencies): enforces ADMIN access level
     """
 
     def make_client(role: Role) -> TestClient:
-        def override_workspace_user() -> Role:
+        def override_org_member() -> Role:
             return role
 
         def override_org_admin() -> Role:
@@ -70,10 +70,10 @@ def vcs_client_factory() -> Generator[Callable[[Role], TestClient], None, None]:
         async def override_get_async_session() -> AsyncMock:
             return mock_session
 
-        ws_user_dep = get_args(WorkspaceUserRole)[1].dependency
+        org_member_dep = get_args(OrgMemberUser)[1].dependency
         org_admin_dep = get_args(OrgAdminUser)[1].dependency
 
-        app.dependency_overrides[ws_user_dep] = override_workspace_user
+        app.dependency_overrides[org_member_dep] = override_org_member
         app.dependency_overrides[org_admin_dep] = override_org_admin
         app.dependency_overrides[get_async_session] = override_get_async_session
 

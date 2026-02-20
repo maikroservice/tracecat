@@ -53,6 +53,16 @@ OrgAdminUser = Annotated[
     ),
 ]
 
+OrgMemberUser = Annotated[
+    Role,
+    RoleACL(allow_user=True, allow_service=False, require_workspace="no"),
+]
+"""Dependency for any authenticated organization member (no workspace required).
+
+Use this when the endpoint is org-scoped but should be accessible to all
+members regardless of access level (e.g. read-only status checks).
+"""
+
 
 async def verify_auth_type(auth_type: AuthType) -> None:
     """Verify if an auth type is enabled and properly configured.

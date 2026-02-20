@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import noload
 
-from tracecat.auth.dependencies import OrgAdminUser
+from tracecat.auth.dependencies import OrgAdminUser, WorkspaceUserRole
 from tracecat.db.dependencies import AsyncDBSession
 from tracecat.db.models import Workspace
 from tracecat.git.utils import parse_git_url
@@ -247,7 +247,7 @@ async def save_gitlab_credentials(
 async def get_gitlab_credentials_status(
     *,
     session: AsyncDBSession,
-    role: OrgAdminUser,
+    role: WorkspaceUserRole,
 ) -> GitLabCredentialsStatus:
     """Get the status of GitLab credentials."""
     try:

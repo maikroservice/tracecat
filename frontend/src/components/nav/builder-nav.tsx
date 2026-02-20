@@ -516,7 +516,7 @@ function WorkflowManualTrigger({
   )
 }
 
-function WorkflowSaveActions({
+export function WorkflowSaveActions({
   workflow,
   validationErrors,
   onSave,
@@ -600,6 +600,7 @@ function WorkflowSaveActions({
             <DropdownMenuTrigger asChild>
               <Button
                 variant="outline"
+                data-testid="git-publish-dropdown-trigger"
                 className="h-full w-7 rounded-l-none border-none px-1 py-0 text-xs text-muted-foreground"
               >
                 <ChevronDownIcon className="size-3" />

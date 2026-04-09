@@ -515,6 +515,34 @@ def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
     )
 
 builtins.__import__ = _restricted_import
+
+# --- Restricted open() to block access to sensitive procfs paths ---
+_original_open = builtins.open
+
+_BLOCKED_PATH_PREFIXES = ("/proc/", "/sys/")
+
+def _restricted_open(*args, **kwargs):
+    """Wrapper around open() that blocks access to sensitive filesystem paths.
+
+    Uses os.path.realpath to resolve symlinks, .., and other traversal
+    tricks before checking against blocked prefixes.
+    """
+    if not _wrapper_initialized:
+        return _original_open(*args, **kwargs)
+
+    file_arg = args[0] if args else kwargs.get("file")
+    if file_arg is not None:
+        resolved = os.path.realpath(str(file_arg))
+        for prefix in _BLOCKED_PATH_PREFIXES:
+            if resolved.startswith(prefix) or resolved == prefix.rstrip("/"):
+                raise PermissionError(
+                    f"Access to '{{resolved}}' is blocked for security reasons. "
+                    f"Scripts cannot access {{prefix.strip('/')}} filesystem paths."
+                )
+
+    return _original_open(*args, **kwargs)
+
+builtins.open = _restricted_open
 '''
 
 # Wrapper script for safe execution

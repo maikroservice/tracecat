@@ -95,7 +95,9 @@ SAFE_STDLIB_MODULES = frozenset(
         "difflib",
         "fnmatch",
         "struct",
-        "io",
+        # NOTE: 'io' is intentionally NOT included here. io.FileIO and io.open
+        # can bypass the restricted builtins.open wrapper, allowing access to
+        # sensitive paths like /proc/*/environ.
         # NOTE: 'inspect' is intentionally NOT included here due to security risks.
         # inspect.currentframe().f_back.f_globals allows sandbox escape via frame
         # introspection. It IS blocked in SafeLambdaValidator.DENYLISTED_SYMBOLS for lambdas.
@@ -516,33 +518,80 @@ def _restricted_import(name, globals=None, locals=None, fromlist=(), level=0):
 
 builtins.__import__ = _restricted_import
 
-# --- Restricted open() to block access to sensitive procfs paths ---
-_original_open = builtins.open
+# --- Restricted file access to block sensitive procfs/sysfs paths ---
+import io as _io
+import pathlib as _pathlib
 
 _BLOCKED_PATH_PREFIXES = ("/proc/", "/sys/")
 
+def _check_blocked_path(file_arg):
+    """Resolve a path and raise if it falls under a blocked prefix."""
+    if file_arg is None:
+        return
+    resolved = os.path.realpath(str(file_arg))
+    for prefix in _BLOCKED_PATH_PREFIXES:
+        if resolved.startswith(prefix) or resolved == prefix.rstrip("/"):
+            raise PermissionError(
+                f"Access to '{{resolved}}' is blocked for security reasons. "
+                f"Scripts cannot access {{prefix.strip('/')}} filesystem paths."
+            )
+
+# 1. Patch builtins.open
+_original_open = builtins.open
+
 def _restricted_open(*args, **kwargs):
-    """Wrapper around open() that blocks access to sensitive filesystem paths.
-
-    Uses os.path.realpath to resolve symlinks, .., and other traversal
-    tricks before checking against blocked prefixes.
-    """
-    if not _wrapper_initialized:
-        return _original_open(*args, **kwargs)
-
-    file_arg = args[0] if args else kwargs.get("file")
-    if file_arg is not None:
-        resolved = os.path.realpath(str(file_arg))
-        for prefix in _BLOCKED_PATH_PREFIXES:
-            if resolved.startswith(prefix) or resolved == prefix.rstrip("/"):
-                raise PermissionError(
-                    f"Access to '{{resolved}}' is blocked for security reasons. "
-                    f"Scripts cannot access {{prefix.strip('/')}} filesystem paths."
-                )
-
+    if _wrapper_initialized:
+        file_arg = args[0] if args else kwargs.get("file")
+        _check_blocked_path(file_arg)
     return _original_open(*args, **kwargs)
 
 builtins.open = _restricted_open
+
+# 2. Patch io.open
+_original_io_open = _io.open
+
+def _restricted_io_open(*args, **kwargs):
+    if _wrapper_initialized:
+        file_arg = args[0] if args else kwargs.get("file")
+        _check_blocked_path(file_arg)
+    return _original_io_open(*args, **kwargs)
+
+_io.open = _restricted_io_open
+
+# 3. Patch io.FileIO to catch low-level file access
+_original_FileIO_init = _io.FileIO.__init__
+
+def _restricted_FileIO_init(self, *args, **kwargs):
+    if _wrapper_initialized:
+        file_arg = args[0] if args else kwargs.get("file", kwargs.get("name"))
+        _check_blocked_path(file_arg)
+    return _original_FileIO_init(self, *args, **kwargs)
+
+_io.FileIO.__init__ = _restricted_FileIO_init
+
+# 4. Patch pathlib.Path methods that read files
+_original_path_open = _pathlib.Path.open
+_original_path_read_text = _pathlib.Path.read_text
+_original_path_read_bytes = _pathlib.Path.read_bytes
+
+def _restricted_path_open(self, *args, **kwargs):
+    if _wrapper_initialized:
+        _check_blocked_path(self)
+    return _original_path_open(self, *args, **kwargs)
+
+def _restricted_path_read_text(self, *args, **kwargs):
+    if _wrapper_initialized:
+        _check_blocked_path(self)
+    return _original_path_read_text(self, *args, **kwargs)
+
+def _restricted_path_read_bytes(self, *args, **kwargs):
+    if _wrapper_initialized:
+        _check_blocked_path(self)
+    return _original_path_read_bytes(self, *args, **kwargs)
+
+_pathlib.Path.open = _restricted_path_open
+_pathlib.Path.read_text = _restricted_path_read_text
+_pathlib.Path.read_bytes = _restricted_path_read_bytes
 '''
 
 # Wrapper script for safe execution

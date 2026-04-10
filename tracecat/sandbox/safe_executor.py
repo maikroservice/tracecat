@@ -558,18 +558,7 @@ def _restricted_io_open(*args, **kwargs):
 
 _io.open = _restricted_io_open
 
-# 3. Patch io.FileIO to catch low-level file access
-_original_FileIO_init = _io.FileIO.__init__
-
-def _restricted_FileIO_init(self, *args, **kwargs):
-    if _wrapper_initialized:
-        file_arg = args[0] if args else kwargs.get("file", kwargs.get("name"))
-        _check_blocked_path(file_arg)
-    return _original_FileIO_init(self, *args, **kwargs)
-
-_io.FileIO.__init__ = _restricted_FileIO_init
-
-# 4. Patch pathlib.Path methods that read files
+# 3. Patch pathlib.Path methods that read files
 _original_path_open = _pathlib.Path.open
 _original_path_read_text = _pathlib.Path.read_text
 _original_path_read_bytes = _pathlib.Path.read_bytes

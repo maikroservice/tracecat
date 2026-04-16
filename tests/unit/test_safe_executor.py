@@ -10,7 +10,11 @@ from tracecat.sandbox.exceptions import (
     SandboxTimeoutError,
     SandboxValidationError,
 )
-from tracecat.sandbox.safe_executor import SafePythonExecutor, _extract_package_name
+from tracecat.sandbox.safe_executor import (
+    SafePythonExecutor,
+    _extract_package_name,
+    _extract_top_level_names_from_record,
+)
 
 
 class TestExtractPackageName:
@@ -36,6 +40,65 @@ class TestExtractPackageName:
         """Test that hyphenated package names are normalized."""
         assert _extract_package_name("py-ocsf-models") == "py_ocsf_models"
         assert _extract_package_name("py-ocsf-models==0.8.0") == "py_ocsf_models"
+
+
+class TestExtractTopLevelNamesFromRecord:
+    """Test the RECORD-based top-level name extraction helper."""
+
+    def test_package_directory(self):
+        """Test extracting a package directory from RECORD."""
+        record = (
+            "whois/__init__.py,sha256=abc,100\n"
+            "whois/parser.py,sha256=def,200\n"
+            "python_whois-0.9.1.dist-info/METADATA,sha256=ghi,300\n"
+            "python_whois-0.9.1.dist-info/RECORD,,\n"
+        )
+        names = _extract_top_level_names_from_record(record)
+        assert names == {"whois"}
+
+    def test_single_file_module(self):
+        """Test extracting a single-file module from RECORD."""
+        record = (
+            "six.py,sha256=abc,100\n"
+            "six-1.16.0.dist-info/METADATA,sha256=def,200\n"
+            "six-1.16.0.dist-info/RECORD,,\n"
+        )
+        names = _extract_top_level_names_from_record(record)
+        assert names == {"six"}
+
+    def test_skips_dist_info_and_data(self):
+        """Test that dist-info and data directories are skipped."""
+        record = (
+            "mypackage/__init__.py,sha256=abc,100\n"
+            "mypackage-1.0.dist-info/METADATA,sha256=def,200\n"
+            "mypackage-1.0.data/scripts/mycli,sha256=ghi,300\n"
+        )
+        names = _extract_top_level_names_from_record(record)
+        assert names == {"mypackage"}
+
+    def test_multiple_packages(self):
+        """Test extracting multiple top-level packages from RECORD."""
+        record = (
+            "pkg_a/__init__.py,sha256=abc,100\n"
+            "pkg_b/__init__.py,sha256=def,200\n"
+            "mylib-1.0.dist-info/METADATA,sha256=ghi,300\n"
+        )
+        names = _extract_top_level_names_from_record(record)
+        assert names == {"pkg_a", "pkg_b"}
+
+    def test_empty_record(self):
+        """Test with empty RECORD content."""
+        names = _extract_top_level_names_from_record("")
+        assert names == set()
+
+    def test_skips_private_modules(self):
+        """Test that underscore-prefixed top-level .py files are skipped."""
+        record = (
+            "_internal.py,sha256=abc,100\n"
+            "public.py,sha256=def,200\n"
+        )
+        names = _extract_top_level_names_from_record(record)
+        assert names == {"public"}
 
 
 class TestSafePythonExecutorBasics:
@@ -503,6 +566,61 @@ class TestCaching:
         )
 
         assert "bs4" in allowed
+
+    def test_allowed_modules_from_record_fallback(self, executor, tmp_path):
+        """Test that import names are resolved from RECORD when top_level.txt is missing.
+
+        This handles packages where the install name differs from the import name
+        (e.g., python-whois installs as python-whois but imports as whois).
+        """
+        venv_path = tmp_path / "venv"
+        python_dir = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        site_packages = venv_path / "lib" / python_dir / "site-packages"
+        site_packages.mkdir(parents=True)
+
+        dist_info = site_packages / "python_whois-0.9.1.dist-info"
+        dist_info.mkdir()
+        (dist_info / "METADATA").write_text(
+            "Name: python-whois\nVersion: 0.9.1\n"
+        )
+        # No top_level.txt — simulate packages that don't include it
+        (dist_info / "RECORD").write_text(
+            "whois/__init__.py,sha256=abc,100\n"
+            "whois/parser.py,sha256=def,200\n"
+            "whois/whois.py,sha256=ghi,300\n"
+            "python_whois-0.9.1.dist-info/METADATA,sha256=jkl,400\n"
+            "python_whois-0.9.1.dist-info/RECORD,,\n"
+        )
+
+        allowed = executor._get_allowed_modules(
+            ["python-whois"],
+            venv_path=venv_path,
+        )
+
+        assert "whois" in allowed
+
+    def test_allowed_modules_from_record_single_file_module(self, executor, tmp_path):
+        """Test RECORD fallback with a single-file module (e.g., six.py)."""
+        venv_path = tmp_path / "venv"
+        python_dir = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        site_packages = venv_path / "lib" / python_dir / "site-packages"
+        site_packages.mkdir(parents=True)
+
+        dist_info = site_packages / "six-1.16.0.dist-info"
+        dist_info.mkdir()
+        (dist_info / "METADATA").write_text("Name: six\nVersion: 1.16.0\n")
+        (dist_info / "RECORD").write_text(
+            "six.py,sha256=abc,100\n"
+            "six-1.16.0.dist-info/METADATA,sha256=def,200\n"
+            "six-1.16.0.dist-info/RECORD,,\n"
+        )
+
+        allowed = executor._get_allowed_modules(
+            ["six"],
+            venv_path=venv_path,
+        )
+
+        assert "six" in allowed
 
 
 class TestAllowNetwork:

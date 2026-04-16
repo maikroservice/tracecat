@@ -12,7 +12,9 @@ running without privileged Docker mode).
 
 import ast
 import asyncio
+import csv
 import hashlib
+import io
 import json
 import os
 import re
@@ -714,6 +716,40 @@ def _extract_package_name(dependency: str) -> str:
     return base_name.replace("-", "_")
 
 
+def _extract_top_level_names_from_record(record_text: str) -> set[str]:
+    """Extract top-level importable module names from a RECORD file.
+
+    The RECORD file lists all installed files in CSV format. Top-level
+    importable modules are directories containing __init__.py or .py files
+    at the root level (not inside .dist-info or .data directories).
+
+    Args:
+        record_text: Contents of the RECORD file.
+
+    Returns:
+        Set of top-level module names found in the RECORD.
+    """
+    top_level_names: set[str] = set()
+    reader = csv.reader(io.StringIO(record_text))
+    for row in reader:
+        if not row:
+            continue
+        path = row[0]
+        # Skip dist-info and data directories
+        if ".dist-info/" in path or ".data/" in path:
+            continue
+        parts = path.split("/")
+        if len(parts) >= 2 and parts[1] == "__init__.py":
+            # Package directory: e.g., "whois/__init__.py" -> "whois"
+            top_level_names.add(parts[0])
+        elif len(parts) == 1 and path.endswith(".py"):
+            # Top-level module file: e.g., "six.py" -> "six"
+            module_name = path[:-3]
+            if module_name and not module_name.startswith("_"):
+                top_level_names.add(module_name)
+    return top_level_names
+
+
 class SafePythonExecutor:
     """Executor for Python scripts without nsjail, using subprocess isolation.
 
@@ -825,8 +861,21 @@ class SafePythonExecutor:
                         module_name = line.strip()
                         if module_name:
                             import_names.add(module_name)
-                else:
-                    import_names.add(_extract_package_name(dist_name))
+                    continue
+
+                # Fallback: read RECORD to find top-level importable names.
+                # This handles packages where the install name differs from
+                # the import name (e.g., python-whois -> whois) and
+                # top_level.txt is not present.
+                record = dist.read_text("RECORD")
+                if record:
+                    record_names = _extract_top_level_names_from_record(record)
+                    if record_names:
+                        import_names.update(record_names)
+                        continue
+
+                # Final fallback: derive from distribution name
+                import_names.add(_extract_package_name(dist_name))
 
         return import_names
 

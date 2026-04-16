@@ -1,0 +1,158 @@
+name: Build and push fork images
+
+on:
+  push:
+    branches: ["main"]
+
+env:
+  REGISTRY: ghcr.io
+  API_IMAGE: ghcr.io/maikroservice/tracecat
+  UI_IMAGE: ghcr.io/maikroservice/tracecat-ui
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      api: ${{ steps.filter.outputs.api }}
+      ui: ${{ steps.filter.outputs.ui }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Detect changed paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            api:
+              - 'tracecat/**'
+              - 'packages/**'
+              - 'Dockerfile'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - 'alembic/**'
+              - 'entrypoint.sh'
+            ui:
+              - 'frontend/**'
+
+  build-and-push-api:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.api == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get next version
+        id: version
+        run: |
+          # Fetch the latest tag from GHCR and bump the patch number
+          TOKEN=$(echo "${{ secrets.GITHUB_TOKEN }}" | base64)
+          TAGS=$(curl -s -H "Authorization: Bearer ${TOKEN}" \
+            "https://ghcr.io/v2/maikroservice/tracecat/tags/list" | jq -r '.tags[]?' 2>/dev/null || echo "")
+
+          if [ -z "$TAGS" ]; then
+            version=$(python -c "exec(open('tracecat/__init__.py').read()); print(__version__)")
+          else
+            latest=$(echo "$TAGS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+            if [ -z "$latest" ]; then
+              version=$(python -c "exec(open('tracecat/__init__.py').read()); print(__version__)")
+            else
+              IFS='.' read -r major minor patch <<< "$latest"
+              version="${major}.${minor}.$((patch + 1))"
+            fi
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Next version: $version"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push API
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          target: production
+          push: true
+          no-cache: true
+          tags: |
+            ${{ env.API_IMAGE }}:${{ steps.version.outputs.version }}
+            ${{ env.API_IMAGE }}:latest
+
+  build-and-push-ui:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.ui == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Get next version
+        id: version
+        run: |
+          # Fetch the latest tag from GHCR and bump the patch number
+          TOKEN=$(echo "${{ secrets.GITHUB_TOKEN }}" | base64)
+          TAGS=$(curl -s -H "Authorization: Bearer ${TOKEN}" \
+            "https://ghcr.io/v2/maikroservice/tracecat-ui/tags/list" | jq -r '.tags[]?' 2>/dev/null || echo "")
+
+          if [ -z "$TAGS" ]; then
+            version=$(python -c "exec(open('tracecat/__init__.py').read()); print(__version__)")
+          else
+            latest=$(echo "$TAGS" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)
+            if [ -z "$latest" ]; then
+              version=$(python -c "exec(open('tracecat/__init__.py').read()); print(__version__)")
+            else
+              IFS='.' read -r major minor patch <<< "$latest"
+              version="${major}.${minor}.$((patch + 1))"
+            fi
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Next version: $version"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push UI
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          file: frontend/Dockerfile.prod
+          platforms: linux/amd64,linux/arm64
+          push: true
+          no-cache: true
+          build-args: |
+            NEXT_PUBLIC_API_URL=http://localhost:8000
+            NEXT_PUBLIC_APP_URL=http://localhost:3000
+            NEXT_SERVER_API_URL=http://localhost:8000
+            NEXT_PUBLIC_APP_ENV=production
+            NODE_ENV=production
+          tags: |
+            ${{ env.UI_IMAGE }}:${{ steps.version.outputs.version }}
+            ${{ env.UI_IMAGE }}:latest

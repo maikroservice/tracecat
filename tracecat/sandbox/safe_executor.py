@@ -87,6 +87,7 @@ SAFE_STDLIB_MODULES = frozenset(
         "zipfile",
         "zlib",
         # Other safe modules
+        "builtins",
         "uuid",
         "contextlib",
         "warnings",

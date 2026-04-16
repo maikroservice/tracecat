@@ -622,6 +622,45 @@ class TestCaching:
 
         assert "six" in allowed
 
+    def test_allowed_modules_includes_transitive_deps(self, executor, tmp_path):
+        """Test that transitive dependencies are included in the allowlist.
+
+        When python-whois is declared, its transitive deps (tldextract, urllib3)
+        should also be allowed since the import hook's origin check can miss
+        transitive imports when globals context is lost.
+        """
+        venv_path = tmp_path / "venv"
+        python_dir = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        site_packages = venv_path / "lib" / python_dir / "site-packages"
+        site_packages.mkdir(parents=True)
+
+        # Declared dep
+        dist_info = site_packages / "python_whois-0.9.1.dist-info"
+        dist_info.mkdir()
+        (dist_info / "METADATA").write_text("Name: python-whois\nVersion: 0.9.1\n")
+        (dist_info / "top_level.txt").write_text("whois\n")
+
+        # Transitive dep
+        dist_info2 = site_packages / "tldextract-5.0.0.dist-info"
+        dist_info2.mkdir()
+        (dist_info2 / "METADATA").write_text("Name: tldextract\nVersion: 5.0.0\n")
+        (dist_info2 / "top_level.txt").write_text("tldextract\n")
+
+        # Transitive dep of transitive dep
+        dist_info3 = site_packages / "urllib3-2.0.0.dist-info"
+        dist_info3.mkdir()
+        (dist_info3 / "METADATA").write_text("Name: urllib3\nVersion: 2.0.0\n")
+        (dist_info3 / "top_level.txt").write_text("urllib3\n")
+
+        allowed = executor._get_allowed_modules(
+            ["python-whois"],
+            venv_path=venv_path,
+        )
+
+        assert "whois" in allowed
+        assert "tldextract" in allowed
+        assert "urllib3" in allowed
+
 
 class TestAllowNetwork:
     """Test allow_network parameter behavior."""

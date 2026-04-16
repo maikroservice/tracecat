@@ -17,7 +17,6 @@ import hashlib
 import io
 import json
 import os
-import re
 import shutil
 import tempfile
 import time
@@ -700,11 +699,6 @@ def _extract_dependency_base_name(dependency: str) -> str:
     return name.strip()
 
 
-def _normalize_distribution_name(name: str) -> str:
-    """Normalize a distribution name using PEP 503 rules."""
-    return re.sub(r"[-_.]+", "-", name).lower()
-
-
 def _extract_package_name(dependency: str) -> str:
     """Extract base package name from dependency spec.
 
@@ -823,20 +817,16 @@ class SafePythonExecutor:
     def _get_dependency_import_names(
         self,
         venv_path: Path,
-        dependencies: list[str],
     ) -> set[str]:
-        """Resolve top-level import names for dependencies from venv metadata."""
-        if not dependencies:
-            return set()
+        """Resolve top-level import names for all packages in the venv.
 
-        normalized_deps = {
-            _normalize_distribution_name(_extract_dependency_base_name(dep))
-            for dep in dependencies
-        }
-        normalized_deps.discard("")
-        if not normalized_deps:
-            return set()
-
+        Scans every installed distribution (declared deps + transitive deps)
+        because the runtime import hook's origin check can miss transitive
+        imports when globals context is lost (e.g., importlib.import_module,
+        C extensions, lazy loaders). Since the venv is isolated and only
+        contains packages installed for the declared dependencies, allowing
+        all of them is safe.
+        """
         import_names: set[str] = set()
         for site_packages in self._iter_site_packages_paths(venv_path):
             try:
@@ -852,8 +842,6 @@ class SafePythonExecutor:
             for dist in distributions:
                 dist_name = dist.metadata.get("Name")
                 if not dist_name:
-                    continue
-                if _normalize_distribution_name(dist_name) not in normalized_deps:
                     continue
 
                 top_level = dist.read_text("top_level.txt")
@@ -911,7 +899,7 @@ class SafePythonExecutor:
             )
 
         if venv_path is not None:
-            allowed.update(self._get_dependency_import_names(venv_path, dependencies))
+            allowed.update(self._get_dependency_import_names(venv_path))
 
         return allowed
 

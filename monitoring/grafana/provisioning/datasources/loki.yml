@@ -1,0 +1,15 @@
+apiVersion: 1
+
+datasources:
+  - name: Loki
+    type: loki
+    uid: loki
+    url: http://loki.internal:3100
+    access: proxy
+    editable: false
+    jsonData:
+      derivedFields:
+        - name: TraceID
+          matcherRegex: '"trace_id":"(\w+)"'
+          url: "$${__value.raw}"
+          datasourceUid: tempo

@@ -1,0 +1,108 @@
+# Shared observability stack — deploy once, used by all services (Tracecat, IRIS, etc.)
+#
+# Usage:
+#   docker compose -f docker-compose-observability.yml up -d
+#
+# Services connect by joining the host network or pointing their OTLP endpoint at:
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.internal:4317
+
+services:
+  otel-collector:
+    hostname: otel-collector.internal
+    image: otel/opentelemetry-collector-contrib:latest
+    restart: unless-stopped
+    command: ["--config=/etc/otel-collector.yaml"]
+    volumes:
+      - ./monitoring/otel-collector/otel-collector.yaml:/etc/otel-collector.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "13133:13133" # health check
+
+  tempo:
+    hostname: tempo.internal
+    image: grafana/tempo:latest
+    restart: unless-stopped
+    user: "0"
+    command: ["-config.file=/etc/tempo/tempo-config.yml"]
+    volumes:
+      - ./monitoring/tempo/tempo-config.yml:/etc/tempo/tempo-config.yml:ro
+      - tempo_data:/var/tempo
+    ports:
+      - "3200:3200"
+
+  loki:
+    hostname: loki.internal
+    image: grafana/loki:latest
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/loki-config.yaml"]
+    volumes:
+      - ./monitoring/loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki_data:/loki
+    ports:
+      - "3100:3100"
+
+  prometheus:
+    hostname: prometheus.internal
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-remote-write-receiver"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+
+  grafana:
+    hostname: grafana.internal
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD:-changeme}
+      GF_FEATURE_TOGGLES_ENABLE: traceqlEditor
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+
+  alloy:
+    hostname: alloy.internal
+    image: grafana/alloy:latest
+    restart: unless-stopped
+    command: run /etc/alloy/config.alloy
+    volumes:
+      - ./monitoring/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+
+  node-exporter:
+    hostname: node-exporter.internal
+    image: prom/node-exporter:v1.10.2
+    restart: unless-stopped
+    pid: host
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/host/root"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+
+volumes:
+  tempo_data:
+  loki_data:
+  prometheus_data:
+  grafana_data:

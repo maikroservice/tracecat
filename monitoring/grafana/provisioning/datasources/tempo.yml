@@ -1,0 +1,15 @@
+apiVersion: 1
+
+datasources:
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    url: http://tempo.internal:3200
+    access: proxy
+    editable: false
+    jsonData:
+      httpMethod: GET
+      serviceMap:
+        datasourceUid: prometheus
+      lokiSearch:
+        datasourceUid: loki

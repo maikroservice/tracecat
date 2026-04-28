@@ -1,0 +1,56 @@
+// Discover all Docker Compose-managed containers
+discovery.docker "all" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "15s"
+}
+
+// Keep only containers with a compose project label; enrich with useful labels
+discovery.relabel "compose_containers" {
+  targets = discovery.docker.all.targets
+
+  // Only Docker Compose containers
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    regex         = ".+"
+    action        = "keep"
+  }
+
+  // Drop Alloy itself to avoid feedback loop
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    regex         = "alloy"
+    action        = "drop"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    target_label  = "compose_project"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service_name"
+  }
+
+  // Strip the leading slash from container names
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/?(.*)"
+    replacement   = "$1"
+    target_label  = "container"
+  }
+}
+
+// Read logs via Docker API and forward to Loki
+loki.source.docker "all" {
+  host             = "unix:///var/run/docker.sock"
+  targets          = discovery.relabel.compose_containers.output
+  forward_to       = [loki.write.shared.receiver]
+  refresh_interval = "15s"
+}
+
+loki.write "shared" {
+  endpoint {
+    url = "http://loki.internal:3100/loki/api/v1/push"
+  }
+}

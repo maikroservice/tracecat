@@ -3,17 +3,21 @@
 These models define the contract between the trusted orchestrator (outside NSJail)
 and the sandboxed runtime (inside NSJail).
 
-Uses pure dataclasses with orjson for minimal import footprint.
+Uses explicit DTO serialization with orjson for the socket boundary.
 """
 
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from tracecat.agent.common.stream_types import UnifiedStreamEvent
-from tracecat.agent.common.types import MCPToolDefinition, SandboxAgentConfig
+from tracecat.agent.common.types import (
+    MCPToolDefinition,
+    SandboxAgentConfig,
+    SandboxSubagentConfig,
+)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -23,9 +27,8 @@ class RuntimeInitPayload:
     The orchestrator sends this after the runtime connects to the control socket.
     Contains everything the runtime needs to execute an agent turn.
 
-    On resume after approval, the sdk_session_data contains the proper tool_result
-    entry (inserted by execute_approved_tools_activity before reload), so the
-    runtime just resumes normally.
+    On resume after approval, sdk_session_data already includes the approved or
+    denied tool_result entry.
     """
 
     # Runtime selection
@@ -37,10 +40,11 @@ class RuntimeInitPayload:
     mcp_auth_token: str  # JWT for MCP auth
     config: SandboxAgentConfig
     user_prompt: str
-    litellm_auth_token: str
+    llm_gateway_auth_token: str
 
     # Resolved tool definitions (orchestrator resolves action names → full definitions)
     allowed_actions: dict[str, MCPToolDefinition] | None = None
+    subagents: list[SandboxSubagentConfig] = field(default_factory=list)
     sdk_session_id: str | None = None
     sdk_session_data: str | None = None  # JSONL content for resume
     is_approval_continuation: bool = False  # True when resuming after approval decision
@@ -50,7 +54,7 @@ class RuntimeInitPayload:
     def from_dict(cls, data: dict[str, Any]) -> RuntimeInitPayload:
         """Construct from dict (orjson parsed)."""
         # Parse config
-        config = SandboxAgentConfig.from_dict(data["config"])
+        config = SandboxAgentConfig.model_validate(data["config"])
 
         # Parse allowed_actions
         allowed_actions = None
@@ -71,8 +75,12 @@ class RuntimeInitPayload:
             mcp_auth_token=data["mcp_auth_token"],
             config=config,
             user_prompt=data["user_prompt"],
-            litellm_auth_token=data["litellm_auth_token"],
+            llm_gateway_auth_token=data["llm_gateway_auth_token"],
             allowed_actions=allowed_actions,
+            subagents=[
+                SandboxSubagentConfig.model_validate(item)
+                for item in data.get("subagents", [])
+            ],
             sdk_session_id=data.get("sdk_session_id"),
             sdk_session_data=data.get("sdk_session_data"),
             is_approval_continuation=data.get("is_approval_continuation", False),
@@ -85,9 +93,9 @@ class RuntimeInitPayload:
             "runtime_type": self.runtime_type,
             "session_id": str(self.session_id),
             "mcp_auth_token": self.mcp_auth_token,
-            "config": self.config.to_dict(),
+            "config": self.config.model_dump(mode="json", exclude_none=True),
             "user_prompt": self.user_prompt,
-            "litellm_auth_token": self.litellm_auth_token,
+            "llm_gateway_auth_token": self.llm_gateway_auth_token,
             "is_approval_continuation": self.is_approval_continuation,
             "is_fork": self.is_fork,
         }
@@ -95,6 +103,11 @@ class RuntimeInitPayload:
             result["allowed_actions"] = {
                 k: v.to_dict() for k, v in self.allowed_actions.items()
             }
+        if self.subagents:
+            result["subagents"] = [
+                subagent.model_dump(mode="json", exclude_none=True)
+                for subagent in self.subagents
+            ]
         if self.sdk_session_id is not None:
             result["sdk_session_id"] = self.sdk_session_id
         if self.sdk_session_data is not None:
@@ -143,6 +156,7 @@ class RuntimeEventEnvelope:
     result_usage: dict[str, Any] | None = None
     result_num_turns: int | None = None
     result_duration_ms: int | None = None
+    result_output: Any = None
     # For type="log" - structured log forwarding from sandbox
     log_level: str | None = None  # "debug", "info", "warning", "error"
     log_message: str | None = None
@@ -167,6 +181,10 @@ class RuntimeEventEnvelope:
             result_usage=data.get("result_usage"),
             result_num_turns=data.get("result_num_turns"),
             result_duration_ms=data.get("result_duration_ms"),
+            result_output=data.get(
+                "result_output",
+                data.get("result_structured_output", data.get("result_result")),
+            ),
             log_level=data.get("log_level"),
             log_message=data.get("log_message"),
             log_extra=data.get("log_extra"),
@@ -195,6 +213,8 @@ class RuntimeEventEnvelope:
             result["result_num_turns"] = self.result_num_turns
         if self.result_duration_ms is not None:
             result["result_duration_ms"] = self.result_duration_ms
+        if self.result_output is not None:
+            result["result_output"] = self.result_output
         if self.log_level is not None:
             result["log_level"] = self.log_level
         if self.log_message is not None:
@@ -261,6 +281,7 @@ class RuntimeEventEnvelope:
         usage: dict[str, Any] | None = None,
         num_turns: int | None = None,
         duration_ms: int | None = None,
+        output: Any = None,
     ) -> RuntimeEventEnvelope:
         """Create a result envelope with usage data from Claude SDK ResultMessage."""
         return cls(
@@ -268,6 +289,7 @@ class RuntimeEventEnvelope:
             result_usage=usage,
             result_num_turns=num_turns,
             result_duration_ms=duration_ms,
+            result_output=output,
         )
 
     @classmethod

@@ -19,10 +19,11 @@ def to_jsonable_python(value: Any) -> Any:
     return _to_jsonable_python(value, fallback=fallback, exclude_none=True)
 
 
-# Maximum number of rows that can be returned from client-facing queries
-MAX_ROWS_CLIENT_POSTGRES = int(
-    os.environ.get("TRACECAT__MAX_ROWS_CLIENT_POSTGRES", 1000)
-)
+# API list/search limits (mirror tracecat/config.py where relevant)
+TRACECAT__LIMIT_MIN = 1
+TRACECAT__LIMIT_DEFAULT = 20
+TRACECAT__LIMIT_CURSOR_MAX = 200
+TRACECAT__LIMIT_TABLE_DOWNLOAD_MAX = 1000
 
 # File upload limits
 TRACECAT__MAX_FILE_SIZE_BYTES = int(
@@ -38,6 +39,13 @@ TRACECAT__MAX_AGGREGATE_UPLOAD_SIZE_BYTES = int(
 # S3 concurrency limit
 TRACECAT__S3_CONCURRENCY_LIMIT = int(
     os.environ.get("TRACECAT__S3_CONCURRENCY_LIMIT", 10)
+)
+
+# DuckDB extension directory. Set in the Docker images to the directory that
+# preinstalled DuckDB extensions are copied into. Left unset in local/dev/test
+# environments, where DuckDB falls back to its default autoinstall behaviour.
+TRACECAT__DUCKDB_EXTENSION_DIRECTORY = os.environ.get(
+    "TRACECAT__DUCKDB_EXTENSION_DIRECTORY"
 )
 
 # Database connection validation (used to prevent connecting to internal DB)
@@ -56,26 +64,3 @@ TRACECAT__AGENT_MAX_TOOL_CALLS = int(
 
 TRACECAT__AGENT_MAX_REQUESTS = int(os.environ.get("TRACECAT__AGENT_MAX_REQUESTS", 120))
 """The maximum number of requests that can be made per agent run."""
-
-
-class _FeatureFlags:
-    """Feature flags checked directly from env to avoid heavy tracecat imports.
-
-    Attributes are set in __init__ to allow patching in tests.
-    """
-
-    def __init__(self) -> None:
-        _flags = os.environ.get("TRACECAT__FEATURE_FLAGS", "")
-        self.registry_client: bool = "registry-client" in _flags
-        """Use SDK/API client instead of direct DB access in sandbox mode."""
-        self.case_tasks: bool = "case-tasks" in _flags
-        """Enable case tasks (enterprise feature)."""
-        self.case_durations: bool = "case-durations" in _flags
-        """Enable case durations (enterprise feature)."""
-        self.agent_presets: bool = "agent-presets" in _flags
-        """Enable agent presets UDFs."""
-        self.ai_ranking: bool = "ai-ranking" in _flags
-        """Enable AI ranking UDFs."""
-
-
-flags = _FeatureFlags()

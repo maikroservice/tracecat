@@ -11,6 +11,7 @@ import { useForm } from "react-hook-form"
 import { z } from "zod"
 import { ApiError } from "@/client"
 import { Icons } from "@/components/icons"
+import { CenteredSpinner } from "@/components/loading/spinner"
 import { Button } from "@/components/ui/button"
 import {
   CardContent,
@@ -28,7 +29,9 @@ import {
 } from "@/components/ui/form"
 import { Input } from "@/components/ui/input"
 import { useAuth, useAuthActions } from "@/hooks/use-auth"
+import { getPostAuthRedirectPath } from "@/lib/auth-redirect"
 import type { RequestValidationError, TracecatApiError } from "@/lib/errors"
+import { useAppInfo } from "@/lib/hooks"
 import { cn } from "@/lib/utils"
 
 // Move type definition outside the function for reuse
@@ -53,14 +56,79 @@ function isEmailLoginValidationError(
   )
 }
 
-export function SignUp({ className }: React.HTMLProps<HTMLDivElement>) {
+interface SignUpProps extends React.HTMLProps<HTMLDivElement> {
+  returnUrl?: string | null
+  organizationSlug?: string | null
+}
+
+function buildSignInPath(
+  returnUrl?: string | null,
+  organizationSlug?: string | null
+): string {
+  const params = new URLSearchParams()
+  if (returnUrl) {
+    params.set("returnUrl", returnUrl)
+  }
+  if (organizationSlug) {
+    params.set("org", organizationSlug)
+  }
+  const query = params.toString()
+  return query ? `/sign-in?${query}` : "/sign-in"
+}
+
+export function SignUp({
+  className,
+  returnUrl,
+  organizationSlug,
+}: SignUpProps) {
   const { user } = useAuth()
+  const { appInfo, appInfoIsLoading, appInfoError } = useAppInfo()
   const router = useRouter()
+  const signInPath = buildSignInPath(returnUrl, organizationSlug)
+
   useEffect(() => {
-    if (user) {
-      router.push("/workspaces")
+    if (!user) {
+      return
     }
+    // Invitation acceptance is handled atomically during registration.
+    router.push(getPostAuthRedirectPath({}))
   }, [user, router])
+
+  if (appInfoIsLoading) {
+    return <CenteredSpinner />
+  }
+  if (appInfoError) {
+    throw appInfoError
+  }
+
+  const allowedAuthTypes: string[] = appInfo?.auth_allowed_types ?? []
+  const showBasicAuth = allowedAuthTypes.includes("basic")
+
+  if (!showBasicAuth) {
+    return (
+      <div
+        className={cn(
+          "container flex size-full items-center justify-center",
+          className
+        )}
+      >
+        <div className="flex w-full flex-1 flex-col justify-center gap-2 px-8 sm:max-w-md">
+          <CardHeader className="items-center space-y-2 text-center">
+            <Image src={TracecatIcon} alt="Tracecat" className="mb-8 size-16" />
+            <CardTitle className="text-2xl">Sign up unavailable</CardTitle>
+            <CardDescription>
+              Password sign-up is disabled. Continue with sign in.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Button asChild className="w-full">
+              <Link href={signInPath}>Back to sign in</Link>
+            </Button>
+          </CardContent>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div
@@ -79,11 +147,11 @@ export function SignUp({ className }: React.HTMLProps<HTMLDivElement>) {
         </CardHeader>
         <CardContent>
           <div className="grid gap-4">
-            <BasicRegistrationForm />
+            <BasicRegistrationForm returnUrl={returnUrl} />
           </div>
           <div className="mt-4 text-center text-sm text-muted-foreground">
             Already have an account?{" "}
-            <Link href="/sign-in" className="underline">
+            <Link href={signInPath} className="underline">
               Sign in
             </Link>
           </div>
@@ -101,7 +169,30 @@ const basicRegistrationSchema = z.object({
 })
 type BasicLoginForm = z.infer<typeof basicRegistrationSchema>
 
-export function BasicRegistrationForm() {
+interface BasicRegistrationFormProps {
+  returnUrl?: string | null
+}
+
+/**
+ * Extract invitation token from a returnUrl if it's an invitation accept URL.
+ */
+function extractInvitationToken(returnUrl: string | null): string | null {
+  if (!returnUrl) return null
+  try {
+    // returnUrl might be like "/invitations/accept?token=abc123"
+    const url = new URL(returnUrl, window.location.origin)
+    if (url.pathname === "/invitations/accept") {
+      return url.searchParams.get("token")
+    }
+  } catch {
+    // Invalid URL, ignore
+  }
+  return null
+}
+
+export function BasicRegistrationForm({
+  returnUrl,
+}: BasicRegistrationFormProps) {
   const [isLoading, setIsLoading] = useState(false)
   const { register, login } = useAuthActions()
   const form = useForm<BasicLoginForm>({
@@ -115,6 +206,11 @@ export function BasicRegistrationForm() {
   const onSubmit = async (values: BasicLoginForm) => {
     try {
       setIsLoading(true)
+
+      // Extract invitation token to pass during registration
+      // This enables atomic invitation acceptance during registration
+      const invitationToken = extractInvitationToken(returnUrl ?? null)
+
       /**
        * XXX(auth): The user cannot set is_active or is_superuser itself at registration.
        * Only a superuser can do it by PATCHing the user.
@@ -123,8 +219,10 @@ export function BasicRegistrationForm() {
         requestBody: {
           email: values.email,
           password: values.password,
+          ...(invitationToken && { invitation_token: invitationToken }),
         },
       })
+
       // On successful registration, log the user in
       await login({
         formData: {
@@ -132,9 +230,9 @@ export function BasicRegistrationForm() {
           password: values.password,
         },
       })
+      // Redirect is handled by the useEffect in SignUp component
     } catch (error) {
       if (error instanceof ApiError) {
-        console.log("ApiError registering user", error)
         const apiError = error as TracecatApiError
 
         // Handle both string and object error details
@@ -173,7 +271,6 @@ export function BasicRegistrationForm() {
             }
           } else {
             // Handle RequestValidationError case
-            console.log("Validation error", detail)
             form.setError("email", {
               message: detail[0].msg || "Unknown error",
             })

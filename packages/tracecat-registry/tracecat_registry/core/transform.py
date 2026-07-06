@@ -5,17 +5,35 @@ from typing import Annotated, Any, Literal
 from typing_extensions import Doc
 import hashlib
 import json
-import os
-import redis.asyncio as redis
 import orjson
-from tracecat_registry import ActionIsInterfaceError, registry
+from tracecat_registry import ActionIsInterfaceError, ctx, registry
+from tracecat_registry._internal.flatten import flatten_dict as _flatten_dict
 from tracecat_registry._internal.jsonpath import eval_jsonpath
 from tracecat_registry._internal.safe_lambda import build_safe_lambda
 
 
+def _compute_digests(seen: dict[tuple[Any, ...], dict[str, Any]]) -> list[str]:
+    """Compute SHA256 hex digests for deduplication keys.
+
+    Args:
+        seen: Mapping of composite key tuples to their items.
+
+    Returns:
+        List of hex digests in iteration order of ``seen``.
+    """
+    digests: list[str] = []
+    for key in seen:
+        # NOTE: Must use stdlib json (not orjson) to preserve digest stability.
+        # orjson produces different whitespace (no space after comma), which
+        # would change SHA256 digests and invalidate existing Redis keys.
+        key_str = json.dumps(key, sort_keys=True, default=str)
+        digests.append(hashlib.sha256(key_str.encode()).hexdigest())
+    return digests
+
+
 @registry.register(
     default_title="Reshape",
-    description="Reshapes the input value to the output. You can use this to reshape a JSON-like structure into another easier to manipulate JSON object.",
+    description="Define the exact scalar, object, or list output you want from workflow data.",
     display_group="Data Transform",
     namespace="core.transform",
 )
@@ -25,6 +43,7 @@ def reshape(
         Doc("The value to reshape"),
     ],
 ) -> Any:
+    """Define the exact scalar, object, or list output you want from workflow data."""
     return value
 
 
@@ -112,82 +131,24 @@ def not_in(
     return result
 
 
-async def _deduplicate_redis(
+async def _deduplicate_persistent(
     seen: dict[tuple[Any, ...], dict[str, Any]], expire_seconds: int
 ) -> list[dict[str, Any]]:
-    # Create Redis client directly to avoid event loop issues with Ray
+    """Deduplicate items via the trusted internal API.
 
-    try:
-        # Get Redis URL from environment
-        redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
-        # Create a new Redis client in the current event loop
-        redis_client = redis.from_url(
-            redis_url,
-            encoding="utf-8",
-            decode_responses=True,
-            max_connections=10,
-        )
-        redis_available = True
-    except Exception as e:
-        raise ConnectionError(
-            f"Unable to connect to key-value store for deduplication: {e}"
-        )
+    Computes SHA256 digests for each key and delegates to the platform API
+    (which owns the Redis connection) to create digest entries atomically.
 
-    result: list[dict[str, Any]] = []
+    Args:
+        seen: Mapping of composite key tuples to their merged items.
+        expire_seconds: TTL for each dedup key.
 
-    try:
-        # AWS ElastiCache usually adds ~0.3-1 ms RTT per command. Reduce round-trips
-        # with a pipeline when we have more than a few items.
-        if redis_available and len(seen) > 10:
-            # Use async pipeline (transaction=False keeps commands independent)
-            pipe = redis_client.pipeline(transaction=False)
-            redis_keys: list[str] = []
-
-            for key in seen.keys():
-                key_str = json.dumps(key, sort_keys=True, default=str)
-                redis_key = f"dedup:{hashlib.sha256(key_str.encode()).hexdigest()}"
-                redis_keys.append(redis_key)
-                pipe.set(redis_key, "1", ex=expire_seconds, nx=True)
-
-            try:
-                exec_results = await pipe.execute()
-            except Exception as e:
-                raise ConnectionError(f"Key-value store pipeline failed: {e}")
-
-            # Determine which items are new globally based on pipeline results.
-            for (key, item), was_set in zip(seen.items(), exec_results):
-                if was_set:
-                    result.append(item)
-        else:
-            # Sequential path (small batches pay negligible RTT penalty)
-            for key, item in seen.items():
-                is_new_globally = True
-
-                if redis_available:
-                    key_str = json.dumps(key, sort_keys=True, default=str)
-                    redis_key = f"dedup:{hashlib.sha256(key_str.encode()).hexdigest()}"
-
-                    try:
-                        was_set = await redis_client.set(
-                            redis_key,
-                            "1",
-                            ex=expire_seconds,
-                            nx=True,
-                        )
-                        is_new_globally = bool(was_set)
-                    except Exception as e:
-                        raise ConnectionError(
-                            f"Unable to connect to key-value store for deduplication: {e}"
-                        )
-
-                if is_new_globally:
-                    result.append(item)
-    finally:
-        # Clean up Redis connection
-        if redis_available:
-            await redis_client.aclose()
-
-    return result
+    Returns:
+        Items whose digests were newly created (not previously seen).
+    """
+    digests = _compute_digests(seen)
+    created = await ctx.deduplicate.aio.create_digests(digests, expire_seconds)
+    return [item for item, is_new in zip(seen.values(), created) if is_new]
 
 
 @registry.register(
@@ -251,7 +212,7 @@ async def deduplicate(
             seen[key] = item.copy()
 
     if persist:
-        results = await _deduplicate_redis(seen, expire_seconds)
+        results = await _deduplicate_persistent(seen, expire_seconds)
     else:
         results = list(seen.values())
 
@@ -323,15 +284,15 @@ def map(
 
 
 @registry.register(
-    default_title="Compact",
-    description="Remove all null or empty string values from a list.",
+    default_title="Drop nulls",
+    description="Remove null values from a list.",
     display_group="Data Transform",
     namespace="core.transform",
 )
-def compact(
-    items: Annotated[list[Any], Doc("List of items to compact.")],
+def drop_nulls(
+    items: Annotated[list[Any], Doc("List of items to filter.")],
 ) -> list[Any]:
-    return [item for item in items if item is not None and item != ""]
+    return [item for item in items if item is not None]
 
 
 @registry.register(
@@ -395,55 +356,7 @@ def gather(
 
 def flatten_dict(x: dict[str, Any] | list[Any], max_depth: int = 100) -> dict[str, Any]:
     """Return object with single level of keys (as jsonpath) and values."""
-
-    def _flatten(
-        obj: dict[str, Any] | list[Any], prefix: str = "", depth: int = 0
-    ) -> dict[str, Any]:
-        if depth > max_depth:
-            raise ValueError(
-                f"Maximum recursion depth ({max_depth}) exceeded while flattening object"
-            )
-
-        result: dict[str, Any] = {}
-
-        # Handle arrays
-        if isinstance(obj, list):
-            for index, item in enumerate(obj):
-                array_path = f"[{index}]"
-                full_path = f"{prefix}{array_path}" if prefix else array_path
-
-                if isinstance(item, (dict, list)):
-                    result.update(_flatten(item, full_path, depth + 1))
-                else:
-                    result[full_path] = item
-            return result
-
-        # Handle dictionaries
-        if isinstance(obj, dict):
-            for key, value in obj.items():
-                # Build the path with dot notation
-                full_path = f"{prefix}.{key}" if prefix else key
-
-                if isinstance(value, dict):
-                    # Recursively flatten nested dicts
-                    result.update(_flatten(value, full_path, depth + 1))
-                elif isinstance(value, list):
-                    # Handle arrays within objects
-                    for index, item in enumerate(value):
-                        array_path = f"{full_path}[{index}]"
-                        if isinstance(item, (dict, list)):
-                            result.update(_flatten(item, array_path, depth + 1))
-                        else:
-                            result[array_path] = item
-                else:
-                    # Leaf value
-                    result[full_path] = value
-            return result
-
-        # Shouldn't reach here, but handle primitives
-        return {prefix: obj} if prefix else {"": obj}
-
-    return _flatten(x)
+    return _flatten_dict(x, max_depth=max_depth)
 
 
 @registry.register(

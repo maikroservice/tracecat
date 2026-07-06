@@ -29,7 +29,7 @@ class Unset:
         ) -> None:
             data: dict[str, Any] = {}
             # Only include if explicitly provided (including None)
-            if assignee_id is not UNSET:
+            if is_set(assignee_id):
                 data["assignee_id"] = assignee_id
     """
 
@@ -52,12 +52,16 @@ def is_set[T](value: T | Unset) -> TypeGuard[T]:
 
     Use this to get proper type narrowing when checking if a value was provided.
 
+    Uses both isinstance() and identity checks:
+    - isinstance() handles pickled instances (same type, different object)
+    - identity handles cross-import edge cases (same object, isinstance may fail)
+
     Example:
         if is_set(start_time):
             # start_time is narrowed from datetime | Unset to datetime
             data["start_time"] = start_time.isoformat()
     """
-    return value is not UNSET
+    return not (isinstance(value, Unset) or value is UNSET)
 
 
 # === Case Types === #
@@ -136,9 +140,17 @@ class CaseCommentData:
     id: str
     content: str
     case_id: str
+    parent_id: str | None = None
+    workflow_id: str | None = None
+    workflow_title: str | None = None
+    workflow_alias: str | None = None
+    workflow_wf_exec_id: str | None = None
+    workflow_status: str | None = None
     user_id: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
+    last_edited_at: str | None = None
+    deleted_at: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CaseCommentData:
@@ -147,9 +159,17 @@ class CaseCommentData:
             id=str(data["id"]),
             content=data["content"],
             case_id=str(data["case_id"]),
+            parent_id=str(data["parent_id"]) if data.get("parent_id") else None,
+            workflow_id=str(data["workflow_id"]) if data.get("workflow_id") else None,
+            workflow_title=data.get("workflow_title"),
+            workflow_alias=data.get("workflow_alias"),
+            workflow_wf_exec_id=data.get("workflow_wf_exec_id"),
+            workflow_status=data.get("workflow_status"),
             user_id=str(data["user_id"]) if data.get("user_id") else None,
             created_at=data.get("created_at"),
             updated_at=data.get("updated_at"),
+            last_edited_at=data.get("last_edited_at"),
+            deleted_at=data.get("deleted_at"),
         )
 
 
@@ -203,10 +223,8 @@ SqlType = Literal[
     "NUMERIC",
     "DATE",
     "BOOLEAN",
-    "TIMESTAMP",
     "TIMESTAMPTZ",
     "JSONB",
-    "UUID",
     "SELECT",
     "MULTI_SELECT",
 ]

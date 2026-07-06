@@ -13,6 +13,7 @@ interface CaseDescriptionEditorProps {
   className?: string
   onBlur?: () => void
   toolbarStatus?: React.ReactNode
+  autoFocus?: boolean
 }
 
 export function CaseDescriptionEditor({
@@ -21,8 +22,10 @@ export function CaseDescriptionEditor({
   className,
   onBlur,
   toolbarStatus,
+  autoFocus = false,
 }: CaseDescriptionEditorProps) {
   const [value, setValue] = React.useState(initialContent ?? "")
+  const [isEditorActive, setIsEditorActive] = React.useState(false)
   const containerRef = React.useRef<HTMLDivElement>(null)
 
   React.useEffect(() => {
@@ -45,25 +48,35 @@ export function CaseDescriptionEditor({
 
       // If next focus target is not inside the editor container (or is null), treat as external blur.
       if (!container || !nextTarget || !container.contains(nextTarget)) {
+        setIsEditorActive(false)
         onBlur?.()
       }
     },
     [onBlur]
   )
 
+  const handleContainerFocus = React.useCallback(() => {
+    setIsEditorActive(true)
+  }, [])
+
   return (
     <div
       ref={containerRef}
       className={cn("mx-0", className)}
+      onFocusCapture={handleContainerFocus}
       onBlur={handleContainerBlur}
     >
       <SimpleEditor
         value={value}
         onChange={handleChange}
         onShortcutFallback={onBlur}
+        showToolbar={isEditorActive}
+        preserveToolbarSpace
         toolbarStatus={toolbarStatus}
+        renderMermaidWhenBlurred
         placeholder="Describe the case..."
         className="case-description-editor"
+        autoFocus={autoFocus}
       />
     </div>
   )

@@ -1,4 +1,3 @@
-import os
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
@@ -10,7 +9,9 @@ from authlib.oauth2.rfc7636 import create_s256_code_challenge
 from pydantic import BaseModel, SecretStr, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tracecat import config
 from tracecat.auth.types import Role
+from tracecat.authz.scopes import SERVICE_PRINCIPAL_SCOPES
 from tracecat.db.models import OAuthIntegration
 from tracecat.exceptions import TracecatAuthorizationError
 from tracecat.integrations.enums import OAuthGrantType
@@ -111,7 +112,7 @@ def encryption_key(monkeypatch: pytest.MonkeyPatch) -> str:
     from cryptography.fernet import Fernet
 
     key = Fernet.generate_key().decode()
-    monkeypatch.setenv("TRACECAT__DB_ENCRYPTION_KEY", key)
+    monkeypatch.setattr(config, "TRACECAT__DB_ENCRYPTION_KEY", key)
     return key
 
 
@@ -181,6 +182,7 @@ class TestIntegrationService:
             user_id=uuid.uuid4(),
             workspace_id=None,
             service_id="tracecat-service",
+            scopes=SERVICE_PRINCIPAL_SCOPES["tracecat-service"],
         )
 
         # Attempt to create service without workspace should raise error
@@ -380,6 +382,34 @@ class TestIntegrationService:
         assert updated.id == integration.id
         assert updated.authorization_endpoint == "https://api.v2.example.com/authorize"
         assert updated.token_endpoint == "https://api.v2.example.com/token"
+
+    async def test_store_integration_clears_stale_token_auth_method(
+        self,
+        integration_service: IntegrationService,
+        mock_token_response: TokenResponse,
+    ) -> None:
+        """Updating without a token auth method clears the stored one."""
+        provider_key = ProviderKey(
+            id="test_provider",
+            grant_type=OAuthGrantType.AUTHORIZATION_CODE,
+        )
+
+        integration = await integration_service.store_integration(
+            provider_key=provider_key,
+            access_token=mock_token_response.access_token,
+            token_endpoint_auth_method="client_secret_post",
+        )
+        assert integration.token_endpoint_auth_method == "client_secret_post"
+
+        # A later token exchange that succeeded without an explicit auth
+        # method must not leave the old method behind for refresh to reuse.
+        updated = await integration_service.store_integration(
+            provider_key=provider_key,
+            access_token=SecretStr("new_access_token"),
+        )
+
+        assert updated.id == integration.id
+        assert updated.token_endpoint_auth_method is None
 
     async def test_list_integrations(
         self,
@@ -999,7 +1029,7 @@ class TestIntegrationService:
 
         # Create service with first encryption key
         key1 = Fernet.generate_key().decode()
-        with patch.dict(os.environ, {"TRACECAT__DB_ENCRYPTION_KEY": key1}):
+        with patch.object(config, "TRACECAT__DB_ENCRYPTION_KEY", key1):
             service1 = IntegrationService(session=session, role=svc_role)
 
             # Store integration
@@ -1014,7 +1044,7 @@ class TestIntegrationService:
 
         # Create service with different encryption key
         key2 = Fernet.generate_key().decode()
-        with patch.dict(os.environ, {"TRACECAT__DB_ENCRYPTION_KEY": key2}):
+        with patch.object(config, "TRACECAT__DB_ENCRYPTION_KEY", key2):
             service2 = IntegrationService(session=session, role=svc_role)
 
             # Attempt to decrypt with wrong key should raise error
@@ -1195,9 +1225,12 @@ class TestIntegrationService:
 
         monkeypatch.setattr(
             "tracecat.integrations.service.get_provider_class",
-            lambda key: MockOAuthProvider
-            if key.id == provider_key.id and key.grant_type == provider_key.grant_type
-            else None,
+            lambda key: (
+                MockOAuthProvider
+                if key.id == provider_key.id
+                and key.grant_type == provider_key.grant_type
+                else None
+            ),
         )
 
         integration = await integration_service.store_provider_config(

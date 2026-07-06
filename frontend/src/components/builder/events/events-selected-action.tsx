@@ -17,9 +17,11 @@ import {
   ConversationContent,
   ConversationScrollButton,
 } from "@/components/ai-elements/conversation"
-import { getWorkflowEventIcon } from "@/components/builder/events/events-workflow"
 import { MessagePart } from "@/components/chat/chat-session-pane"
 import { CodeBlock } from "@/components/code-block"
+import { getWorkflowEventIcon } from "@/components/events/workflow-event-status"
+import { CollectionObjectResult } from "@/components/executions/collection-object-result"
+import { ExternalObjectResult } from "@/components/executions/external-object-result"
 import { JsonViewWithControls } from "@/components/json-viewer"
 import { Spinner } from "@/components/loading/spinner"
 import { AlertNotification } from "@/components/notifications"
@@ -49,9 +51,14 @@ import {
   groupEventsByActionRef,
   parseStreamId,
   refToLabel,
+  WF_TRIGGER_EVENT_REF,
   type WorkflowExecutionEventCompact,
   type WorkflowExecutionReadCompact,
 } from "@/lib/event-history"
+import {
+  isCollectionStoredObject,
+  isExternalStoredObject,
+} from "@/lib/stored-object"
 import { useWorkflowBuilder } from "@/providers/builder"
 
 type TabType = "input" | "result" | "interaction"
@@ -154,6 +161,7 @@ function ActionEventView({
   }
   return (
     <ActionEventDetails
+      executionId={execution.id}
       eventRef={selectedRef}
       status={execution.status}
       events={execution.events}
@@ -182,7 +190,8 @@ function ActionInteractionEventDetails({
       <JsonViewWithControls
         src={interaction.response_payload}
         defaultExpanded={true}
-        copyPrefix={`ACTIONS.${eventRef}.interaction`}
+        copyPrefix={getEventCopyPrefix(eventRef, "interaction")}
+        copyMode="jsonpath-and-payload"
       />
     </div>
   )
@@ -192,31 +201,48 @@ export function SuccessEvent({
   event,
   type,
   eventRef,
+  executionId,
+  eventId,
   defaultExpanded = true,
-  defaultTab = "nested",
 }: {
   event: WorkflowExecutionEventCompact
   type: Omit<TabType, "interaction">
   eventRef: string
+  executionId: string
+  eventId: number
   defaultExpanded?: boolean
-  defaultTab?: "nested" | "flat"
 }) {
+  const shouldShowTriggerInput =
+    type === "result" && eventRef === WF_TRIGGER_EVENT_REF
+
   switch (type) {
     case "input":
       return (
         <JsonViewWithControls
           src={event.action_input}
           defaultExpanded={defaultExpanded}
-          defaultTab={defaultTab}
+          copyPrefix={getEventCopyPrefix(eventRef, "input")}
+          copyMode="jsonpath-and-payload"
         />
       )
     case "result":
+      if (shouldShowTriggerInput) {
+        return (
+          <JsonViewWithControls
+            src={event.action_input}
+            defaultExpanded={defaultExpanded}
+            copyPrefix={getEventCopyPrefix(eventRef, "input")}
+            copyMode="jsonpath-and-payload"
+          />
+        )
+      }
       return (
         <ActionResultViewer
           result={event.action_result}
           eventRef={eventRef}
+          executionId={executionId}
+          eventId={eventId}
           defaultExpanded={defaultExpanded}
-          defaultTab={defaultTab}
         />
       )
   }
@@ -226,13 +252,15 @@ export function SuccessEvent({
 function ActionResultViewer({
   result,
   eventRef,
+  executionId,
+  eventId,
   defaultExpanded = true,
-  defaultTab = "nested",
 }: {
   result: unknown
   eventRef: string
+  executionId: string
+  eventId: number
   defaultExpanded?: boolean
-  defaultTab?: "nested" | "flat"
 }) {
   if (result === null || result === undefined) {
     return (
@@ -243,14 +271,54 @@ function ActionResultViewer({
     )
   }
 
+  if (isExternalStoredObject(result)) {
+    return (
+      <ExternalObjectResult
+        executionId={executionId}
+        eventId={eventId}
+        external={result}
+      />
+    )
+  }
+
+  if (isCollectionStoredObject(result)) {
+    return (
+      <CollectionObjectResult
+        executionId={executionId}
+        eventId={eventId}
+        collection={result}
+        copyMode="jsonpath-and-payload"
+        copyPrefix={getEventCopyPrefix(eventRef, "result")}
+      />
+    )
+  }
+
   return (
     <JsonViewWithControls
       src={result}
       defaultExpanded={defaultExpanded}
-      defaultTab={defaultTab}
-      copyPrefix={`ACTIONS.${eventRef}.result`}
+      copyPrefix={getEventCopyPrefix(eventRef, "result")}
+      copyMode="jsonpath-and-payload"
     />
   )
+}
+
+function getEventCopyPrefix(
+  eventRef: string,
+  kind: "input" | "result" | "interaction"
+): string {
+  if (eventRef === WF_TRIGGER_EVENT_REF) {
+    return "TRIGGER"
+  }
+
+  switch (kind) {
+    case "input":
+      return `ACTIONS.${eventRef}`
+    case "interaction":
+      return `ACTIONS.${eventRef}.interaction`
+    case "result":
+      return `ACTIONS.${eventRef}.result`
+  }
 }
 
 function StreamDetails({
@@ -296,11 +364,13 @@ function StreamDetails({
 
 function ActionEventContent({
   actionEvent,
+  executionId,
   type,
   eventRef,
   streamIdPlaceholder,
 }: {
   actionEvent: WorkflowExecutionEventCompact
+  executionId: string
   type: Omit<TabType, "interaction">
   eventRef: string
   streamIdPlaceholder?: string
@@ -373,8 +443,9 @@ function ActionEventContent({
               <ActionResultViewer
                 result={actionEvent.action_result}
                 eventRef={eventRef}
+                executionId={executionId}
+                eventId={actionEvent.source_event_id}
                 defaultExpanded={true}
-                defaultTab="nested"
               />
             </TabsContent>
           </Tabs>
@@ -400,7 +471,13 @@ function ActionEventContent({
           {type === "result" && action_error ? (
             <ErrorEvent failure={action_error} />
           ) : (
-            <SuccessEvent event={actionEvent} type={type} eventRef={eventRef} />
+            <SuccessEvent
+              event={actionEvent}
+              type={type}
+              eventRef={eventRef}
+              executionId={executionId}
+              eventId={actionEvent.source_event_id}
+            />
           )}
         </div>
       )
@@ -409,11 +486,13 @@ function ActionEventContent({
 }
 
 export function ActionEventDetails({
+  executionId,
   eventRef,
   status,
   events,
   type,
 }: {
+  executionId: string
   eventRef: string
   status: WorkflowExecutionReadCompact["status"]
   events: WorkflowExecutionEventCompact[]
@@ -443,6 +522,7 @@ export function ActionEventDetails({
     return (
       <ActionEventContent
         actionEvent={actionEventsForRef[0]}
+        executionId={executionId}
         type={type}
         eventRef={eventRef}
         streamIdPlaceholder="Input is the same for all events"
@@ -466,6 +546,7 @@ export function ActionEventDetails({
             <div key="session-streams">
               <ActionSessionCarousel
                 events={eventsWithSessions}
+                executionId={executionId}
                 type={type}
                 eventRef={eventRef}
               />
@@ -479,6 +560,7 @@ export function ActionEventDetails({
         <div key={key}>
           <ActionEventContent
             actionEvent={actionEvent}
+            executionId={executionId}
             type={type}
             eventRef={eventRef}
           />
@@ -493,6 +575,7 @@ export function ActionEventDetails({
     <div key={actionEvent.stream_id ?? actionEvent.source_event_id}>
       <ActionEventContent
         actionEvent={actionEvent}
+        executionId={executionId}
         type={type}
         eventRef={eventRef}
       />
@@ -502,10 +585,12 @@ export function ActionEventDetails({
 
 function ActionSessionCarousel({
   events,
+  executionId,
   type,
   eventRef,
 }: {
   events: WorkflowExecutionEventCompact[]
+  executionId: string
   type: Omit<TabType, "interaction">
   eventRef: string
 }) {
@@ -580,6 +665,7 @@ function ActionSessionCarousel({
             >
               <ActionEventContent
                 actionEvent={actionEvent}
+                executionId={executionId}
                 type={type}
                 eventRef={eventRef}
               />
@@ -719,7 +805,9 @@ function ActionSessionShell({
 function ErrorEvent({ failure }: { failure: EventFailure }) {
   return (
     <div className="flex flex-col space-y-8 text-xs">
-      <CodeBlock title="Error Message">{failure.message}</CodeBlock>
+      <CodeBlock title="Error Message">
+        {failure.root_cause_message ?? failure.message}
+      </CodeBlock>
     </div>
   )
 }

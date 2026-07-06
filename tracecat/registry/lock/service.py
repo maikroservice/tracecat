@@ -13,14 +13,23 @@ from tracecat.db.models import (
     RegistryVersion,
 )
 from tracecat.dsl.enums import PlatformAction
-from tracecat.exceptions import RegistryError
+from tracecat.exceptions import (
+    BuiltinRegistryHasNoSelectionError,
+    EntitlementRequired,
+    RegistryError,
+)
 from tracecat.registry.actions.schemas import RegistryActionImplValidator
+from tracecat.registry.constants import DEFAULT_REGISTRY_ORIGIN
 from tracecat.registry.lock.types import RegistryLock
-from tracecat.registry.versions.schemas import RegistryVersionManifest
-from tracecat.service import BaseService
+from tracecat.registry.versions.schemas import (
+    RegistryVersionManifest,
+    registry_manifest_fingerprint,
+)
+from tracecat.service import BaseOrgService
+from tracecat.tiers.enums import Entitlement
 
 
-class RegistryLockService(BaseService):
+class RegistryLockService(BaseOrgService):
     """Service for resolving and managing registry version locks.
 
     Registry locks map repository origins to specific version strings,
@@ -57,7 +66,7 @@ class RegistryLockService(BaseService):
             RegistryError: If an action is not found in any registry or is ambiguous
             RegistryError: If a repository has no current_version_id set
         """
-        # 1. Query platform registries via current_version_id
+        # Query platform registries via current_version_id.
         platform_statement = (
             select(
                 PlatformRegistryRepository.origin,
@@ -76,7 +85,25 @@ class RegistryLockService(BaseService):
         platform_result = await self.session.execute(platform_statement)
         platform_rows = platform_result.tuples().all()
 
-        # 2. Query org registries via current_version_id
+        builtin_version = next(
+            (
+                str(version)
+                for origin, version, _ in platform_rows
+                if origin == DEFAULT_REGISTRY_ORIGIN
+            ),
+            None,
+        )
+        if builtin_version is None:
+            self.logger.info(
+                "Platform registry has no selected version; builtin lock resolution is pending sync",
+                origin=DEFAULT_REGISTRY_ORIGIN,
+            )
+            raise BuiltinRegistryHasNoSelectionError(
+                "Builtin registry sync is still in progress. Please retry shortly.",
+                detail={"origin": DEFAULT_REGISTRY_ORIGIN},
+            )
+
+        # Query org registries via current_version_id.
         org_statement = (
             select(
                 RegistryRepository.origin,
@@ -95,21 +122,47 @@ class RegistryLockService(BaseService):
         org_result = await self.session.execute(org_statement)
         org_rows = org_result.tuples().all()
 
-        # 3. Combine: platform first, then org (org overrides for same origin)
-        rows = list(platform_rows) + list(org_rows)
+        custom_registry_enabled = await self.has_entitlement(
+            Entitlement.CUSTOM_REGISTRY
+        )
+        if not custom_registry_enabled and org_rows:
+            self.logger.info(
+                "Custom registry entitlement disabled; excluding org registry manifests from lock resolution",
+                organization_id=str(self.organization_id),
+                org_registry_count=len(org_rows),
+            )
 
-        # 2. Build origins dict and parse manifests
+        # Combine: platform first, then org (org overrides for same origin).
+        # When custom registry entitlement is disabled, only platform registries
+        # are considered for lock resolution.
+        rows = list(platform_rows)
+        if custom_registry_enabled:
+            rows.extend(org_rows)
+
+        # Build origins dict and parse manifests.
         origins: dict[str, str] = {}
+        origin_fingerprints: dict[str, str] = {}
+        builtin_fingerprint: str | None = None
         origin_manifests: dict[str, RegistryVersionManifest] = {}
+        excluded_custom_origin_manifests: dict[str, RegistryVersionManifest] = {}
 
         for origin, version, manifest_dict in rows:
             origin_str = str(origin)
             origins[origin_str] = str(version)
-            origin_manifests[origin_str] = RegistryVersionManifest.model_validate(
-                manifest_dict
-            )
+            manifest = RegistryVersionManifest.model_validate(manifest_dict)
+            origin_manifests[origin_str] = manifest
+            fingerprint = registry_manifest_fingerprint(manifest)
+            origin_fingerprints[origin_str] = fingerprint
+            if origin_str == DEFAULT_REGISTRY_ORIGIN and builtin_fingerprint is None:
+                builtin_fingerprint = fingerprint
+        if not custom_registry_enabled:
+            for origin, _version, manifest_dict in org_rows:
+                origin_str = str(origin)
+                excluded_custom_origin_manifests[origin_str] = (
+                    RegistryVersionManifest.model_validate(manifest_dict)
+                )
 
-        # 3. Build action -> origin mapping using BFS to include template step actions
+        # Build action -> origin mapping using BFS to include template step actions.
         actions: dict[str, str] = {}
         queue: deque[str] = deque(sorted(action_names))
 
@@ -126,6 +179,15 @@ class RegistryLockService(BaseService):
                     matching_origins.append(origin_str)
 
             if len(matching_origins) == 0:
+                if not custom_registry_enabled:
+                    if any(
+                        action_name in manifest.actions
+                        for manifest in excluded_custom_origin_manifests.values()
+                    ):
+                        raise EntitlementRequired(
+                            Entitlement.CUSTOM_REGISTRY.value,
+                            unavailable_actions=[action_name],
+                        )
                 raise RegistryError(
                     f"Action '{action_name}' not found in any registry. "
                     f"Available registries: {list(origins.keys())}"
@@ -148,7 +210,7 @@ class RegistryLockService(BaseService):
                 )
                 if impl.type == "template":
                     for step in impl.template_action.definition.steps:
-                        if PlatformAction.is_interface(step.action):
+                        if not PlatformAction.is_template_step_supported(step.action):
                             raise RegistryError(
                                 f"Template action '{action_name}' contains step '{step.ref}' using "
                                 f"platform action '{step.action}'. Platform actions cannot be used "
@@ -157,12 +219,21 @@ class RegistryLockService(BaseService):
                         if step.action not in actions:
                             queue.append(step.action)
 
-        # Only keep origins that are actually needed for the resolved actions.
+        # Only keep origins needed for resolved actions. Always include the
+        # builtin platform registry — tracecat_registry is a runtime dependency
+        # for every action (decorators, secrets, context, SDK helpers imported
+        # from it), so its tarball must always be mounted in the ephemeral
+        # nsjail sandbox. Use the platform version because artifact lookup
+        # treats tracecat_registry as platform-scoped; an org override would miss.
         used_origins = set(actions.values())
-        origins = {
-            origin: version
-            for origin, version in origins.items()
-            if origin in used_origins
+        origins = {o: v for o, v in origins.items() if o in used_origins}
+        origins[DEFAULT_REGISTRY_ORIGIN] = builtin_version
+        if builtin_fingerprint is not None:
+            origin_fingerprints[DEFAULT_REGISTRY_ORIGIN] = builtin_fingerprint
+        origin_fingerprints = {
+            o: fingerprint
+            for o, fingerprint in origin_fingerprints.items()
+            if o in origins
         }
 
         self.logger.debug(
@@ -171,4 +242,8 @@ class RegistryLockService(BaseService):
             num_actions=len(actions),
         )
 
-        return RegistryLock(origins=origins, actions=actions)
+        return RegistryLock(
+            origins=origins,
+            actions=actions,
+            origin_fingerprints=origin_fingerprints,
+        )

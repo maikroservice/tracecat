@@ -3,7 +3,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
-from tracecat.git.constants import GIT_HTTPS_URL_REGEX, GIT_SSH_URL_REGEX
+from tracecat.git.constants import GIT_SSH_URL_REGEX
 
 
 class BaseSettingsGroup(BaseModel):
@@ -34,15 +34,14 @@ class GitSettingsUpdate(BaseSettingsGroup):
 
     @field_validator("git_repo_url", mode="before")
     def validate_git_repo_url(cls, value: str | None) -> str | None:
-        """Validate that git_repo_url is a valid Git URL if provided."""
+        """Validate that git_repo_url is a valid Git SSH URL if provided."""
         if value is None:
             return value
 
         # Use shared regex from git utils to ensure consistency across the codebase
-        # Accept both SSH and HTTPS URLs
-        if not GIT_SSH_URL_REGEX.match(value) and not GIT_HTTPS_URL_REGEX.match(value):
+        if not GIT_SSH_URL_REGEX.match(value):
             raise ValueError(
-                "Must be a valid Git URL (e.g., git+ssh://git@github.com/org/repo.git or https://gitlab.com/org/repo.git)"
+                "Must be a valid Git SSH URL (e.g., git+ssh://<user>@github.com/org/repo.git)"
             )
 
         return value
@@ -53,6 +52,13 @@ class SAMLSettingsRead(BaseSettingsGroup):
     saml_enforced: bool
     saml_idp_metadata_url: str | None = Field(default=None)
     saml_sp_acs_url: str  # Read only
+    decryption_failed_keys: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Encrypted setting keys that could not be decrypted with the current "
+            "encryption key and must be reconfigured."
+        ),
+    )
 
     @field_validator("saml_enforced", mode="before")
     @classmethod
@@ -73,49 +79,9 @@ class SAMLSettingsUpdate(BaseSettingsGroup):
     saml_idp_metadata_url: str | None = Field(default=None)
 
 
-class AuthSettingsRead(BaseSettingsGroup):
-    auth_basic_enabled: bool
-    auth_require_email_verification: bool
-    auth_allowed_email_domains: list[str]
-    auth_min_password_length: int
-    auth_session_expire_time_seconds: int
-
-
-class AuthSettingsUpdate(BaseSettingsGroup):
-    auth_basic_enabled: bool = Field(
-        default=True,
-        description="Whether basic auth is enabled.",
-    )
-    auth_require_email_verification: bool = Field(
-        default=False,
-        description="Whether email verification is required for authentication.",
-    )
-    auth_allowed_email_domains: list[str] = Field(
-        default_factory=list,
-        description="Allowed email domains for authentication. If empty, all domains are allowed.",
-    )
-    auth_min_password_length: int = Field(
-        default=12,
-        description="Minimum password length for authentication.",
-    )
-    auth_session_expire_time_seconds: int = Field(
-        default=86400 * 7,  # 1 week
-        description="Session expiration time in seconds.",
-    )
-
-
-class OAuthSettingsRead(BaseSettingsGroup):
-    """Settings for OAuth authentication."""
-
-    oauth_google_enabled: bool
-
-
-class OAuthSettingsUpdate(BaseSettingsGroup):
-    """Settings for OAuth authentication."""
-
-    oauth_google_enabled: bool = Field(
-        default=True, description="Whether OAuth is enabled."
-    )
+class VersionedResourceResolutionStrategy(StrEnum):
+    PINNED = "pinned"
+    LATEST = "latest"
 
 
 class AppSettingsRead(BaseSettingsGroup):
@@ -126,8 +92,10 @@ class AppSettingsRead(BaseSettingsGroup):
     app_interactions_enabled: bool
     app_workflow_export_enabled: bool
     app_create_workspace_on_register: bool
-    app_editor_pill_decorations_enabled: bool
     app_action_form_mode_enabled: bool
+    app_versioned_resource_resolution_strategy: VersionedResourceResolutionStrategy = (
+        VersionedResourceResolutionStrategy.LATEST
+    )
 
 
 class AppSettingsUpdate(BaseSettingsGroup):
@@ -152,13 +120,18 @@ class AppSettingsUpdate(BaseSettingsGroup):
         default=False,
         description="Whether to automatically create a workspace when a user signs up.",
     )
-    app_editor_pill_decorations_enabled: bool = Field(
-        default=False,
-        description="Whether to show template expression pills with decorations. When disabled, expressions show as plain text with simple highlighting.",
-    )
     app_action_form_mode_enabled: bool = Field(
         default=True,
         description="Whether to enable form mode for action inputs. When disabled, only YAML mode is available, preserving raw YAML formatting.",
+    )
+    app_versioned_resource_resolution_strategy: VersionedResourceResolutionStrategy = (
+        Field(
+            default=VersionedResourceResolutionStrategy.LATEST,
+            description=(
+                "How versioned resource references are resolved when a feature "
+                "supports both pinned and latest dependency resolution."
+            ),
+        )
     )
 
 
@@ -166,6 +139,17 @@ class AuditSettingsRead(BaseSettingsGroup):
     """Settings for audit logging."""
 
     audit_webhook_url: str | None
+    audit_webhook_custom_headers: dict[str, str] | None = None
+    audit_webhook_custom_payload: dict[str, Any] | None = None
+    audit_webhook_payload_attribute: str | None = None
+    audit_webhook_verify_ssl: bool = True
+    decryption_failed_keys: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Encrypted setting keys that could not be decrypted with the current "
+            "encryption key and must be reconfigured."
+        ),
+    )
 
 
 class AuditSettingsUpdate(BaseSettingsGroup):
@@ -174,6 +158,31 @@ class AuditSettingsUpdate(BaseSettingsGroup):
     audit_webhook_url: str | None = Field(
         default=None,
         description="Webhook URL that receives streamed audit events. When unset, audit events are skipped.",
+    )
+    audit_webhook_custom_headers: dict[str, str] | None = Field(
+        default=None,
+        description="Custom headers to include in audit webhook requests. Header names are case-insensitive.",
+    )
+    audit_webhook_custom_payload: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Custom JSON payload merged into streamed audit event payloads. "
+            "Custom keys override default audit event keys."
+        ),
+    )
+    audit_webhook_payload_attribute: str | None = Field(
+        default=None,
+        description=(
+            "Optional wrapper key for audit payloads. When set to a value like "
+            "'event', payload is sent as {'event': <audit_payload>}."
+        ),
+    )
+    audit_webhook_verify_ssl: bool = Field(
+        default=True,
+        description=(
+            "Whether TLS certificates are verified for webhook requests. "
+            "Disable only for trusted on-prem/self-signed endpoints."
+        ),
     )
 
 

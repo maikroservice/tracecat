@@ -14,6 +14,7 @@ import { useForm } from "react-hook-form"
 import YAML from "yaml"
 import { z } from "zod"
 import { ApiError } from "@/client"
+import { useScopeCheck } from "@/components/auth/scope-guard"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -41,7 +42,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { Separator } from "@/components/ui/separator"
 import { Switch } from "@/components/ui/switch"
-import type { TracecatApiError } from "@/lib/errors"
+import { getApiErrorDetail, type TracecatApiError } from "@/lib/errors"
 import { useFolders, useWorkflowManager } from "@/lib/hooks"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
@@ -65,7 +66,9 @@ function ImportWorkflowDialog({
 }) {
   const router = useRouter()
   const [validationErrors, setValidationErrors] = useState<string | null>(null)
-  const { createWorkflow } = useWorkflowManager()
+  const { createWorkflow } = useWorkflowManager(undefined, {
+    listEnabled: false,
+  })
 
   const form = useForm<ImportFormValues>({
     resolver: zodResolver(importFormSchema),
@@ -137,6 +140,7 @@ function ImportWorkflowDialog({
                   <FormControl>
                     <Input
                       type="file"
+                      className="min-h-9 py-2"
                       onChange={(e) => {
                         const file = e.target.files?.[0]
                         if (file) {
@@ -225,8 +229,9 @@ function CreateFolderDialog({
       onOpenChange(false)
     } catch (error) {
       console.log("Error creating folder:", error)
+      const detail = getApiErrorDetail(error)
       form.setError("name", {
-        message: "Folder already exists or another error occurred.",
+        message: detail ?? "Folder already exists or another error occurred.",
       })
     }
   }
@@ -294,9 +299,16 @@ export function CreateWorkflowButton({
 }) {
   const router = useRouter()
   const workspaceId = useWorkspaceId()
-  const { createWorkflow, moveWorkflow } = useWorkflowManager()
+  const canCreateWorkflow = useScopeCheck("workflow:create")
+  const { createWorkflow, moveWorkflow } = useWorkflowManager(undefined, {
+    listEnabled: false,
+  })
   const [importDialogOpen, setImportDialogOpen] = useState(false)
   const [folderDialogOpen, setFolderDialogOpen] = useState(false)
+
+  if (canCreateWorkflow !== true) {
+    return null
+  }
 
   const handleCreateWorkflow = async () => {
     try {

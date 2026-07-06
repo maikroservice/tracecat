@@ -2,7 +2,8 @@ import type { ApiError } from "@/client"
 
 export interface TracecatApiError<T = unknown> extends ApiError {
   readonly body: {
-    detail: T
+    detail?: T
+    message?: string | null
   }
 }
 
@@ -39,4 +40,98 @@ export function isRequestValidationErrorArray(
   obj: unknown
 ): obj is RequestValidationError[] {
   return Array.isArray(obj) && obj.every((o) => isRequestValidationError(o))
+}
+
+export function getApiErrorDetail(error: unknown): string | null {
+  if (!(error instanceof Error)) {
+    return null
+  }
+
+  const maybeApiError = error as TracecatApiError<unknown>
+  const detail = maybeApiError.body?.detail
+  if (typeof detail === "string") {
+    return detail
+  }
+  if (detail != null) {
+    try {
+      return JSON.stringify(detail)
+    } catch {
+      return error.message
+    }
+  }
+  const message = maybeApiError.body?.message
+  if (typeof message === "string" && message.length > 0) {
+    return message
+  }
+  return error.message
+}
+
+/**
+ * Strip credentials and query parameters from any URLs embedded in free text.
+ *
+ * Backend connection errors can echo a user-supplied server URI, which may
+ * carry secrets in its userinfo (`user:pass@`) or query string. Sanitize before
+ * surfacing such text in toasts or the console so those values are not leaked
+ * into UI output or logs. Non-URL text is returned unchanged.
+ */
+export function sanitizeUrlsInText(text: string): string {
+  return text.replace(/\bhttps?:\/\/[^\s]+/gi, (match) => {
+    try {
+      const url = new URL(match)
+      url.username = ""
+      url.password = ""
+      url.search = ""
+      url.hash = ""
+      return url.toString()
+    } catch {
+      // Not a parseable URL (e.g. trailing punctuation captured); fall back to
+      // dropping everything from the first `?` and any `userinfo@` segment.
+      return match
+        .replace(/^(https?:\/\/)[^/@]*@/i, "$1")
+        .replace(/[?#].*$/, "")
+    }
+  })
+}
+
+const MCP_OAUTH_DISCOVERY_ERROR_PATTERNS = [
+  "dynamic registration",
+  "discover oauth",
+  "oauth discovery",
+  "oauth server",
+  "authorization-server",
+  "oauth endpoint host",
+  "registration_endpoint",
+]
+
+export function getMcpOAuthConnectErrorDetail(error: unknown): string {
+  const detail = getApiErrorDetail(error) ?? "Unknown error"
+  const normalized = detail.toLowerCase()
+  if (
+    MCP_OAUTH_DISCOVERY_ERROR_PATTERNS.some((pattern) =>
+      normalized.includes(pattern)
+    )
+  ) {
+    return `MCP OAuth discovery failed. Create an OAuth integration manually, then select it from Advanced. ${detail}`
+  }
+  return detail
+}
+
+/**
+ * Extract a structured `code` field from an API error's detail payload, when
+ * the backend returns `{ "code": "...", ... }` for machine-readable handling.
+ */
+export function getApiErrorCode(error: unknown): string | null {
+  if (!(error instanceof Error)) {
+    return null
+  }
+  const detail = (error as TracecatApiError<unknown>).body?.detail
+  if (
+    typeof detail === "object" &&
+    detail !== null &&
+    "code" in detail &&
+    typeof (detail as { code: unknown }).code === "string"
+  ) {
+    return (detail as { code: string }).code
+  }
+  return null
 }

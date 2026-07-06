@@ -52,8 +52,15 @@ import orjson
 from pydantic import TypeAdapter
 
 from tracecat import config
+from tracecat.executor.action_gateway.config import (
+    ACTION_GATEWAY_SANDBOX_SOCKET,
+    action_gateway_socket_path,
+)
 from tracecat.executor.schemas import ExecutorResult, ResolvedContext
+from tracecat.executor.secret_preprocessors import project_secret_env
 from tracecat.logger import logger
+from tracecat.sandbox.seccomp import build_untrusted_seccomp_policy
+from tracecat.secrets.common import apply_masks_object
 
 if TYPE_CHECKING:
     from tracecat.auth.types import Role
@@ -272,16 +279,17 @@ class WorkerPool:
         env["TRACECAT_WORKER_ID"] = str(worker_id)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
+        action_gateway_socket = action_gateway_socket_path()
 
         if config.TRACECAT__DISABLE_NSJAIL:
             # Direct subprocess mode (no sandbox)
             proc = await self._spawn_direct_worker(
-                worker_id, work_dir, socket_path, env
+                worker_id, work_dir, socket_path, env, action_gateway_socket
             )
         else:
             # Sandboxed mode with nsjail
             proc = await self._spawn_nsjail_worker(
-                worker_id, work_dir, socket_path, env
+                worker_id, work_dir, socket_path, env, action_gateway_socket
             )
 
         # Wait for socket to appear (indicates worker is ready)
@@ -326,12 +334,17 @@ class WorkerPool:
         work_dir: Path,
         socket_path: Path,
         env: dict[str, str],
+        action_gateway_socket: Path | None,
     ) -> asyncio.subprocess.Process:
         """Spawn worker as direct subprocess (no nsjail sandbox)."""
         import sys
 
         # Socket path is the actual host path
         env["TRACECAT_WORKER_SOCKET"] = str(socket_path)
+        if action_gateway_socket is not None:
+            env["TRACECAT__ACTION_GATEWAY_SOCKET"] = str(action_gateway_socket)
+        else:
+            env.pop("TRACECAT__ACTION_GATEWAY_SOCKET", None)
 
         cmd = [
             sys.executable,
@@ -356,13 +369,20 @@ class WorkerPool:
         work_dir: Path,
         socket_path: Path,
         env: dict[str, str],
+        action_gateway_socket: Path | None,
     ) -> asyncio.subprocess.Process:
         """Spawn worker inside nsjail sandbox."""
         # Socket path inside sandbox
         env["TRACECAT_WORKER_SOCKET"] = "/work/task.sock"
+        if action_gateway_socket is not None:
+            env["TRACECAT__ACTION_GATEWAY_SOCKET"] = str(ACTION_GATEWAY_SANDBOX_SOCKET)
+        else:
+            env.pop("TRACECAT__ACTION_GATEWAY_SOCKET", None)
 
         # Build nsjail config
-        nsjail_config = self._build_nsjail_config(worker_id, work_dir)
+        nsjail_config = self._build_nsjail_config(
+            worker_id, work_dir, action_gateway_socket=action_gateway_socket
+        )
         config_path = work_dir.parent / "nsjail.cfg"
         config_path.write_text(nsjail_config)
 
@@ -393,6 +413,11 @@ class WorkerPool:
             "TRACECAT_WORKER_ID",
             "--env",
             "TRACECAT_WORKER_SOCKET",
+            *(
+                ["--env", "TRACECAT__ACTION_GATEWAY_SOCKET"]
+                if "TRACECAT__ACTION_GATEWAY_SOCKET" in env
+                else []
+            ),
             # Set PYTHONPATH explicitly for the sandbox Python
             "--env",
             f"PYTHONPATH={pythonpath}",
@@ -418,7 +443,13 @@ class WorkerPool:
             env=env,
         )
 
-    def _build_nsjail_config(self, worker_id: int, work_dir: Path) -> str:
+    def _build_nsjail_config(
+        self,
+        worker_id: int,
+        work_dir: Path,
+        *,
+        action_gateway_socket: Path | None = None,
+    ) -> str:
         """Build nsjail configuration for a persistent worker."""
         rootfs = config.TRACECAT__SANDBOX_ROOTFS_PATH
         tracecat_app = "/app"  # Where tracecat is installed in container
@@ -444,6 +475,9 @@ class WorkerPool:
             "clone_newipc: true",
             "clone_newuts: true",
             "clone_newcgroup: true",
+            "",
+            "# Syscall filtering",
+            f'seccomp_string: "{build_untrusted_seccomp_policy()}"',
             "",
             "# Resource limits",
             "rlimit_as_type: SOFT",
@@ -506,6 +540,15 @@ class WorkerPool:
                 f'mount {{ src: "{work_dir}" dst: "/work" is_bind: true rw: true }}',
             ]
         )
+
+        if action_gateway_socket is not None:
+            config_lines.extend(
+                [
+                    "",
+                    "# Action Gateway socket for SDK calls",
+                    f'mount {{ src: "{action_gateway_socket}" dst: "{ACTION_GATEWAY_SANDBOX_SOCKET}" is_bind: true rw: false }}',
+                ]
+            )
 
         # Dev and proc
         config_lines.extend(
@@ -1057,11 +1100,19 @@ class WorkerPool:
         action_name = input.task.action
         task_ref = input.task.ref
         stage = "init"
+        secret_projection = resolved_context.secret_projection
+        if secret_projection is None:
+            secret_projection = await project_secret_env(
+                secrets=resolved_context.secrets,
+                role=role,
+                run_context=input.run_context,
+            )
 
         request = {
             "input": input.model_dump(mode="json"),
             "role": role.model_dump(mode="json"),
             "resolved_context": resolved_context.model_dump(mode="json"),
+            "secret_env": secret_projection.env,
         }
         request_bytes = orjson.dumps(request)
 
@@ -1137,6 +1188,10 @@ class WorkerPool:
 
             elapsed_ms = (time.monotonic() - start_time) * 1000
             data = orjson.loads(response_bytes)
+            if data.get("type") == "failure":
+                data["error"] = apply_masks_object(
+                    data["error"], masks=secret_projection.mask_values
+                )
 
             # Validate using discriminated union
             result = _ExecutorResultAdapter.validate_python(data)

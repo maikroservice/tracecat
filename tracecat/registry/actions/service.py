@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, NamedTuple, TypedDict
 from typing import cast as typing_cast
 
@@ -19,12 +19,14 @@ from sqlalchemy import (
     tuple_,
     union_all,
 )
+from sqlalchemy.ext.asyncio import AsyncSession
 from tracecat_registry import (
     RegistryOAuthSecret,
     RegistrySecretType,
     RegistrySecretTypeValidator,
 )
 
+from tracecat.auth.types import Role
 from tracecat.db.models import (
     PlatformRegistryAction,
     PlatformRegistryIndex,
@@ -63,6 +65,7 @@ from tracecat.registry.actions.schemas import (
     TemplateAction,
 )
 from tracecat.registry.actions.types import IndexedActionResult, IndexEntry
+from tracecat.registry.constants import DEFAULT_REGISTRY_ORIGIN
 from tracecat.registry.loaders import (
     LoaderMode,
     get_bound_action_from_manifest,
@@ -71,8 +74,11 @@ from tracecat.registry.loaders import (
 from tracecat.registry.repository import Repository
 from tracecat.registry.sync.service import RegistrySyncService
 from tracecat.registry.versions.schemas import RegistryVersionManifest
+from tracecat.secrets.enums import SecretType
 from tracecat.secrets.schemas import SecretDefinition
-from tracecat.service import BaseService
+from tracecat.service import BaseOrgService
+from tracecat.tiers.enums import Entitlement
+from tracecat.tiers.service import TierService
 
 if TYPE_CHECKING:
     from tracecat.ssh import SshEnv
@@ -158,12 +164,92 @@ class SecretAggregate(TypedDict):
     optional_keys: set[str]
     optional: bool
     actions: set[str]
+    secret_type: str | None
 
 
-class RegistryActionsService(BaseService):
+def _infer_secret_type_from_keys(keys: list[str]) -> str:
+    """Infer registry secret_type from key shape.
+
+    Handles manifests stored before the secret_type field was added.
+    """
+    key_set = set(keys)
+    if key_set == {"PRIVATE_KEY"}:
+        return "ssh_key"
+    if key_set == {"TLS_CERTIFICATE", "TLS_PRIVATE_KEY"}:
+        return "mtls"
+    if key_set == {"CA_CERTIFICATE"}:
+        return "ca_cert"
+    return "custom"
+
+
+class RegistryActionsService(BaseOrgService):
     """Registry actions service."""
 
     service_name = "registry_actions"
+
+    def __init__(self, session: AsyncSession, role: Role | None = None):
+        super().__init__(session, role=role)
+        self._enabled_entitlements_cache: set[str] | None = None
+        self._custom_registry_enabled_cache: bool | None = None
+
+    @staticmethod
+    def _normalize_required_entitlements(options: dict) -> set[str]:
+        required = options.get("required_entitlements")
+        if not required:
+            return set()
+        if isinstance(required, str):
+            return {required}
+        if isinstance(required, list):
+            return {str(item) for item in required if item}
+        return set()
+
+    async def _get_enabled_entitlements(self) -> set[str]:
+        if self._enabled_entitlements_cache is None:
+            tier_service = TierService(self.session)
+            effective = await tier_service.get_effective_entitlements(
+                self.organization_id
+            )
+            self._enabled_entitlements_cache = {
+                key for key, value in effective.model_dump().items() if value
+            }
+        return self._enabled_entitlements_cache
+
+    @staticmethod
+    def _is_custom_origin(origin: str) -> bool:
+        return origin != DEFAULT_REGISTRY_ORIGIN
+
+    async def _is_custom_registry_enabled(self) -> bool:
+        if self._custom_registry_enabled_cache is None:
+            self._custom_registry_enabled_cache = await self.has_entitlement(
+                Entitlement.CUSTOM_REGISTRY
+            )
+        return self._custom_registry_enabled_cache
+
+    async def _allow_custom_origins_for_rows(self, origins: Iterable[str]) -> bool:
+        if not any(self._is_custom_origin(origin) for origin in origins):
+            return True
+        return await self._is_custom_registry_enabled()
+
+    async def _filter_index_entries_by_entitlements(
+        self,
+        entries: list[tuple[IndexEntry, str]],
+        *,
+        include_locked: bool = False,
+    ) -> list[tuple[IndexEntry, str]]:
+        required_any: set[str] = set()
+        for entry, _origin in entries:
+            required_any |= self._normalize_required_entitlements(entry.options)
+        if not required_any:
+            return entries
+        enabled = await self._get_enabled_entitlements()
+        filtered: list[tuple[IndexEntry, str]] = []
+        for entry, origin in entries:
+            missing = self._normalize_required_entitlements(entry.options) - enabled
+            entry.missing_entitlements = tuple(sorted(missing))
+            if missing and not include_locked:
+                continue
+            filtered.append((entry, origin))
+        return filtered
 
     async def list_actions_from_index(
         self,
@@ -171,6 +257,7 @@ class RegistryActionsService(BaseService):
         namespace: str | None = None,
         include_marked: bool = False,
         include_keys: set[str] | None = None,
+        include_locked: bool = False,
     ) -> list[tuple[IndexEntry, str]]:
         """List actions from registry index for current versions.
 
@@ -271,11 +358,16 @@ class RegistryActionsService(BaseService):
         )
         result = await self.session.execute(combined)
         rows = typing_cast(list[_IndexSelectRow], result.all())
+        allow_custom_origins = await self._allow_custom_origins_for_rows(
+            row.origin for row in rows
+        )
 
         # Convert to index entries, deduplicating (org-scoped takes precedence)
         entries: list[tuple[IndexEntry, str]] = []
         seen_actions: set[str] = set()
         for row in rows:
+            if not allow_custom_origins and self._is_custom_origin(row.origin):
+                continue
             action_name = f"{row.namespace}.{row.name}"
             # Skip duplicates (org-scoped takes precedence due to ORDER BY)
             if action_name in seen_actions:
@@ -297,7 +389,9 @@ class RegistryActionsService(BaseService):
                 options=row.options or {},
             )
             entries.append((entry, row.origin))
-        return entries
+        return await self._filter_index_entries_by_entitlements(
+            entries, include_locked=include_locked
+        )
 
     async def list_actions_from_index_by_repository(
         self,
@@ -380,9 +474,27 @@ class RegistryActionsService(BaseService):
         combined = union_all(org_statement, platform_statement)
         result = await self.session.execute(combined)
         rows = typing_cast(list[_RepoIndexRow], result.all())
+        allow_custom_origins = await self._allow_custom_origins_for_rows(
+            row.origin for row in rows
+        )
+
+        required_any: set[str] = set()
+        for row in rows:
+            if not allow_custom_origins and self._is_custom_origin(row.origin):
+                continue
+            required_any |= self._normalize_required_entitlements(row.options or {})
+        enabled_entitlements: set[str] | None = None
+        if required_any:
+            enabled_entitlements = await self._get_enabled_entitlements()
 
         actions: list[RegistryActionRead] = []
         for row in rows:
+            if not allow_custom_origins and self._is_custom_origin(row.origin):
+                continue
+            required = self._normalize_required_entitlements(row.options or {})
+            if required and enabled_entitlements is not None:
+                if not required.issubset(enabled_entitlements):
+                    continue
             manifest = RegistryVersionManifest.model_validate(row.manifest)
             action_name = f"{row.namespace}.{row.name}"
             manifest_action = manifest.actions.get(action_name)
@@ -505,31 +617,43 @@ class RegistryActionsService(BaseService):
             text("source")  # "org" < "platform" alphabetically
         )
         result = await self.session.execute(combined)
-        first_row = result.first()
-
-        if not first_row:
+        rows = typing_cast(list[_ActionIndexRow], result.all())
+        if not rows:
             return None
 
-        row = typing_cast(_ActionIndexRow, first_row)
-        manifest = RegistryVersionManifest.model_validate(row.manifest)
-        return IndexedActionResult(
-            index_entry=IndexEntry(
-                id=row.id,
-                namespace=row.namespace,
-                name=row.name,
-                action_type=row.action_type,
-                description=row.description,
-                default_title=row.default_title,
-                display_group=row.display_group,
-                options=row.options or {},
-                doc_url=row.doc_url,
-                author=row.author,
-                deprecated=row.deprecated,
-            ),
-            manifest=manifest,
-            origin=row.origin,
-            repository_id=row.repo_id,
+        allow_custom_origins = await self._allow_custom_origins_for_rows(
+            row.origin for row in rows
         )
+        enabled_entitlements: set[str] | None = None
+        for row in rows:
+            if not allow_custom_origins and self._is_custom_origin(row.origin):
+                continue
+            required = self._normalize_required_entitlements(row.options or {})
+            if required:
+                if enabled_entitlements is None:
+                    enabled_entitlements = await self._get_enabled_entitlements()
+                if not required.issubset(enabled_entitlements):
+                    continue
+            manifest = RegistryVersionManifest.model_validate(row.manifest)
+            return IndexedActionResult(
+                index_entry=IndexEntry(
+                    id=row.id,
+                    namespace=row.namespace,
+                    name=row.name,
+                    action_type=row.action_type,
+                    description=row.description,
+                    default_title=row.default_title,
+                    display_group=row.display_group,
+                    options=row.options or {},
+                    doc_url=row.doc_url,
+                    author=row.author,
+                    deprecated=row.deprecated,
+                ),
+                manifest=manifest,
+                origin=row.origin,
+                repository_id=row.repo_id,
+            )
+        return None
 
     async def get_actions_from_index(
         self,
@@ -647,9 +771,14 @@ class RegistryActionsService(BaseService):
         )
         result = await self.session.execute(combined)
         rows = typing_cast(list[_ActionIndexRow], result.all())
+        allow_custom_origins = await self._allow_custom_origins_for_rows(
+            row.origin for row in rows
+        )
 
         actions: dict[str, IndexedActionResult] = {}
         for row in rows:
+            if not allow_custom_origins and self._is_custom_origin(row.origin):
+                continue
             action_name = f"{row.namespace}.{row.name}"
             # Skip if already found (org-scoped takes precedence)
             if action_name in actions:
@@ -674,6 +803,21 @@ class RegistryActionsService(BaseService):
                 origin=row.origin,
                 repository_id=row.repo_id,
             )
+
+        required_any: set[str] = set()
+        for result in actions.values():
+            required_any |= self._normalize_required_entitlements(
+                result.index_entry.options
+            )
+        if required_any:
+            enabled = await self._get_enabled_entitlements()
+            actions = {
+                name: result
+                for name, result in actions.items()
+                if self._normalize_required_entitlements(
+                    result.index_entry.options
+                ).issubset(enabled)
+            }
 
         return actions
 
@@ -779,11 +923,16 @@ class RegistryActionsService(BaseService):
             combined = combined.limit(limit)
         result = await self.session.execute(combined)
         rows = typing_cast(list[_SearchIndexRow], result.all())
+        allow_custom_origins = await self._allow_custom_origins_for_rows(
+            row.origin for row in rows
+        )
 
         entries: list[tuple[IndexEntry, str]] = []
         seen_actions: set[str] = set()
 
         for row in rows:
+            if not allow_custom_origins and self._is_custom_origin(row.origin):
+                continue
             action_name = f"{row.namespace}.{row.name}"
             # Skip duplicates (org-scoped takes precedence in union order)
             if action_name in seen_actions:
@@ -809,7 +958,7 @@ class RegistryActionsService(BaseService):
                 )
             )
 
-        return entries
+        return await self._filter_index_entries_by_entitlements(entries)
 
     async def get_aggregated_secrets(self) -> list[SecretDefinition]:
         """Aggregate secrets from all actions in both org and platform registries.
@@ -856,6 +1005,7 @@ class RegistryActionsService(BaseService):
 
         aggregated: dict[str, SecretAggregate] = {}
         seen_actions: set[str] = set()
+        enabled_entitlements: set[str] | None = None
 
         for manifest_data in manifest_rows:
             manifest = RegistryVersionManifest.model_validate(manifest_data)
@@ -864,6 +1014,15 @@ class RegistryActionsService(BaseService):
                 if action_name in seen_actions:
                     continue
                 seen_actions.add(action_name)
+
+                required_entitlements = (
+                    manifest_action.options.required_entitlements or []
+                )
+                if required_entitlements:
+                    if enabled_entitlements is None:
+                        enabled_entitlements = await self._get_enabled_entitlements()
+                    if not set(required_entitlements).issubset(enabled_entitlements):
+                        continue
 
                 if not manifest_action.secrets:
                     continue
@@ -874,6 +1033,12 @@ class RegistryActionsService(BaseService):
                     ):
                         continue
 
+                    # Use the declared secret_type, but infer from key shape
+                    # when it wasn't explicitly set (old manifests).
+                    declared_type = secret.secret_type
+                    if "secret_type" not in secret.model_fields_set and secret.keys:
+                        declared_type = _infer_secret_type_from_keys(secret.keys)
+
                     entry = aggregated.setdefault(
                         secret.name,
                         {
@@ -881,6 +1046,7 @@ class RegistryActionsService(BaseService):
                             "optional_keys": set(),
                             "optional": False,
                             "actions": set(),
+                            "secret_type": None,
                         },
                     )
                     if secret.keys:
@@ -889,6 +1055,15 @@ class RegistryActionsService(BaseService):
                         entry["optional_keys"].update(secret.optional_keys)
                     entry["optional"] = entry["optional"] or secret.optional
                     entry["actions"].add(action_name)
+
+                    # Track declared secret_type; conflict → validation error
+                    if entry["secret_type"] is None:
+                        entry["secret_type"] = declared_type
+                    elif entry["secret_type"] != declared_type:
+                        raise RegistryValidationError(
+                            f"Conflicting secret_type for secret {secret.name!r}: "
+                            f"{entry['secret_type']!r} vs {declared_type!r}"
+                        )
 
         definitions: list[SecretDefinition] = []
         for name, data in aggregated.items():
@@ -901,6 +1076,7 @@ class RegistryActionsService(BaseService):
                     keys=required_keys,
                     optional_keys=optional_keys or None,
                     optional=data["optional"],
+                    secret_type=SecretType(data["secret_type"] or SecretType.CUSTOM),
                     actions=actions,
                     action_count=len(actions),
                 )
@@ -1057,6 +1233,7 @@ class RegistryActionsService(BaseService):
         *,
         target_version: str | None = None,
         target_commit_sha: str | None = None,
+        git_repo_package_name: str | None = None,
         ssh_env: SshEnv | None = None,
     ) -> tuple[str | None, str | None]:
         """Sync actions from a repository using the versioned flow.
@@ -1073,13 +1250,14 @@ class RegistryActionsService(BaseService):
             db_repo: The repository to sync.
             target_version: Version string (auto-generated if not provided).
             target_commit_sha: Optional commit SHA to sync to.
+            git_repo_package_name: Optional Python package name override for git repos.
             ssh_env: SSH environment for git operations (required for git+ssh repos).
 
         Returns:
             Tuple of (commit_sha, version_string)
 
         Raises:
-            TarballBuildError: If tarball building fails (no version is created)
+            RegistryArtifactBuildError: If artifact building fails (no version is created)
         """
         # Use the v2 sync service
         sync_service = RegistrySyncService(self.session, self.role)
@@ -1090,6 +1268,7 @@ class RegistryActionsService(BaseService):
                     db_repo=db_repo,
                     target_version=target_version,
                     target_commit_sha=target_commit_sha,
+                    git_repo_package_name=git_repo_package_name,
                     ssh_env=ssh_env,
                     commit=False,
                 )
@@ -1099,6 +1278,7 @@ class RegistryActionsService(BaseService):
                     db_repo=db_repo,
                     target_version=target_version,
                     target_commit_sha=target_commit_sha,
+                    git_repo_package_name=git_repo_package_name,
                     ssh_env=ssh_env,
                     commit=False,
                 )

@@ -1,55 +1,105 @@
 "use client"
 
+import { useQueryClient } from "@tanstack/react-query"
 import { formatDistanceToNow } from "date-fns"
 import {
   AlertTriangle,
+  Check,
   ChevronDown,
   ClockPlus,
+  FileText,
   FileUpIcon,
   Flag,
   Flame,
-  Key,
+  FolderIcon,
+  KeyRound,
+  ListIcon,
+  LockKeyhole,
+  MessageSquare,
+  MousePointerClickIcon,
   PanelRight,
   PenLine,
   Plus,
-  Search,
-  Sparkles,
+  TagsIcon,
   Trash2,
   User,
   X,
 } from "lucide-react"
+import dynamic from "next/dynamic"
 import Link from "next/link"
-import { usePathname, useSearchParams } from "next/navigation"
-import { Fragment, type ReactNode, useState } from "react"
-import type { CaseStatus, OAuthGrantType } from "@/client"
+import { usePathname, useRouter, useSearchParams } from "next/navigation"
+import {
+  Fragment,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useState,
+} from "react"
+import {
+  type CaseStatus,
+  casesAddTag,
+  casesCreateComment,
+  casesGetCase,
+  casesUpdateCase,
+} from "@/client"
+import {
+  AgentsCatalogViewMode,
+  AgentsCatalogViewToggle,
+} from "@/components/agents/agents-catalog-view-toggle"
+import { AgentFolderCreateDialog } from "@/components/agents/agents-dashboard"
+import { CreateAgentDialog } from "@/components/agents/create-agent-dialog"
+import { useScopeCheck } from "@/components/auth/scope-guard"
+import { AddCaseDropdown } from "@/components/cases/add-case-dropdown"
 import { AddCaseDuration } from "@/components/cases/add-case-duration"
+import { AddCaseTag } from "@/components/cases/add-case-tag"
 import { AddCustomField } from "@/components/cases/add-custom-field"
 import {
   PRIORITIES,
   SEVERITIES,
   STATUSES,
 } from "@/components/cases/case-categories"
+import { CaseClosureDialog } from "@/components/cases/case-closure-dialog"
 import { CreateCaseDialog } from "@/components/cases/case-create-dialog"
-import {
-  StatusSelect,
-  UNASSIGNED,
-} from "@/components/cases/case-panel-selectors"
+import { CaseDurationMetrics } from "@/components/cases/case-duration-metrics"
+import { UNASSIGNED } from "@/components/cases/case-panel-selectors"
 import { useCaseSelection } from "@/components/cases/case-selection-context"
 import {
   CasesViewMode,
   CasesViewToggle,
 } from "@/components/cases/cases-view-toggle"
+import { AddWorkflowTag } from "@/components/dashboard/add-workflow-tag"
 import { CreateWorkflowButton } from "@/components/dashboard/create-workflow-button"
 import {
-  FolderViewToggle,
-  ViewMode,
-} from "@/components/dashboard/folder-view-toggle"
+  WorkflowsCatalogViewMode,
+  WorkflowsCatalogViewToggle,
+} from "@/components/dashboard/workflows-catalog-view-toggle"
+import { DynamicLucideIcon } from "@/components/dynamic-lucide-icon"
 import { CreateCustomProviderDialog } from "@/components/integrations/create-custom-provider-dialog"
-import { MCPIntegrationDialog } from "@/components/integrations/mcp-integration-dialog"
 import { Spinner } from "@/components/loading/spinner"
+import {
+  MembersViewMode,
+  MembersViewToggle,
+} from "@/components/members/members-view-toggle"
+import { CreateGroupButton } from "@/components/rbac/create-group-button"
+import { CreateRoleButton } from "@/components/rbac/create-role-button"
+import { RegistryActionsControls } from "@/components/registry/workspace-actions-controls"
+import { CreateSkillButton } from "@/components/skills/create-skill-button"
+import { SkillsDetailActions } from "@/components/skills/skills-detail-actions"
+import { TableSelectionActionsBar } from "@/components/tables/ag-grid-bulk-actions"
 import { CreateTableDialog } from "@/components/tables/table-create-dialog"
 import { TableImportTableDialog } from "@/components/tables/table-import-table-dialog"
 import { TableInsertButton } from "@/components/tables/table-insert-button"
+import { TableLinkRowsToCaseCommand } from "@/components/tables/table-link-rows-to-case-command"
+import { CreateTagDialog } from "@/components/tags/create-tag-dialog"
+
+const SimpleEditor = dynamic(
+  () =>
+    import("@/components/tiptap-templates/simple/simple-editor").then(
+      (m) => m.SimpleEditor
+    ),
+  { ssr: false }
+)
+
 import {
   AlertDialog,
   AlertDialogAction,
@@ -71,8 +121,17 @@ import {
 import { Button } from "@/components/ui/button"
 import { ButtonGroup, ButtonGroupText } from "@/components/ui/button-group"
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuSeparator,
   DropdownMenuSub,
@@ -80,25 +139,34 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
+import { Kbd } from "@/components/ui/kbd"
 import { SidebarTrigger } from "@/components/ui/sidebar"
-import { AddWorkspaceMember } from "@/components/workspaces/add-workspace-member"
+import { Skeleton } from "@/components/ui/skeleton"
 import {
-  NewCredentialsDialog,
-  NewCredentialsDialogTrigger,
-} from "@/components/workspaces/add-workspace-secret"
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
+import { toast } from "@/components/ui/use-toast"
+import { WorkspaceResourceSyncActions } from "@/components/workspace-sync/resource-sync-actions"
+import { AddWorkspaceMember } from "@/components/workspaces/add-workspace-member"
 import {
   NewVariableDialog,
   NewVariableDialogTrigger,
 } from "@/components/workspaces/add-workspace-variable"
-import { useAgentPreset } from "@/hooks/use-agent-presets"
-import { useLocalStorage } from "@/hooks/use-local-storage"
+import { CreateCredentialDialog } from "@/components/workspaces/create-credential-dialog"
+import { useAgentPreset, useAgentTagCatalog } from "@/hooks/use-agent-presets"
+import { useEntitlements } from "@/hooks/use-entitlements"
+import { useSkill } from "@/hooks/use-skills"
 import { useWorkspaceDetails, useWorkspaceMembers } from "@/hooks/use-workspace"
-import { getDisplayName } from "@/lib/auth"
 import {
+  useCaseDropdownDefinitions,
+  useCaseDurationDefinitions,
+  useCaseDurations,
+  useCaseFields,
+  useCaseTagCatalog,
   useGetCase,
   useGetTable,
-  useIntegrationProvider,
-  useUpdateCase,
 } from "@/lib/hooks"
 import { capitalizeFirst, cn } from "@/lib/utils"
 import { useWorkspaceId } from "@/providers/workspace-id"
@@ -109,8 +177,6 @@ interface PageConfig {
 }
 
 interface ControlsHeaderProps {
-  /** Whether the right-hand chat sidebar is currently open */
-  isChatOpen?: boolean
   /** Callback to toggle the chat sidebar */
   onToggleChat?: () => void
 }
@@ -125,18 +191,41 @@ const CASE_STATUS_TINTS: Record<CaseStatus, string> = {
   unknown: "bg-slate-500/[0.03] dark:bg-slate-500/[0.08]",
 }
 
+const CHAT_TOGGLE_KEY = "c"
+
 function WorkflowsActions() {
+  const pathname = usePathname()
+  const workspaceId = useWorkspaceId()
   const searchParams = useSearchParams()
-  const currentPath = searchParams?.get("path") || null
-  const [view, setView] = useLocalStorage("folder-view", ViewMode.Tags)
+  const catalogView = pathname?.includes("/workflows/tags")
+    ? WorkflowsCatalogViewMode.Tags
+    : WorkflowsCatalogViewMode.Workflows
+  const view = searchParams?.get("view") === "list" ? "list" : "folders"
+  const currentPath =
+    view === "folders" ? searchParams?.get("path") || "/" : null
+  const workflowsHref = `/workspaces/${workspaceId}/workflows`
+  const tagsHref = `/workspaces/${workspaceId}/workflows/tags`
 
   return (
     <>
-      <FolderViewToggle view={view} onViewChange={setView} />
-      <CreateWorkflowButton
-        view={view === ViewMode.Folders ? "folders" : "default"}
-        currentFolderPath={currentPath}
+      <WorkflowsCatalogViewToggle
+        view={catalogView}
+        workflowsHref={workflowsHref}
+        tagsHref={tagsHref}
       />
+      <WorkspaceResourceSyncActions
+        label="workflows"
+        branchSlug="workflows"
+        resources={["workflow"]}
+      />
+      {catalogView === WorkflowsCatalogViewMode.Tags ? (
+        <AddWorkflowTag />
+      ) : (
+        <CreateWorkflowButton
+          view={view === "folders" ? "folders" : "default"}
+          currentFolderPath={currentPath}
+        />
+      )}
     </>
   )
 }
@@ -162,8 +251,8 @@ function WorkflowsBreadcrumb({
   const segments = normalizedPath.split("/").filter(Boolean)
   const baseHref = `/workspaces/${workspaceId}/workflows`
   const getFolderHref = (folderPath: string) => {
-    if (folderPath === "/") return baseHref
-    return `${baseHref}?path=${encodeURIComponent(folderPath)}`
+    if (folderPath === "/") return `${baseHref}?view=folders&path=%2F`
+    return `${baseHref}?view=folders&path=${encodeURIComponent(folderPath)}`
   }
 
   return (
@@ -211,6 +300,11 @@ function TablesActions() {
 
   return (
     <>
+      <WorkspaceResourceSyncActions
+        label="tables"
+        branchSlug="tables"
+        resources={["table"]}
+      />
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button variant="outline" size="sm" className="h-7 bg-white">
@@ -260,7 +354,9 @@ function TablesActions() {
 }
 
 function IntegrationsActions() {
-  const [activeDialog, setActiveDialog] = useState<"oauth" | "mcp" | null>(null)
+  const [oauthDialogOpen, setOauthDialogOpen] = useState(false)
+  const [credentialDialogOpen, setCredentialDialogOpen] = useState(false)
+  const canCreateSecrets = useScopeCheck("secret:create") === true
 
   return (
     <>
@@ -280,81 +376,375 @@ function IntegrationsActions() {
             [&_[data-radix-collection-item]]:gap-2
           "
         >
-          <DropdownMenuItem onSelect={() => setActiveDialog("oauth")}>
-            <Key className="size-4 text-foreground/80" />
-            <div className="flex flex-col text-xs">
-              <span>OAuth provider</span>
-              <span className="text-xs text-muted-foreground">
-                Add a custom OAuth 2.0 provider
-              </span>
-            </div>
-          </DropdownMenuItem>
-          <DropdownMenuItem onSelect={() => setActiveDialog("mcp")}>
-            <Sparkles className="size-4 text-foreground/80" />
-            <div className="flex flex-col text-xs">
-              <span>MCP integration</span>
-              <span className="text-xs text-muted-foreground">
-                Connect to an MCP server
-              </span>
-            </div>
-          </DropdownMenuItem>
+          <DropdownMenuGroup>
+            {canCreateSecrets ? (
+              <DropdownMenuItem onSelect={() => setCredentialDialogOpen(true)}>
+                <KeyRound className="size-4 text-foreground/80" />
+                <div className="flex flex-col text-xs">
+                  <span>Key-value credentials</span>
+                  <span className="text-xs text-muted-foreground">
+                    Store API keys and tokens
+                  </span>
+                </div>
+              </DropdownMenuItem>
+            ) : null}
+            <DropdownMenuItem onSelect={() => setOauthDialogOpen(true)}>
+              <LockKeyhole className="size-4 text-foreground/80" />
+              <div className="flex flex-col text-xs">
+                <span>Custom OAuth provider</span>
+                <span className="text-xs text-muted-foreground">
+                  Configure OAuth app credentials
+                </span>
+              </div>
+            </DropdownMenuItem>
+          </DropdownMenuGroup>
         </DropdownMenuContent>
       </DropdownMenu>
-      <CreateCustomProviderDialog
-        open={activeDialog === "oauth"}
-        onOpenChange={(open) => setActiveDialog(open ? "oauth" : null)}
-        hideTrigger
+      <CreateCredentialDialog
+        open={credentialDialogOpen}
+        onOpenChange={setCredentialDialogOpen}
       />
-      <MCPIntegrationDialog
-        open={activeDialog === "mcp"}
-        onOpenChange={(open) => setActiveDialog(open ? "mcp" : null)}
+      <CreateCustomProviderDialog
+        open={oauthDialogOpen}
+        onOpenChange={setOauthDialogOpen}
         hideTrigger
       />
     </>
   )
 }
 
-function AgentsActions() {
-  const workspaceId = useWorkspaceId()
+function SkillsActions() {
+  return (
+    <>
+      <WorkspaceResourceSyncActions
+        label="skills"
+        branchSlug="skills"
+        resources={["skill"]}
+      />
+      <CreateSkillButton />
+    </>
+  )
+}
+
+function BreadcrumbEntityPage({
+  label,
+  skeletonClassName,
+}: {
+  label?: string | null
+  skeletonClassName: string
+}) {
+  if (!label) {
+    return <Skeleton className={skeletonClassName} />
+  }
+
+  return <BreadcrumbPage className="font-semibold">{label}</BreadcrumbPage>
+}
+
+function SkillsBreadcrumb({
+  workspaceId,
+  skillId,
+}: {
+  workspaceId: string
+  skillId: string
+}) {
+  const { skill } = useSkill(workspaceId, skillId)
 
   return (
-    <Button variant="outline" size="sm" className="h-7 bg-white" asChild>
-      <Link href={`/workspaces/${workspaceId}/agents/new`}>
+    <Breadcrumb>
+      <BreadcrumbList className="relative z-10 flex items-center gap-2 text-sm flex-nowrap overflow-hidden whitespace-nowrap min-w-0 bg-transparent pr-1">
+        <BreadcrumbItem>
+          <BreadcrumbLink asChild className="font-semibold hover:no-underline">
+            <Link href={`/workspaces/${workspaceId}/skills`}>Skills</Link>
+          </BreadcrumbLink>
+        </BreadcrumbItem>
+        <BreadcrumbSeparator className="shrink-0">
+          <span className="text-muted-foreground">/</span>
+        </BreadcrumbSeparator>
+        <BreadcrumbItem>
+          <BreadcrumbEntityPage
+            label={skill?.name}
+            skeletonClassName="h-4 w-28"
+          />
+        </BreadcrumbItem>
+      </BreadcrumbList>
+    </Breadcrumb>
+  )
+}
+
+function normalizeAgentActionPath(rawPath: string | null): string {
+  if (!rawPath || rawPath === "/") {
+    return "/"
+  }
+  const withLeadingSlash = rawPath.startsWith("/") ? rawPath : `/${rawPath}`
+  return withLeadingSlash.endsWith("/") && withLeadingSlash !== "/"
+    ? withLeadingSlash.slice(0, -1)
+    : withLeadingSlash
+}
+
+function AgentFoldersBreadcrumb({
+  workspaceId,
+  path,
+}: {
+  workspaceId: string
+  path: string | null
+}) {
+  const normalizedPath = normalizeAgentActionPath(path)
+  const segments = normalizedPath.split("/").filter(Boolean)
+  const baseHref = `/workspaces/${workspaceId}/agents`
+  const getFolderHref = (folderPath: string) => {
+    if (folderPath === "/") {
+      return `${baseHref}?view=folders&path=%2F`
+    }
+    return `${baseHref}?view=folders&path=${encodeURIComponent(folderPath)}`
+  }
+
+  return (
+    <Breadcrumb>
+      <BreadcrumbList className="relative z-10 flex items-center gap-2 text-sm flex-nowrap overflow-hidden whitespace-nowrap min-w-0 bg-transparent pr-1">
+        <BreadcrumbItem>
+          <BreadcrumbLink asChild className="font-semibold hover:no-underline">
+            <Link href={baseHref}>Agents</Link>
+          </BreadcrumbLink>
+        </BreadcrumbItem>
+        {segments.map((segment, index) => {
+          const folderPath = `/${segments.slice(0, index + 1).join("/")}`
+          const isLast = index === segments.length - 1
+          return (
+            <Fragment key={folderPath}>
+              <BreadcrumbSeparator className="shrink-0">
+                <span className="text-muted-foreground">/</span>
+              </BreadcrumbSeparator>
+              <BreadcrumbItem>
+                {isLast ? (
+                  <BreadcrumbPage className="font-semibold">
+                    {segment}
+                  </BreadcrumbPage>
+                ) : (
+                  <BreadcrumbLink
+                    asChild
+                    className="font-semibold hover:no-underline"
+                  >
+                    <Link href={getFolderHref(folderPath)}>{segment}</Link>
+                  </BreadcrumbLink>
+                )}
+              </BreadcrumbItem>
+            </Fragment>
+          )
+        })}
+      </BreadcrumbList>
+    </Breadcrumb>
+  )
+}
+
+function AgentsActions() {
+  const pathname = usePathname()
+  const workspaceId = useWorkspaceId()
+  const searchParams = useSearchParams()
+  const { hasEntitlement, isLoading: entitlementsLoading } = useEntitlements()
+  const canCreateAgent = useScopeCheck("agent:create")
+  const [createDialogOpen, setCreateDialogOpen] = useState(false)
+  const [createTagDialogOpen, setCreateTagDialogOpen] = useState(false)
+  const [folderDialogOpen, setFolderDialogOpen] = useState(false)
+
+  const catalogView = pathname?.includes("/agents/tags")
+    ? AgentsCatalogViewMode.Tags
+    : AgentsCatalogViewMode.Agents
+  const agentsHref = `/workspaces/${workspaceId}/agents`
+  const tagsHref = `/workspaces/${workspaceId}/agents/tags`
+  const isFoldersView = searchParams?.get("view") !== "list"
+  const currentPath = normalizeAgentActionPath(
+    searchParams?.get("path") ?? null
+  )
+  const agentAddonsEnabled = hasEntitlement("agent_addons")
+  const canUseAgentActions =
+    !entitlementsLoading && agentAddonsEnabled && canCreateAgent === true
+  let agentActionControls: ReactNode = null
+
+  if (canUseAgentActions) {
+    if (catalogView === AgentsCatalogViewMode.Tags) {
+      agentActionControls = (
+        <AddAgentTag
+          open={createTagDialogOpen}
+          onOpenChange={setCreateTagDialogOpen}
+        />
+      )
+    } else {
+      agentActionControls = (
+        <>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="outline" size="sm" className="h-7 bg-white">
+                <Plus className="mr-1 h-3.5 w-3.5" />
+                Create new
+                <ChevronDown className="ml-1 h-3.5 w-3.5" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align="end"
+              className="
+                [&_[data-radix-collection-item]]:flex
+                [&_[data-radix-collection-item]]:items-center
+                [&_[data-radix-collection-item]]:gap-2
+              "
+            >
+              <DropdownMenuItem onSelect={() => setCreateDialogOpen(true)}>
+                <MousePointerClickIcon className="size-4 text-foreground/80" />
+                <div className="flex flex-col text-xs">
+                  <span>Agent</span>
+                  <span className="text-xs text-muted-foreground">
+                    Start from scratch
+                  </span>
+                </div>
+              </DropdownMenuItem>
+              {isFoldersView && (
+                <DropdownMenuItem onSelect={() => setFolderDialogOpen(true)}>
+                  <FolderIcon className="size-4 text-foreground/80" />
+                  <div className="flex flex-col text-xs">
+                    <span>Folder</span>
+                    <span className="text-xs text-muted-foreground">
+                      Create a new folder
+                    </span>
+                  </div>
+                </DropdownMenuItem>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <CreateAgentDialog
+            open={createDialogOpen}
+            onOpenChange={setCreateDialogOpen}
+            currentPath={isFoldersView ? currentPath : null}
+          />
+          <AgentFolderCreateDialog
+            open={folderDialogOpen}
+            onOpenChange={setFolderDialogOpen}
+            currentPath={currentPath}
+          />
+        </>
+      )
+    }
+  }
+
+  return (
+    <>
+      <AgentsCatalogViewToggle
+        view={catalogView}
+        agentsHref={agentsHref}
+        tagsHref={tagsHref}
+      />
+      <WorkspaceResourceSyncActions
+        label="agents"
+        branchSlug="agents"
+        resources={["agent_preset"]}
+      />
+      {agentActionControls}
+    </>
+  )
+}
+
+function AddAgentTag({
+  open,
+  onOpenChange,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  const workspaceId = useWorkspaceId()
+  const { agentTags, createAgentTag } = useAgentTagCatalog(workspaceId, {
+    enabled: open,
+  })
+
+  return (
+    <>
+      <Button
+        variant="outline"
+        size="sm"
+        className="h-7 bg-white"
+        onClick={() => onOpenChange(true)}
+      >
         <Plus className="mr-1 h-3.5 w-3.5" />
-        New agent
-      </Link>
-    </Button>
+        Create tag
+      </Button>
+      <CreateTagDialog
+        open={open}
+        onOpenChange={onOpenChange}
+        existingTags={agentTags}
+        onCreateTag={async (params) => {
+          await createAgentTag(params)
+        }}
+        title="Create new agent tag"
+        description="Enter a name for your new agent tag."
+      />
+    </>
   )
 }
 
 function CasesActions() {
   const pathname = usePathname()
-  const searchParams = useSearchParams()
   const workspaceId = useWorkspaceId()
   const [dialogOpen, setDialogOpen] = useState(false)
 
   const view = pathname?.includes("/cases/custom-fields")
     ? CasesViewMode.CustomFields
-    : pathname?.includes("/cases/durations")
-      ? CasesViewMode.Durations
-      : searchParams?.get("view") === CasesViewMode.Tags
-        ? CasesViewMode.Tags
-        : CasesViewMode.Cases
+    : pathname?.includes("/cases/closure-requirements")
+      ? CasesViewMode.ClosureRequirements
+      : pathname?.includes("/cases/durations")
+        ? CasesViewMode.Durations
+        : pathname?.includes("/cases/tags")
+          ? CasesViewMode.Tags
+          : pathname?.includes("/cases/dropdowns")
+            ? CasesViewMode.Dropdowns
+            : CasesViewMode.Cases
 
   const casesHref = workspaceId ? `/workspaces/${workspaceId}/cases` : undefined
-  const tagsHref = (() => {
-    if (!workspaceId || !casesHref) return undefined
-    const params = new URLSearchParams(searchParams?.toString())
-    params.set("view", CasesViewMode.Tags)
-    const queryString = params.toString()
-    return queryString ? `${casesHref}?${queryString}` : casesHref
-  })()
+  const tagsHref = workspaceId
+    ? `/workspaces/${workspaceId}/cases/tags`
+    : undefined
   const customFieldsHref = workspaceId
     ? `/workspaces/${workspaceId}/cases/custom-fields`
+    : undefined
+  const dropdownsHref = workspaceId
+    ? `/workspaces/${workspaceId}/cases/dropdowns`
+    : undefined
+  const closureRequirementsHref = workspaceId
+    ? `/workspaces/${workspaceId}/cases/closure-requirements`
     : undefined
   const durationsHref = workspaceId
     ? `/workspaces/${workspaceId}/cases/durations`
     : undefined
+  let syncActions: ReactNode = null
+  if (view === CasesViewMode.CustomFields) {
+    syncActions = (
+      <WorkspaceResourceSyncActions
+        label="case custom fields"
+        branchSlug="case-fields"
+        resources={["case_field"]}
+      />
+    )
+  } else if (view === CasesViewMode.Durations) {
+    syncActions = (
+      <WorkspaceResourceSyncActions
+        label="case durations"
+        branchSlug="case-durations"
+        resources={["case_duration"]}
+      />
+    )
+  } else if (view === CasesViewMode.Tags) {
+    syncActions = (
+      <WorkspaceResourceSyncActions
+        label="case tags"
+        branchSlug="case-tags"
+        resources={["case_tag"]}
+      />
+    )
+  } else if (view === CasesViewMode.Dropdowns) {
+    syncActions = (
+      <WorkspaceResourceSyncActions
+        label="case dropdowns"
+        branchSlug="case-dropdowns"
+        resources={["case_dropdown"]}
+      />
+    )
+  }
 
   return (
     <>
@@ -363,13 +753,20 @@ function CasesActions() {
         casesHref={casesHref}
         tagsHref={tagsHref}
         customFieldsHref={customFieldsHref}
+        dropdownsHref={dropdownsHref}
+        closureRequirementsHref={closureRequirementsHref}
         durationsHref={durationsHref}
       />
+      {syncActions}
       {view === CasesViewMode.CustomFields ? (
         <AddCustomField />
       ) : view === CasesViewMode.Durations ? (
         <AddCaseDuration />
-      ) : (
+      ) : view === CasesViewMode.Tags ? (
+        <AddCaseTag />
+      ) : view === CasesViewMode.Dropdowns ? (
+        <AddCaseDropdown />
+      ) : view === CasesViewMode.ClosureRequirements ? null : (
         <>
           <Button
             variant="outline"
@@ -387,9 +784,10 @@ function CasesActions() {
   )
 }
 
-function CasesSelectionActionsBar() {
+function CasesSelectionActionsBar({ enabled = true }: { enabled?: boolean }) {
   const {
     selectedCount,
+    selectedCaseIds,
     clearSelection,
     deleteSelected,
     bulkUpdateSelectedCases,
@@ -397,8 +795,182 @@ function CasesSelectionActionsBar() {
     isUpdating,
   } = useCaseSelection()
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false)
+  const [selectedTagIds, setSelectedTagIds] = useState<Set<string>>(new Set())
+  const [isApplyingTags, setIsApplyingTags] = useState(false)
+  const [commentDialogOpen, setCommentDialogOpen] = useState(false)
+  const [commentText, setCommentText] = useState("")
+  const [isAddingComments, setIsAddingComments] = useState(false)
+  const [appendDialogOpen, setAppendDialogOpen] = useState(false)
+  const [appendText, setAppendText] = useState("")
+  const [isAppending, setIsAppending] = useState(false)
   const workspaceId = useWorkspaceId()
-  const { members, membersLoading } = useWorkspaceMembers(workspaceId)
+  const queryClient = useQueryClient()
+  const { hasEntitlement } = useEntitlements()
+  const caseAddonsEnabled = hasEntitlement("case_addons")
+  const shouldLoadCatalogData = enabled && selectedCount > 0
+  const { members, membersLoading } = useWorkspaceMembers(workspaceId, {
+    enabled: shouldLoadCatalogData,
+  })
+  const { caseTags, caseTagsIsLoading } = useCaseTagCatalog(workspaceId, {
+    enabled: shouldLoadCatalogData,
+  })
+  const { dropdownDefinitions, dropdownDefinitionsIsLoading } =
+    useCaseDropdownDefinitions(
+      workspaceId,
+      shouldLoadCatalogData && caseAddonsEnabled
+    )
+  const { caseFields: caseFieldDefinitions } = useCaseFields(
+    workspaceId,
+    shouldLoadCatalogData && caseAddonsEnabled
+  )
+  const [closureDialog, setClosureDialog] = useState<{
+    open: boolean
+    targetStatus: CaseStatus
+  } | null>(null)
+
+  // All callbacks must be defined before any early returns to satisfy React's rules of hooks
+  const handleToggleTagSelection = useCallback((tagId: string) => {
+    setSelectedTagIds((prev) => {
+      const next = new Set(prev)
+      if (next.has(tagId)) {
+        next.delete(tagId)
+      } else {
+        next.add(tagId)
+      }
+      return next
+    })
+  }, [])
+
+  const handleApplyTags = useCallback(async () => {
+    if (selectedTagIds.size === 0 || selectedCaseIds.length === 0) {
+      return
+    }
+
+    setIsApplyingTags(true)
+    try {
+      // Apply each selected tag to each selected case
+      const promises = selectedCaseIds.flatMap((caseId) =>
+        Array.from(selectedTagIds).map((tagId) =>
+          casesAddTag({
+            caseId,
+            workspaceId,
+            requestBody: { tag_id: tagId },
+          })
+        )
+      )
+
+      await Promise.all(promises)
+
+      // Invalidate queries to refresh the data
+      await queryClient.invalidateQueries({ queryKey: ["cases"] })
+
+      const tagNames = caseTags
+        ?.filter((t) => selectedTagIds.has(t.id))
+        .map((t) => t.name)
+        .join(", ")
+
+      const caseCount = selectedCaseIds.length
+      toast({
+        title: "Tags applied",
+        description: `Applied ${selectedTagIds.size} tag${selectedTagIds.size === 1 ? "" : "s"} (${tagNames}) to ${caseCount} case${caseCount === 1 ? "" : "s"}.`,
+      })
+
+      // Clear selection after applying
+      setSelectedTagIds(new Set())
+    } catch (error) {
+      console.error("Failed to apply tags:", error)
+      toast({
+        title: "Error",
+        description: "Failed to apply some tags. Please try again.",
+        variant: "destructive",
+      })
+    } finally {
+      setIsApplyingTags(false)
+    }
+  }, [selectedTagIds, selectedCaseIds, workspaceId, queryClient, caseTags])
+
+  const handleBulkAddComment = useCallback(async () => {
+    if (!commentText.trim() || selectedCaseIds.length === 0) return
+
+    setIsAddingComments(true)
+    try {
+      await Promise.all(
+        selectedCaseIds.map((caseId) =>
+          casesCreateComment({
+            caseId,
+            workspaceId,
+            requestBody: { content: commentText.trim() },
+          })
+        )
+      )
+
+      await queryClient.invalidateQueries({ queryKey: ["cases"] })
+
+      const caseCount = selectedCaseIds.length
+      toast({
+        title: "Comments added",
+        description: `Added comment to ${caseCount} case${caseCount === 1 ? "" : "s"}.`,
+      })
+
+      setCommentText("")
+      setCommentDialogOpen(false)
+    } catch (error) {
+      console.error("Failed to add comments:", error)
+      toast({
+        title: "Error",
+        description: "Failed to add comments to some cases. Please try again.",
+        variant: "destructive",
+      })
+    } finally {
+      setIsAddingComments(false)
+    }
+  }, [commentText, selectedCaseIds, workspaceId, queryClient])
+
+  const handleBulkAppendDescription = useCallback(async () => {
+    if (!appendText.trim() || selectedCaseIds.length === 0) return
+
+    setIsAppending(true)
+    try {
+      const cases = await Promise.all(
+        selectedCaseIds.map((caseId) => casesGetCase({ caseId, workspaceId }))
+      )
+
+      await Promise.all(
+        cases.map((c) =>
+          casesUpdateCase({
+            caseId: c.id,
+            workspaceId,
+            requestBody: {
+              description:
+                (c.description ? `${c.description}\n\n` : "") +
+                appendText.trim(),
+            },
+          })
+        )
+      )
+
+      await queryClient.invalidateQueries({ queryKey: ["cases"] })
+
+      const caseCount = selectedCaseIds.length
+      toast({
+        title: "Descriptions updated",
+        description: `Appended text to ${caseCount} case${caseCount === 1 ? "" : "s"}.`,
+      })
+
+      setAppendText("")
+      setAppendDialogOpen(false)
+    } catch (error) {
+      console.error("Failed to append to descriptions:", error)
+      toast({
+        title: "Error",
+        description:
+          "Failed to update some case descriptions. Please try again.",
+        variant: "destructive",
+      })
+    } finally {
+      setIsAppending(false)
+    }
+  }, [appendText, selectedCaseIds, workspaceId, queryClient])
 
   const statusOptions = Object.values(STATUSES)
   const priorityOptions = Object.values(PRIORITIES)
@@ -410,11 +982,7 @@ function CasesSelectionActionsBar() {
     },
     ...(members?.map((member) => ({
       value: member.user_id,
-      label: getDisplayName({
-        first_name: member.first_name,
-        last_name: member.last_name,
-        email: member.email,
-      }),
+      label: member.email,
     })) ?? []),
   ]
 
@@ -422,9 +990,15 @@ function CasesSelectionActionsBar() {
     return null
   }
 
-  const isBusy = Boolean(isDeleting) || Boolean(isUpdating)
+  const isBusy =
+    Boolean(isDeleting) ||
+    Boolean(isUpdating) ||
+    isApplyingTags ||
+    isAddingComments ||
+    isAppending
   const canUpdate = Boolean(bulkUpdateSelectedCases) && !isBusy
   const pluralisedCases = `${selectedCount} case${selectedCount === 1 ? "" : "s"}`
+  const canApplyTags = !isBusy && caseTags && caseTags.length > 0
 
   const handleClearSelection = () => {
     if (isBusy) {
@@ -480,7 +1054,7 @@ function CasesSelectionActionsBar() {
               <DropdownMenuSubTrigger disabled={!canUpdate}>
                 <span className="flex items-center gap-2">
                   <Flag className="size-3 text-muted-foreground" aria-hidden />
-                  <span>Change status</span>
+                  <span>Status</span>
                 </span>
               </DropdownMenuSubTrigger>
               <DropdownMenuSubContent className="w-48">
@@ -492,6 +1066,28 @@ function CasesSelectionActionsBar() {
                     onSelect={async () => {
                       if (!bulkUpdateSelectedCases) {
                         return
+                      }
+                      // Intercept closed/resolved for closure requirements
+                      if (
+                        caseAddonsEnabled &&
+                        (status.value === "closed" ||
+                          status.value === "resolved")
+                      ) {
+                        const reqFields =
+                          caseFieldDefinitions?.filter(
+                            (f) => !f.reserved && f.required_on_closure
+                          ) ?? []
+                        const reqDropdowns =
+                          dropdownDefinitions?.filter(
+                            (d) => d.required_on_closure
+                          ) ?? []
+                        if (reqFields.length > 0 || reqDropdowns.length > 0) {
+                          setClosureDialog({
+                            open: true,
+                            targetStatus: status.value,
+                          })
+                          return
+                        }
                       }
                       await bulkUpdateSelectedCases(
                         { status: status.value },
@@ -520,7 +1116,7 @@ function CasesSelectionActionsBar() {
                     className="size-3 text-muted-foreground"
                     aria-hidden
                   />
-                  <span>Change priority</span>
+                  <span>Priority</span>
                 </span>
               </DropdownMenuSubTrigger>
               <DropdownMenuSubContent className="w-48">
@@ -557,7 +1153,7 @@ function CasesSelectionActionsBar() {
               <DropdownMenuSubTrigger disabled={!canUpdate}>
                 <span className="flex items-center gap-2">
                   <Flame className="size-3 text-muted-foreground" aria-hidden />
-                  <span>Change severity</span>
+                  <span>Severity</span>
                 </span>
               </DropdownMenuSubTrigger>
               <DropdownMenuSubContent className="w-48">
@@ -590,6 +1186,111 @@ function CasesSelectionActionsBar() {
                 ))}
               </DropdownMenuSubContent>
             </DropdownMenuSub>
+            {caseAddonsEnabled && dropdownDefinitionsIsLoading && (
+              <DropdownMenuItem disabled>
+                <Spinner className="mr-2 size-3" /> Loading dropdowns...
+              </DropdownMenuItem>
+            )}
+            {caseAddonsEnabled &&
+              !dropdownDefinitionsIsLoading &&
+              dropdownDefinitions?.map((definition) => (
+                <DropdownMenuSub key={definition.id}>
+                  <DropdownMenuSubTrigger disabled={!canUpdate}>
+                    <span className="flex min-w-0 items-center gap-2">
+                      <span className="shrink-0">
+                        {definition.icon_name ? (
+                          <DynamicLucideIcon
+                            name={definition.icon_name}
+                            className="size-3 text-muted-foreground"
+                            fallback={
+                              <ListIcon className="size-3 text-muted-foreground" />
+                            }
+                          />
+                        ) : (
+                          <ListIcon className="size-3 text-muted-foreground" />
+                        )}
+                      </span>
+                      <span className="truncate" title={definition.name}>
+                        {definition.name}
+                      </span>
+                    </span>
+                  </DropdownMenuSubTrigger>
+                  <DropdownMenuSubContent className="w-48">
+                    <DropdownMenuItem
+                      disabled={!canUpdate}
+                      className="flex items-center gap-2"
+                      onSelect={async () => {
+                        if (!bulkUpdateSelectedCases) return
+                        await bulkUpdateSelectedCases(
+                          {
+                            dropdown_values: [
+                              {
+                                definition_id: definition.id,
+                                option_id: null,
+                              },
+                            ],
+                          },
+                          {
+                            successTitle: `${definition.name} cleared`,
+                            successDescription: `Applied to ${pluralisedCases}.`,
+                          }
+                        )
+                      }}
+                    >
+                      <span className="text-muted-foreground">None</span>
+                    </DropdownMenuItem>
+                    {definition.options?.map((opt) => {
+                      const optionStyle = opt.color
+                        ? ({ color: opt.color } as React.CSSProperties)
+                        : undefined
+                      return (
+                        <DropdownMenuItem
+                          key={opt.id}
+                          disabled={!canUpdate}
+                          className="flex items-center gap-2"
+                          onSelect={async () => {
+                            if (!bulkUpdateSelectedCases) return
+                            await bulkUpdateSelectedCases(
+                              {
+                                dropdown_values: [
+                                  {
+                                    definition_id: definition.id,
+                                    option_id: opt.id,
+                                  },
+                                ],
+                              },
+                              {
+                                successTitle: `${definition.name} set to ${opt.label}`,
+                                successDescription: `Applied to ${pluralisedCases}.`,
+                              }
+                            )
+                          }}
+                        >
+                          {opt.icon_name ? (
+                            <DynamicLucideIcon
+                              name={opt.icon_name}
+                              className="size-3"
+                              style={optionStyle}
+                              fallback={
+                                <span
+                                  className="size-3 shrink-0 rounded-full bg-muted-foreground/40"
+                                  style={optionStyle}
+                                />
+                              }
+                            />
+                          ) : opt.color ? (
+                            <span
+                              className="size-3 shrink-0 rounded-full"
+                              style={{ backgroundColor: opt.color }}
+                            />
+                          ) : null}
+                          <span style={optionStyle}>{opt.label}</span>
+                        </DropdownMenuItem>
+                      )
+                    })}
+                  </DropdownMenuSubContent>
+                </DropdownMenuSub>
+              ))}
             <DropdownMenuSub>
               <DropdownMenuSubTrigger disabled={!canUpdate}>
                 <span className="flex items-center gap-2">
@@ -632,6 +1333,122 @@ function CasesSelectionActionsBar() {
                   ))}
               </DropdownMenuSubContent>
             </DropdownMenuSub>
+            <DropdownMenuSub>
+              <DropdownMenuSubTrigger disabled={!canApplyTags}>
+                <span className="flex items-center gap-2">
+                  <TagsIcon
+                    className="size-3 text-muted-foreground"
+                    aria-hidden
+                  />
+                  <span>Apply tags</span>
+                </span>
+              </DropdownMenuSubTrigger>
+              <DropdownMenuSubContent className="w-56">
+                {caseTagsIsLoading && (
+                  <DropdownMenuItem disabled>
+                    <Spinner className="mr-2 size-3" /> Loading tags...
+                  </DropdownMenuItem>
+                )}
+                {!caseTagsIsLoading && (!caseTags || caseTags.length === 0) && (
+                  <DropdownMenuItem disabled>
+                    No tags available
+                  </DropdownMenuItem>
+                )}
+                {!caseTagsIsLoading && caseTags && caseTags.length > 0 && (
+                  <>
+                    <div className="max-h-48 overflow-y-auto">
+                      {caseTags.map((tag) => {
+                        const isSelected = selectedTagIds.has(tag.id)
+                        return (
+                          <DropdownMenuItem
+                            key={tag.id}
+                            disabled={isBusy}
+                            className="flex items-center gap-2"
+                            onSelect={(e) => {
+                              e.preventDefault()
+                              handleToggleTagSelection(tag.id)
+                            }}
+                          >
+                            <div
+                              className={cn(
+                                "flex size-4 shrink-0 items-center justify-center rounded-sm border",
+                                isSelected
+                                  ? "border-primary bg-primary text-primary-foreground"
+                                  : "border-muted-foreground/40"
+                              )}
+                            >
+                              {isSelected && (
+                                <Check className="size-3" aria-hidden />
+                              )}
+                            </div>
+                            <div
+                              className="size-2 shrink-0 rounded-full"
+                              style={{
+                                backgroundColor: tag.color || undefined,
+                              }}
+                            />
+                            <span className="truncate">{tag.name}</span>
+                          </DropdownMenuItem>
+                        )
+                      })}
+                    </div>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      disabled={selectedTagIds.size === 0 || isBusy}
+                      className="justify-center font-medium"
+                      onSelect={async (e) => {
+                        e.preventDefault()
+                        await handleApplyTags()
+                      }}
+                    >
+                      {isApplyingTags ? (
+                        <>
+                          <Spinner className="mr-2 size-3" />
+                          Applying...
+                        </>
+                      ) : (
+                        <>
+                          Apply{" "}
+                          {selectedTagIds.size > 0 &&
+                            `(${selectedTagIds.size})`}
+                        </>
+                      )}
+                    </DropdownMenuItem>
+                  </>
+                )}
+              </DropdownMenuSubContent>
+            </DropdownMenuSub>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              disabled={isBusy}
+              onSelect={(event) => {
+                event.preventDefault()
+                setCommentDialogOpen(true)
+              }}
+            >
+              <span className="flex items-center gap-2">
+                <MessageSquare
+                  className="size-3 text-muted-foreground"
+                  aria-hidden
+                />
+                <span>Add comment</span>
+              </span>
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              disabled={isBusy}
+              onSelect={(event) => {
+                event.preventDefault()
+                setAppendDialogOpen(true)
+              }}
+            >
+              <span className="flex items-center gap-2">
+                <FileText
+                  className="size-3 text-muted-foreground"
+                  aria-hidden
+                />
+                <span>Append to description</span>
+              </span>
+            </DropdownMenuItem>
             <DropdownMenuSeparator />
             <DropdownMenuItem
               className="text-destructive focus:text-destructive"
@@ -680,75 +1497,312 @@ function CasesSelectionActionsBar() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+      <Dialog
+        open={commentDialogOpen}
+        onOpenChange={(open) => {
+          setCommentDialogOpen(open)
+          if (!open) setCommentText("")
+        }}
+      >
+        <DialogContent className="max-w-2xl">
+          <DialogHeader className="text-left">
+            <DialogTitle>Add comment</DialogTitle>
+            <DialogDescription>
+              Add a comment to {selectedCount} selected
+              {selectedCount === 1 ? " case" : " cases"}.
+            </DialogDescription>
+          </DialogHeader>
+          <SimpleEditor
+            value={commentText}
+            onChange={setCommentText}
+            placeholder="Enter comment..."
+            className="min-h-[150px]"
+          />
+          <DialogFooter className="flex-row justify-end space-x-2">
+            <Button
+              variant="outline"
+              onClick={() => {
+                setCommentDialogOpen(false)
+                setCommentText("")
+              }}
+            >
+              Cancel
+            </Button>
+            <Button
+              disabled={!commentText.trim() || isAddingComments}
+              onClick={handleBulkAddComment}
+            >
+              {isAddingComments ? (
+                <>
+                  <Spinner className="mr-2 size-3" />
+                  Adding...
+                </>
+              ) : (
+                "Add comment"
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      <Dialog
+        open={appendDialogOpen}
+        onOpenChange={(open) => {
+          setAppendDialogOpen(open)
+          if (!open) setAppendText("")
+        }}
+      >
+        <DialogContent className="max-w-2xl">
+          <DialogHeader className="text-left">
+            <DialogTitle>Append to description</DialogTitle>
+            <DialogDescription>
+              Append text to the description of {selectedCount} selected
+              {selectedCount === 1 ? " case" : " cases"}.
+            </DialogDescription>
+          </DialogHeader>
+          <SimpleEditor
+            value={appendText}
+            onChange={setAppendText}
+            placeholder="Enter text to append..."
+            className="min-h-[150px]"
+          />
+          <DialogFooter className="flex-row justify-end space-x-2">
+            <Button
+              variant="outline"
+              onClick={() => {
+                setAppendDialogOpen(false)
+                setAppendText("")
+              }}
+            >
+              Cancel
+            </Button>
+            <Button
+              disabled={!appendText.trim() || isAppending}
+              onClick={handleBulkAppendDescription}
+            >
+              {isAppending ? (
+                <>
+                  <Spinner className="mr-2 size-3" />
+                  Appending...
+                </>
+              ) : (
+                "Append"
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+      {closureDialog && (
+        <CaseClosureDialog
+          open={closureDialog.open}
+          onOpenChange={(open) => {
+            if (!open) setClosureDialog(null)
+          }}
+          targetStatus={closureDialog.targetStatus as "closed" | "resolved"}
+          requiredFields={
+            caseFieldDefinitions?.filter(
+              (f) => !f.reserved && f.required_on_closure
+            ) ?? []
+          }
+          requiredDropdowns={
+            dropdownDefinitions?.filter((d) => d.required_on_closure) ?? []
+          }
+          isBulk
+          selectedCount={selectedCount}
+          onSubmit={async (data) => {
+            if (!bulkUpdateSelectedCases) return
+            const statusLabel =
+              closureDialog.targetStatus === "closed" ? "Closed" : "Resolved"
+            await bulkUpdateSelectedCases(
+              {
+                status: closureDialog.targetStatus,
+                fields: data.fields,
+                dropdown_values: data.dropdown_values.map((dv) => ({
+                  definition_id: dv.definition_id,
+                  option_id: dv.option_id,
+                })),
+              },
+              {
+                successTitle: `Status set to ${statusLabel}`,
+                successDescription: `Applied to ${pluralisedCases}.`,
+              }
+            )
+          }}
+        />
+      )}
     </>
   )
 }
 
-function MembersActions() {
+function MembersActions({ view }: { view: MembersViewMode }) {
   const { workspace } = useWorkspaceDetails()
+  const workspaceId = useWorkspaceId()
 
   if (!workspace) {
     return null
   }
 
-  return <AddWorkspaceMember workspace={workspace} />
+  // Render the appropriate action button based on the current view
+  const actionButton =
+    view === MembersViewMode.Roles ? (
+      <CreateRoleButton workspaceOnly />
+    ) : view === MembersViewMode.Groups ? (
+      <CreateGroupButton />
+    ) : (
+      <AddWorkspaceMember workspace={workspace} />
+    )
+
+  return (
+    <>
+      <MembersViewToggle
+        view={view}
+        membersHref={`/workspaces/${workspaceId}/members`}
+        rolesHref={`/workspaces/${workspaceId}/members/roles`}
+        groupsHref={`/workspaces/${workspaceId}/members/groups`}
+        rbacScope="workspace:rbac:read"
+      />
+      {actionButton}
+    </>
+  )
 }
 
 function CredentialsActions() {
-  const workspaceId = useWorkspaceId()
-  const pathname = usePathname()
-  const isOnCatalogPage = pathname?.includes("/credentials/catalog")
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const canCreateSecrets = useScopeCheck("secret:create")
 
   return (
-    <div className="flex items-center gap-2">
-      <div className="inline-flex items-center rounded-md border bg-transparent">
-        <Link
-          href={`/workspaces/${workspaceId}/credentials`}
-          className={cn(
-            "flex h-7 items-center gap-1.5 rounded-l-sm px-2.5 text-xs font-medium transition-colors",
-            !isOnCatalogPage
-              ? "bg-background text-accent-foreground"
-              : "bg-accent text-muted-foreground hover:bg-muted/50"
-          )}
-        >
-          <Key className="h-3.5 w-3.5" />
-          Credentials
-        </Link>
-        <Link
-          href={`/workspaces/${workspaceId}/credentials/catalog`}
-          className={cn(
-            "flex h-7 items-center gap-1.5 rounded-r-sm px-2.5 text-xs font-medium transition-colors",
-            isOnCatalogPage
-              ? "bg-background text-accent-foreground"
-              : "bg-accent text-muted-foreground hover:bg-muted/50"
-          )}
-        >
-          <Search className="h-3.5 w-3.5" />
-          Catalog
-        </Link>
-      </div>
-      <NewCredentialsDialog>
-        <NewCredentialsDialogTrigger asChild>
-          <Button variant="outline" size="sm" className="h-7 bg-white">
+    <>
+      <WorkspaceResourceSyncActions
+        label="credential metadata"
+        branchSlug="credentials"
+        resources={["secret_metadata"]}
+      />
+      {canCreateSecrets === true && (
+        <>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 bg-white"
+            onClick={() => setDialogOpen(true)}
+          >
             <Plus className="mr-1 h-3.5 w-3.5" />
             Add credential
           </Button>
-        </NewCredentialsDialogTrigger>
-      </NewCredentialsDialog>
-    </div>
+          <CreateCredentialDialog
+            open={dialogOpen}
+            onOpenChange={setDialogOpen}
+          />
+        </>
+      )}
+    </>
+  )
+}
+
+function ServiceAccountsActions() {
+  const canCreateServiceAccounts = useScopeCheck(
+    "workspace:service_account:create"
+  )
+  const pathname = usePathname()
+  const searchParams = useSearchParams()
+  const router = useRouter()
+
+  if (canCreateServiceAccounts !== true || !pathname) {
+    return null
+  }
+
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      className="h-7 bg-white"
+      onClick={() => {
+        const params = new URLSearchParams(searchParams?.toString())
+        params.set("createServiceAccount", Date.now().toString())
+        router.replace(`${pathname}?${params.toString()}`, {
+          scroll: false,
+        })
+      }}
+    >
+      <Plus className="mr-1 h-3.5 w-3.5" />
+      Create service account
+    </Button>
+  )
+}
+
+function McpServersActions() {
+  const canCreate = useScopeCheck("integration:create")
+  const pathname = usePathname()
+  const searchParams = useSearchParams()
+  const router = useRouter()
+
+  if (canCreate !== true || !pathname) {
+    return null
+  }
+
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      className="h-7 bg-white"
+      onClick={() => {
+        const params = new URLSearchParams(searchParams?.toString())
+        params.set("createMcpServer", Date.now().toString())
+        router.replace(`${pathname}?${params.toString()}`, {
+          scroll: false,
+        })
+      }}
+    >
+      <Plus className="mr-1 h-3.5 w-3.5" />
+      Add MCP server
+    </Button>
+  )
+}
+
+function McpAccessActions() {
+  const canReadWorkspace = useScopeCheck("workspace:read")
+  const pathname = usePathname()
+  const searchParams = useSearchParams()
+  const router = useRouter()
+
+  if (canReadWorkspace !== true || !pathname) {
+    return null
+  }
+
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      className="h-7 bg-white"
+      onClick={() => {
+        const params = new URLSearchParams(searchParams?.toString())
+        params.set("createMcpToken", Date.now().toString())
+        router.replace(`${pathname}?${params.toString()}`, {
+          scroll: false,
+        })
+      }}
+    >
+      <Plus className="mr-1 h-3.5 w-3.5" />
+      Create token
+    </Button>
   )
 }
 
 function VariablesActions() {
   return (
-    <NewVariableDialog>
-      <NewVariableDialogTrigger asChild>
-        <Button variant="outline" size="sm" className="h-7 bg-white">
-          <Plus className="mr-1 h-3.5 w-3.5" />
-          Add variable
-        </Button>
-      </NewVariableDialogTrigger>
-    </NewVariableDialog>
+    <>
+      <WorkspaceResourceSyncActions
+        label="variables"
+        branchSlug="variables"
+        resources={["variable"]}
+      />
+      <NewVariableDialog>
+        <NewVariableDialogTrigger asChild>
+          <Button variant="outline" size="sm" className="h-7 bg-white">
+            <Plus className="mr-1 h-3.5 w-3.5" />
+            Add variable
+          </Button>
+        </NewVariableDialogTrigger>
+      </NewVariableDialog>
+    </>
   )
 }
 
@@ -773,9 +1827,10 @@ function CaseBreadcrumb({
           <span className="text-muted-foreground">/</span>
         </BreadcrumbSeparator>
         <BreadcrumbItem>
-          <BreadcrumbPage className="font-semibold">
-            {caseData?.short_id || caseId}
-          </BreadcrumbPage>
+          <BreadcrumbEntityPage
+            label={caseData?.short_id}
+            skeletonClassName="h-4 w-20"
+          />
         </BreadcrumbItem>
       </BreadcrumbList>
     </Breadcrumb>
@@ -836,25 +1891,31 @@ function CaseStatusControl({
   caseId: string
   workspaceId: string
 }) {
-  const { caseData } = useGetCase({ caseId, workspaceId })
-  const { updateCase } = useUpdateCase({
-    workspaceId,
+  const { hasEntitlement } = useEntitlements()
+  const caseAddonsEnabled = hasEntitlement("case_addons")
+  const { caseDurations, caseDurationsIsLoading } = useCaseDurations({
     caseId,
+    workspaceId,
+    enabled: caseAddonsEnabled,
   })
-
-  if (!caseData) {
-    return null
-  }
-
-  const handleStatusChange = (newStatus: CaseStatus) => {
-    const updatePromise = updateCase({ status: newStatus })
-    updatePromise.catch((error) => {
-      console.error("Failed to update case status", error)
-    })
-  }
+  const { caseDurationDefinitions, caseDurationDefinitionsIsLoading } =
+    useCaseDurationDefinitions(workspaceId, caseAddonsEnabled)
 
   return (
-    <StatusSelect status={caseData.status} onValueChange={handleStatusChange} />
+    <div className="min-w-0">
+      {caseAddonsEnabled ? (
+        <div className="max-w-[min(48vw,36rem)] overflow-x-auto">
+          <CaseDurationMetrics
+            durations={caseDurations}
+            definitions={caseDurationDefinitions}
+            isLoading={
+              caseDurationsIsLoading || caseDurationDefinitionsIsLoading
+            }
+            variant="inline"
+          />
+        </div>
+      ) : null}
+    </div>
   )
 }
 
@@ -879,9 +1940,10 @@ function TableBreadcrumb({
           <span className="text-muted-foreground">/</span>
         </BreadcrumbSeparator>
         <BreadcrumbItem>
-          <BreadcrumbPage className="font-semibold">
-            {table?.name || tableId}
-          </BreadcrumbPage>
+          <BreadcrumbEntityPage
+            label={table?.name}
+            skeletonClassName="h-4 w-28"
+          />
         </BreadcrumbItem>
       </BreadcrumbList>
     </Breadcrumb>
@@ -889,44 +1951,17 @@ function TableBreadcrumb({
 }
 
 function TableDetailsActions() {
-  return <TableInsertButton />
-}
-
-function IntegrationBreadcrumb({
-  providerId,
-  workspaceId,
-  grantType,
-}: {
-  providerId: string
-  workspaceId: string
-  grantType: OAuthGrantType
-}) {
-  const { provider } = useIntegrationProvider({
-    providerId,
-    workspaceId,
-    grantType,
-  })
-
   return (
-    <Breadcrumb>
-      <BreadcrumbList className="relative z-10 flex items-center gap-2 text-sm flex-nowrap overflow-hidden whitespace-nowrap min-w-0 bg-transparent pr-1">
-        <BreadcrumbItem>
-          <BreadcrumbLink asChild className="font-semibold hover:no-underline">
-            <Link href={`/workspaces/${workspaceId}/integrations`}>
-              Integrations
-            </Link>
-          </BreadcrumbLink>
-        </BreadcrumbItem>
-        <BreadcrumbSeparator className="shrink-0">
-          <span className="text-muted-foreground">/</span>
-        </BreadcrumbSeparator>
-        <BreadcrumbItem>
-          <BreadcrumbPage className="font-semibold">
-            {provider?.metadata.name || providerId}
-          </BreadcrumbPage>
-        </BreadcrumbItem>
-      </BreadcrumbList>
-    </Breadcrumb>
+    <>
+      <WorkspaceResourceSyncActions
+        label="tables"
+        branchSlug="tables"
+        resources={["table"]}
+      />
+      <TableSelectionActionsBar />
+      <TableLinkRowsToCaseCommand />
+      <TableInsertButton />
+    </>
   )
 }
 
@@ -951,9 +1986,10 @@ function AgentPresetBreadcrumb({
           <span className="text-muted-foreground">/</span>
         </BreadcrumbSeparator>
         <BreadcrumbItem>
-          <BreadcrumbPage className="font-semibold">
-            {preset?.name || presetId}
-          </BreadcrumbPage>
+          <BreadcrumbEntityPage
+            label={preset?.name}
+            skeletonClassName="h-4 w-32"
+          />
         </BreadcrumbItem>
       </BreadcrumbList>
     </Breadcrumb>
@@ -972,11 +2008,17 @@ function getPageConfig(
 
   // Match routes and return appropriate config
   if (pagePath === "/" || pagePath.startsWith("/workflows")) {
+    const workflowView =
+      searchParams?.get("view") === "list" ? "list" : "folders"
     return {
       title: (
         <WorkflowsBreadcrumb
           workspaceId={workspaceId}
-          path={searchParams?.get("path") ?? "/"}
+          path={
+            workflowView === "folders"
+              ? (searchParams?.get("path") ?? "/")
+              : "/"
+          }
         />
       ),
       actions: <WorkflowsActions />,
@@ -989,18 +2031,25 @@ function getPageConfig(
     }
   }
 
+  if (pagePath.startsWith("/runs")) {
+    return {
+      title: "Runs",
+    }
+  }
+
   if (pagePath.startsWith("/agents")) {
-    // Check if this is an agent preset detail page
+    // Tags page
+    if (pagePath === "/agents/tags") {
+      return {
+        title: "Agents",
+        actions: <AgentsActions />,
+      }
+    }
+
+    // Agent preset detail page
     const agentPresetMatch = pagePath.match(/^\/agents\/([^/]+)$/)
     if (agentPresetMatch) {
       const presetId = agentPresetMatch[1]
-      // Don't show breadcrumb for "new" preset - it's the create page
-      if (presetId === "new") {
-        return {
-          title: "Agents",
-          actions: <AgentsActions />,
-        }
-      }
       return {
         title: (
           <AgentPresetBreadcrumb
@@ -1008,11 +2057,26 @@ function getPageConfig(
             workspaceId={workspaceId}
           />
         ),
+        actions: (
+          <WorkspaceResourceSyncActions
+            label="agents"
+            branchSlug="agents"
+            resources={["agent_preset"]}
+          />
+        ),
       }
     }
 
+    const agentsView = searchParams?.get("view") === "list" ? "list" : "folders"
     return {
-      title: "Agents",
+      title: (
+        <AgentFoldersBreadcrumb
+          workspaceId={workspaceId}
+          path={
+            agentsView === "folders" ? (searchParams?.get("path") ?? "/") : "/"
+          }
+        />
+      ),
       actions: <AgentsActions />,
     }
   }
@@ -1020,7 +2084,10 @@ function getPageConfig(
   if (pagePath.startsWith("/cases")) {
     if (
       pagePath === "/cases/custom-fields" ||
-      pagePath === "/cases/durations"
+      pagePath === "/cases/dropdowns" ||
+      pagePath === "/cases/closure-requirements" ||
+      pagePath === "/cases/durations" ||
+      pagePath === "/cases/tags"
     ) {
       return {
         title: "Cases",
@@ -1062,27 +2129,41 @@ function getPageConfig(
   }
 
   if (pagePath.startsWith("/integrations")) {
-    // Check if this is an integration detail page
-    const integrationMatch = pagePath.match(/^\/integrations\/([^/]+)$/)
-    if (integrationMatch && searchParams) {
-      const providerId = integrationMatch[1]
-      const grantType = searchParams.get("grant_type") as OAuthGrantType
-      if (grantType) {
-        return {
-          title: (
-            <IntegrationBreadcrumb
-              providerId={providerId}
-              workspaceId={workspaceId}
-              grantType={grantType}
-            />
-          ),
-        }
-      }
-    }
-
     return {
       title: "Integrations",
       actions: <IntegrationsActions />,
+    }
+  }
+
+  if (pagePath.startsWith("/actions")) {
+    return {
+      title: "Actions",
+      actions: <RegistryActionsControls />,
+    }
+  }
+
+  if (pagePath.startsWith("/skills")) {
+    const skillMatch = pagePath.match(/^\/skills\/([^/]+)$/)
+    if (skillMatch) {
+      return {
+        title: (
+          <SkillsBreadcrumb workspaceId={workspaceId} skillId={skillMatch[1]} />
+        ),
+        actions: (
+          <>
+            <WorkspaceResourceSyncActions
+              label="skills"
+              branchSlug="skills"
+              resources={["skill"]}
+            />
+            <SkillsDetailActions />
+          </>
+        ),
+      }
+    }
+    return {
+      title: "Skills",
+      actions: <SkillsActions />,
     }
   }
 
@@ -1093,6 +2174,27 @@ function getPageConfig(
     }
   }
 
+  if (pagePath.startsWith("/mcp-servers")) {
+    return {
+      title: "MCP servers",
+      actions: <McpServersActions />,
+    }
+  }
+
+  if (pagePath.startsWith("/service-accounts")) {
+    return {
+      title: "Service accounts",
+      actions: <ServiceAccountsActions />,
+    }
+  }
+
+  if (pagePath.startsWith("/mcp")) {
+    return {
+      title: "MCP access",
+      actions: <McpAccessActions />,
+    }
+  }
+
   if (pagePath.startsWith("/variables")) {
     return {
       title: "Variables",
@@ -1100,26 +2202,44 @@ function getPageConfig(
     }
   }
 
-  if (pagePath.startsWith("/members")) {
+  if (pagePath === "/members") {
     return {
       title: "Members",
-      actions: <MembersActions />,
+      actions: <MembersActions view={MembersViewMode.Members} />,
+    }
+  }
+
+  if (pagePath === "/members/roles") {
+    return {
+      title: "Roles",
+      actions: <MembersActions view={MembersViewMode.Roles} />,
+    }
+  }
+
+  if (pagePath === "/members/groups") {
+    return {
+      title: "Groups",
+      actions: <MembersActions view={MembersViewMode.Groups} />,
+    }
+  }
+
+  if (pagePath.startsWith("/inbox")) {
+    return {
+      title: "Inbox",
     }
   }
 
   return null
 }
 
-export function ControlsHeader({
-  isChatOpen,
-  onToggleChat,
-}: ControlsHeaderProps = {}) {
+export function ControlsHeader({ onToggleChat }: ControlsHeaderProps = {}) {
   const pathname = usePathname()
   const searchParams = useSearchParams()
   const workspaceId = useWorkspaceId()
   const pagePath = pathname
     ? pathname.replace(`/workspaces/${workspaceId}`, "") || "/"
     : "/"
+  const isCasesListPage = pagePath === "/cases"
   const isCaseDetail = pagePath.match(
     /^\/cases\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i
   )
@@ -1133,16 +2253,74 @@ export function ControlsHeader({
     { enabled: Boolean(caseId) }
   )
 
+  useEffect(() => {
+    if (!onToggleChat) {
+      return
+    }
+    const DOUBLE_TAP_WINDOW_MS = 1200
+    let pendingAt: number | null = null
+
+    const isEditableTarget = (target: EventTarget | null) => {
+      if (!(target instanceof HTMLElement)) {
+        return false
+      }
+      const tagName = target.tagName
+      return (
+        target.isContentEditable ||
+        tagName === "INPUT" ||
+        tagName === "TEXTAREA" ||
+        tagName === "SELECT" ||
+        target.getAttribute("role") === "textbox"
+      )
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.repeat ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.altKey ||
+        event.shiftKey
+      ) {
+        pendingAt = null
+        return
+      }
+      if (event.key.toLowerCase() !== CHAT_TOGGLE_KEY) {
+        pendingAt = null
+        return
+      }
+      if (isEditableTarget(event.target)) {
+        pendingAt = null
+        return
+      }
+
+      const now = Date.now()
+      if (pendingAt === null || now - pendingAt > DOUBLE_TAP_WINDOW_MS) {
+        pendingAt = now
+        return
+      }
+
+      pendingAt = null
+      event.preventDefault()
+      onToggleChat()
+    }
+
+    window.addEventListener("keydown", handleKeyDown)
+    return () => window.removeEventListener("keydown", handleKeyDown)
+  }, [onToggleChat])
+
   if (!pageConfig) {
     return null
   }
 
   // Check if this is a case detail page to show timestamp
+  // Only apply background for case detail pages with status tints.
+  // Non-case pages should be transparent to avoid painting over SidebarInset's rounded corners.
   const headerBackgroundClass = caseId
     ? caseData?.status
       ? CASE_STATUS_TINTS[caseData.status]
       : "bg-muted/5 dark:bg-muted/[0.12]"
-    : "bg-background"
+    : ""
 
   const titleContent =
     typeof pageConfig.title === "string" ? (
@@ -1177,7 +2355,7 @@ export function ControlsHeader({
 
       {/* Middle section: bulk selection actions */}
       <div className="flex flex-1 justify-center min-w-[1rem]">
-        <CasesSelectionActionsBar />
+        {isCasesListPage && <CasesSelectionActionsBar enabled />}
       </div>
 
       {/* Right section: actions / timestamp / chat toggle */}
@@ -1189,15 +2367,35 @@ export function ControlsHeader({
             )}
 
         {onToggleChat && (
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-7 w-7"
-            onClick={onToggleChat}
-          >
-            <PanelRight className="h-4 w-4 text-muted-foreground" />
-            <span className="sr-only">Toggle Chat</span>
-          </Button>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7"
+                onClick={onToggleChat}
+              >
+                <PanelRight className="h-4 w-4 text-muted-foreground" />
+                <span className="sr-only">Toggle Chat</span>
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent
+              side="bottom"
+              align="end"
+              alignOffset={-10}
+              collisionPadding={16}
+              className="border-0 bg-transparent p-0 shadow-none"
+              sideOffset={8}
+            >
+              <span className="inline-flex items-center gap-1">
+                <Kbd>C</Kbd>
+                <span className="inline-flex h-5 items-center rounded border bg-muted px-1.5 text-[10px] font-medium text-muted-foreground">
+                  then
+                </span>
+                <Kbd>C</Kbd>
+              </span>
+            </TooltipContent>
+          </Tooltip>
         )}
       </div>
     </header>

@@ -1,18 +1,28 @@
 """LLM HTTP bridge for sandboxed agent runtime.
 
 This module provides a pure Python HTTP bridge that runs inside the NSJail sandbox.
-It binds to localhost:4000 and forwards all HTTP traffic to a Unix socket,
-enabling the Claude SDK to communicate with LiteLLM without network access.
+It binds to localhost and forwards all HTTP traffic to a Unix socket,
+enabling the Claude SDK to communicate with the LLM gateway without network access.
 
 The bridge handles:
 - HTTP/1.1 request parsing and forwarding
 - Streaming responses (SSE for LLM completions)
 - Connection keepalive
 
+Port allocation:
+- NSJail mode: Uses fixed port 4000 (isolated by network namespace)
+- Direct mode: Uses port=0 for OS-assigned dynamic port (avoids clashes
+  between concurrent agent runs sharing the host network namespace)
+
 Usage:
-    bridge = LLMBridge()
+    # NSJail mode (fixed port)
+    bridge = LLMBridge(port=4000)
     await bridge.start()
-    # Claude SDK can now connect to http://127.0.0.1:4000
+
+    # Direct mode (dynamic port)
+    bridge = LLMBridge(port=0)
+    port = await bridge.start()  # Returns actual port
+    # Claude SDK connects to http://127.0.0.1:{port}
 """
 
 from __future__ import annotations
@@ -22,48 +32,77 @@ from pathlib import Path
 
 import orjson
 
+from tracecat.agent.common.config import JAILED_LLM_SOCKET_PATH
 from tracecat.logger import logger
 
-# Well-known socket path inside the sandbox
-JAILED_LLM_SOCKET_PATH = Path("/var/run/tracecat/llm.sock")
-
 # Bridge listens on this address inside the sandbox
-# Use port 4100 to avoid conflict with LiteLLM proxy (typically on 4000)
 LLM_BRIDGE_HOST = "127.0.0.1"
-LLM_BRIDGE_PORT = 4100
+# Default port for NSJail mode - port 4000 matches the gateway port
+# In direct mode, use port=0 for OS-assigned dynamic port
+LLM_BRIDGE_DEFAULT_PORT = 4000
 
 # Maximum request body size (10 MB) - prevents memory exhaustion
 MAX_BODY_SIZE = 10 * 1024 * 1024
 
 
 class LLMBridge:
-    """HTTP bridge that forwards localhost:4000 to Unix socket.
+    """HTTP bridge that forwards localhost to Unix socket.
 
     Runs inside the NSJail sandbox to enable HTTP communication with
-    the LiteLLM proxy on the host via a mounted Unix socket.
+    the LLM gateway on the host via a mounted Unix socket.
+
+    Supports dynamic port allocation for direct mode to avoid port
+    clashes between concurrent agent runs.
     """
 
-    def __init__(self, socket_path: Path = JAILED_LLM_SOCKET_PATH):
+    def __init__(
+        self,
+        socket_path: Path = JAILED_LLM_SOCKET_PATH,
+        port: int = LLM_BRIDGE_DEFAULT_PORT,
+    ):
         """Initialize the LLM bridge.
 
         Args:
             socket_path: Path to the Unix socket for LLM proxy communication.
+            port: Port to listen on. Use 0 for OS-assigned dynamic port
+                (recommended for direct mode to avoid clashes).
         """
         self.socket_path = socket_path
+        self._requested_port = port
+        self._actual_port: int | None = None
         self._server: asyncio.Server | None = None
         self._serve_task: asyncio.Task[None] | None = None
 
-    async def start(self) -> None:
-        """Start the HTTP bridge server on localhost:4000.
+    @property
+    def port(self) -> int:
+        """Get the actual port the bridge is listening on.
+
+        Returns the OS-assigned port if started with port=0,
+        otherwise returns the requested port.
+        """
+        return (
+            self._actual_port if self._actual_port is not None else self._requested_port
+        )
+
+    async def start(self) -> int:
+        """Start the HTTP bridge server.
 
         The server runs in the background and handles connections
         until stop() is called.
+
+        Returns:
+            The actual port the bridge is listening on (useful when
+            started with port=0 for dynamic allocation).
         """
         self._server = await asyncio.start_server(
             self._handle_connection,
             host=LLM_BRIDGE_HOST,
-            port=LLM_BRIDGE_PORT,
+            port=self._requested_port,
         )
+        # Get the actual port from the server socket (important for port=0)
+        actual_port = self._server.sockets[0].getsockname()[1]
+        self._actual_port = actual_port
+
         # Start serving in the background with error handling
         # Store task as instance attribute to prevent garbage collection
         self._serve_task = asyncio.create_task(self._server.serve_forever())
@@ -71,9 +110,11 @@ class LLMBridge:
         logger.info(
             "LLM bridge started",
             host=LLM_BRIDGE_HOST,
-            port=LLM_BRIDGE_PORT,
+            requested_port=self._requested_port,
+            actual_port=actual_port,
             socket_path=str(self.socket_path),
         )
+        return actual_port
 
     def _on_serve_done(self, task: asyncio.Task[None]) -> None:
         """Callback to log errors from serve_forever task."""
@@ -156,7 +197,7 @@ class LLMBridge:
         """Read a complete HTTP request including headers and body.
 
         Handles Content-Length for request bodies (used in POST requests
-        to LiteLLM for chat completions).
+        to the LLM gateway for chat completions).
 
         Returns:
             Complete HTTP request as bytes, or None if connection closed.

@@ -11,7 +11,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from tracecat_registry import RegistryOAuthSecret, registry
 from typing_extensions import Doc
 
-import tracecat.config as config
 from tracecat.db.models import RegistryRepository, RegistryVersion
 from tracecat.dsl.common import (
     DSLEntrypoint,
@@ -23,13 +22,12 @@ from tracecat.exceptions import (
     ExecutionError,
     RegistryValidationError,
 )
-from tracecat.executor.backends.direct import DirectBackend
+from tracecat.executor.backends.test import TestBackend
 from tracecat.executor.service import dispatch_action
 from tracecat.expressions.expectations import ExpectedField
 
 # Add imports for expression validation
 from tracecat.expressions.validation import TemplateValidator
-from tracecat.feature_flags.enums import FeatureFlag
 from tracecat.identifiers.workflow import WorkflowUUID
 from tracecat.integrations.enums import OAuthGrantType
 from tracecat.integrations.schemas import ProviderKey
@@ -49,6 +47,7 @@ from tracecat.registry.lock.types import RegistryLock
 from tracecat.registry.repository import Repository
 from tracecat.registry.versions.schemas import RegistryVersionManifestAction
 from tracecat.registry.versions.service import RegistryVersionsService
+from tracecat.tiers import defaults as tier_defaults
 from tracecat.validation.schemas import ActionValidationResult, ValidationResultType
 from tracecat.validation.service import validate_dsl
 
@@ -59,8 +58,11 @@ async def create_manifest_for_actions(
     session: AsyncSession,
     repo_id: UUID,
     actions: list[BoundRegistryAction],
+    organization_id: UUID | None,
 ) -> RegistryLock:
     """Create a RegistryVersion with manifest for the given actions."""
+    assert organization_id is not None, "organization_id must be provided"
+
     result = await session.execute(
         select(RegistryRepository).where(RegistryRepository.id == repo_id)
     )
@@ -99,7 +101,7 @@ async def create_manifest_for_actions(
     manifest = {"schema_version": "1.0", "actions": manifest_actions}
 
     rv = RegistryVersion(
-        organization_id=config.TRACECAT__DEFAULT_ORG_ID,
+        organization_id=organization_id,
         repository_id=repo_id,
         version=TEST_VERSION,
         manifest=manifest,
@@ -129,9 +131,12 @@ async def run_action_test(input: RunActionInput, role) -> Any:
     """Test helper: execute action using production code path."""
     from tracecat.contexts import ctx_role
 
-    ctx_role.set(role)
-    backend = DirectBackend()
-    return await dispatch_action(backend, input)
+    token = ctx_role.set(role)
+    try:
+        backend = TestBackend()
+        return await dispatch_action(backend, input)
+    finally:
+        ctx_role.reset(token)
 
 
 @pytest.fixture
@@ -650,7 +655,6 @@ async def test_template_action_with_optional_oauth_both_ac_and_cc(
     # Test OAuth token values
     ac_token_value = "__TEST_AC_TOKEN__"
     cc_token_value = "__TEST_CC_TOKEN__"
-
     # Create a test template action with both AC and CC OAuth secrets as optional
     test_action = TemplateAction(
         type="action",
@@ -764,7 +768,10 @@ async def test_template_action_with_optional_oauth_both_ac_and_cc(
 
     # Create manifest for both test actions
     registry_lock = await create_manifest_for_actions(
-        session, db_repo_id, [bound_action, bound_action_required]
+        session,
+        db_repo_id,
+        [bound_action, bound_action_required],
+        test_role.organization_id,
     )
 
     # Helper function to run the optional action
@@ -869,7 +876,6 @@ async def test_validate_dsl_with_optional_oauth_credentials(
     """
 
     session, db_repo_id = db_session_with_repo
-
     # Create a template action with optional OAuth credentials (both AC and CC)
     test_action = TemplateAction(
         type="action",
@@ -942,7 +948,7 @@ async def test_validate_dsl_with_optional_oauth_credentials(
 
     # Validate the DSL - this should NOT fail for optional OAuth credentials
     # BUG: Currently this will fail because validate_workspace_integration doesn't check optional field
-    validation_results = await validate_dsl(session, dsl)
+    validation_results = await validate_dsl(session, dsl, role=test_role)
 
     # Filter for secret validation errors
     secret_errors = [
@@ -959,13 +965,17 @@ async def test_validate_dsl_with_optional_oauth_credentials(
 
 @pytest.mark.integration
 @pytest.mark.anyio
-async def test_agent_tool_approvals_requires_feature_flag(
+async def test_agent_tool_approvals_requires_entitlement(
     test_role, db_session_with_repo, monkeypatch
 ):
     session, db_repo_id = db_session_with_repo
 
-    # Ensure feature flag disabled
-    monkeypatch.setattr(config, "TRACECAT__FEATURE_FLAGS", set())
+    # Ensure entitlement disabled
+    monkeypatch.setattr(
+        tier_defaults,
+        "DEFAULT_ENTITLEMENTS",
+        tier_defaults.DEFAULT_ENTITLEMENTS.model_copy(update={"agent_addons": False}),
+    )
 
     repo = Repository()
     repo.init(include_base=True, include_templates=False)
@@ -980,7 +990,9 @@ async def test_agent_tool_approvals_requires_feature_flag(
         await ra_service.create_action(action_create)
 
     # Create manifest for the ai.agent action using the helper
-    await create_manifest_for_actions(session, db_repo_id, [bound_action])
+    await create_manifest_for_actions(
+        session, db_repo_id, [bound_action], test_role.organization_id
+    )
 
     dsl = DSLInput(
         title="Test Workflow",
@@ -992,8 +1004,10 @@ async def test_agent_tool_approvals_requires_feature_flag(
                 action="ai.agent",
                 args={
                     "user_prompt": "Hello",
-                    "model_name": "gpt-4o-mini",
-                    "model_provider": "openai",
+                    "model": {
+                        "model_name": "gpt-4o-mini",
+                        "model_provider": "openai",
+                    },
                     "actions": ["tools.slack.post_message"],
                     "tool_approvals": {"tools.slack.post_message": True},
                 },
@@ -1001,7 +1015,7 @@ async def test_agent_tool_approvals_requires_feature_flag(
         ],
     )
 
-    validation_results = await validate_dsl(session, dsl)
+    validation_results = await validate_dsl(session, dsl, role=test_role)
     action_errors = [
         r for r in validation_results if r.root.type == ValidationResultType.ACTION
     ]
@@ -1014,20 +1028,20 @@ async def test_agent_tool_approvals_requires_feature_flag(
         detail_msgs: set[str] = set()
     else:
         detail_msgs = {d.msg for d in detail}
-    assert any("agent-approvals" in msg for msg in detail_msgs)
+    assert any("agent_addons" in msg for msg in detail_msgs)
 
 
 @pytest.mark.integration
 @pytest.mark.anyio
-async def test_agent_tool_approvals_passes_with_feature_flag(
+async def test_agent_tool_approvals_passes_with_entitlement(
     test_role, db_session_with_repo, monkeypatch
 ):
     session, db_repo_id = db_session_with_repo
 
     monkeypatch.setattr(
-        config,
-        "TRACECAT__FEATURE_FLAGS",
-        {FeatureFlag.AGENT_APPROVALS},
+        tier_defaults,
+        "DEFAULT_ENTITLEMENTS",
+        tier_defaults.DEFAULT_ENTITLEMENTS.model_copy(update={"agent_addons": True}),
     )
 
     repo = Repository()
@@ -1043,7 +1057,9 @@ async def test_agent_tool_approvals_passes_with_feature_flag(
         await ra_service.create_action(action_create)
 
     # Create manifest for the ai.agent action using the helper
-    await create_manifest_for_actions(session, db_repo_id, [bound_action])
+    await create_manifest_for_actions(
+        session, db_repo_id, [bound_action], test_role.organization_id
+    )
 
     dsl = DSLInput(
         title="Test Workflow",
@@ -1055,8 +1071,10 @@ async def test_agent_tool_approvals_passes_with_feature_flag(
                 action="ai.agent",
                 args={
                     "user_prompt": "Hello",
-                    "model_name": "gpt-4o-mini",
-                    "model_provider": "openai",
+                    "model": {
+                        "model_name": "gpt-4o-mini",
+                        "model_provider": "openai",
+                    },
                     "actions": ["tools.slack.post_message"],
                     "tool_approvals": {"tools.slack.post_message": True},
                 },
@@ -1064,7 +1082,7 @@ async def test_agent_tool_approvals_passes_with_feature_flag(
         ],
     )
 
-    validation_results = await validate_dsl(session, dsl)
+    validation_results = await validate_dsl(session, dsl, role=test_role)
     action_errors = [
         r for r in validation_results if r.root.type == ValidationResultType.ACTION
     ]

@@ -5,9 +5,17 @@ import { MessageSquare } from "lucide-react"
 import { motion } from "motion/react"
 import Image from "next/image"
 import TracecatIcon from "public/icon.png"
-import { useEffect, useRef } from "react"
-import { Streamdown } from "streamdown"
+import { type ComponentProps, useEffect, useRef } from "react"
+import type { Streamdown } from "streamdown"
+import { MarkdownWithFrontmatter } from "@/components/ai-elements/markdown-with-frontmatter"
 import { Dots } from "@/components/loading/dots"
+import { invalidateCaseActivityQueries } from "@/lib/cases/invalidation"
+import {
+  ALLOWED_MARKDOWN_IMAGE_PREFIXES,
+  ALLOWED_MARKDOWN_LINK_PREFIXES,
+  DEFAULT_MARKDOWN_ORIGIN,
+  getStreamdownRehypePlugins,
+} from "@/lib/sanitize-markdown"
 
 /**
  * Model message part types for the legacy chat messages component.
@@ -87,6 +95,10 @@ const caseUpdateActions = [
 
 const assistantMarkdownStyle =
   "text-sm max-w-full text-foreground dark:prose-invert"
+
+const chatMessageRehypePlugins = getStreamdownRehypePlugins() as NonNullable<
+  ComponentProps<typeof Streamdown>["rehypePlugins"]
+>
 
 export function Messages({
   messages,
@@ -172,11 +184,8 @@ export function Messages({
     ) {
       console.log("Invalidating case queries")
       // Force-refetch the case & related queries so the UI updates instantly
-      queryClient.invalidateQueries({ queryKey: ["case", entityId] })
       queryClient.invalidateQueries({ queryKey: ["cases", workspaceId] })
-      queryClient.invalidateQueries({
-        queryKey: ["case-events", entityId, workspaceId],
-      })
+      invalidateCaseActivityQueries(queryClient, entityId, workspaceId)
       queryClient.invalidateQueries({
         queryKey: ["case-comments", entityId, workspaceId],
       })
@@ -200,12 +209,17 @@ export function Messages({
           transition={{ duration: 0.3, ease: "easeInOut" }}
         >
           <Image src={TracecatIcon} alt="Tracecat" className="size-4 mt-1" />
-          <Streamdown
+          <MarkdownWithFrontmatter
+            allowedImagePrefixes={ALLOWED_MARKDOWN_IMAGE_PREFIXES}
+            allowedLinkPrefixes={ALLOWED_MARKDOWN_LINK_PREFIXES}
+            defaultOrigin={DEFAULT_MARKDOWN_ORIGIN}
+            rehypePlugins={chatMessageRehypePlugins}
             className={`${assistantMarkdownStyle} flex-1`}
+            enableFrontmatter={false}
             parseIncompleteMarkdown
           >
             {streamingText}
-          </Streamdown>
+          </MarkdownWithFrontmatter>
         </motion.div>
       )}
       {isResponding && !streamingText && (
@@ -263,9 +277,16 @@ function AgentChatMessage({ message }: { message: ModelResponse }) {
       <Image src={TracecatIcon} alt="Tracecat" className="size-4 mt-1" />
       <div className="flex flex-1 flex-col gap-3 text-sm text-foreground">
         {textContent && (
-          <Streamdown className={assistantMarkdownStyle}>
+          <MarkdownWithFrontmatter
+            allowedImagePrefixes={ALLOWED_MARKDOWN_IMAGE_PREFIXES}
+            allowedLinkPrefixes={ALLOWED_MARKDOWN_LINK_PREFIXES}
+            defaultOrigin={DEFAULT_MARKDOWN_ORIGIN}
+            rehypePlugins={chatMessageRehypePlugins}
+            className={assistantMarkdownStyle}
+            enableFrontmatter={false}
+          >
             {textContent}
-          </Streamdown>
+          </MarkdownWithFrontmatter>
         )}
 
         {toolCalls.map((part, index) => (

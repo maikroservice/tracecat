@@ -1,4 +1,6 @@
 import {
+  applyEdgeChanges,
+  applyNodeChanges,
   Background,
   type Connection,
   ConnectionLineType,
@@ -12,16 +14,14 @@ import {
   type NodeRemoveChange,
   type OnConnectStartParams,
   Panel,
-  Position,
   ReactFlow,
   type ReactFlowInstance,
-  useEdgesState,
-  useNodesState,
   useReactFlow,
   type Viewport,
   type XYPosition,
 } from "@xyflow/react"
 import React, {
+  type SetStateAction,
   useCallback,
   useEffect,
   useImperativeHandle,
@@ -32,13 +32,17 @@ import { v4 as uuid4 } from "uuid"
 
 import "@xyflow/react/dist/style.css"
 
-import Dagre from "@dagrejs/dagre"
 import { MoveHorizontalIcon, MoveVerticalIcon, PlusIcon } from "lucide-react"
-import type { GraphOperation, GraphResponse } from "@/client"
+import type {
+  GraphOperation,
+  GraphResponse,
+  RegistryActionReadMinimal,
+} from "@/client"
 import actionNode, {
   type ActionNodeData,
   type ActionNodeType,
 } from "@/components/builder/canvas/action-node"
+import { CanvasToolbar } from "@/components/builder/canvas/canvas-toolbar"
 import { DeleteActionNodeDialog } from "@/components/builder/canvas/delete-node-dialog"
 import selectorNode, {
   type SelectorNodeData,
@@ -55,9 +59,14 @@ import { Button } from "@/components/ui/button"
 import { useToast } from "@/components/ui/use-toast"
 import { useGraph, useGraphOperations } from "@/lib/hooks"
 import { pruneGraphObject } from "@/lib/workflow"
+import { useWorkflowBuilder } from "@/providers/builder"
 import { useWorkflow } from "@/providers/workflow"
+import {
+  getLayoutedElements,
+  mergeHydratedEdges,
+  mergeHydratedNodes,
+} from "./graph-layout"
 
-const dagreGraph = new Dagre.graphlib.Graph().setDefaultEdgeLabel(() => ({}))
 const defaultNodeWidth = 172
 const defaultNodeHeight = 36
 
@@ -66,60 +75,14 @@ const fitViewOptions: FitViewOptions = {
   maxZoom: 1,
 }
 
-const getId = () => uuid4()
-
-/**
- * Taken from https://reactflow.dev/examples/layout/dagre
- * @param nodes
- * @param edges
- * @param direction
- * @returns
- */
-function getLayoutedElements(
-  nodes: Node[],
-  edges: Edge[],
-  direction = "TB"
-): {
-  nodes: Node[]
-  edges: Edge[]
-} {
-  const isHorizontal = direction === "LR"
-  dagreGraph.setGraph({ rankdir: direction, nodesep: 250, ranksep: 300 })
-
-  nodes.forEach((node) => {
-    dagreGraph.setNode(node.id, {
-      width: node.width ?? defaultNodeWidth,
-      height: node.height ?? defaultNodeHeight,
-    })
-  })
-
-  edges.forEach((edge) => {
-    dagreGraph.setEdge(edge.source, edge.target)
-  })
-
-  Dagre.layout(dagreGraph)
-
-  const newNodes = nodes.map((node) => {
-    const nodeWithPosition = dagreGraph.node(node.id)
-    const height = node.height ?? defaultNodeHeight
-    const width = node.width ?? defaultNodeWidth
-    const newNode = {
-      ...node,
-      targetPosition: isHorizontal ? Position.Left : Position.Top,
-      sourcePosition: isHorizontal ? Position.Right : Position.Bottom,
-      // We are shifting the dagre node position (anchor=center center) to the top left
-      // so it matches the React Flow node anchor point (top left).
-      position: {
-        x: nodeWithPosition.x - width / 2,
-        y: nodeWithPosition.y - height / 2,
-      },
-    }
-
-    return newNode
-  })
-
-  return { nodes: newNodes, edges }
+// Embedded surfaces (e.g. the workflow artifact panel) start further out so a
+// small graph (or a lone trigger) doesn't fill the panel.
+const embeddedFitViewOptions: FitViewOptions = {
+  minZoom: 0.25,
+  maxZoom: 0.6,
 }
+
+const getId = () => uuid4()
 
 export type NodeTypename = "udf" | "trigger" | "selector"
 export type NodeType = ActionNodeType | TriggerNodeType | SelectorNodeType
@@ -145,6 +108,37 @@ const defaultEdgeOptions = {
   },
 }
 
+type CanvasGraphState = {
+  nodes: Node[]
+  edges: Edge[]
+}
+
+function resolveStateAction<T>(value: SetStateAction<T>, current: T): T {
+  return typeof value === "function"
+    ? (value as (current: T) => T)(current)
+    : value
+}
+
+function removeEphemeralGraphElements({
+  nodes,
+  edges,
+}: CanvasGraphState): CanvasGraphState {
+  const ephemeralNodeIds = new Set(
+    nodes.filter((node) => isEphemeral(node)).map((node) => node.id)
+  )
+  if (ephemeralNodeIds.size === 0) {
+    return { nodes, edges }
+  }
+
+  return {
+    nodes: nodes.filter((node) => !isEphemeral(node)),
+    edges: edges.filter(
+      (edge) =>
+        !ephemeralNodeIds.has(edge.source) && !ephemeralNodeIds.has(edge.target)
+    ),
+  }
+}
+
 export function isInvincible(node: Node | Node<NodeData>): boolean {
   return invincibleNodeTypes.includes(node?.type as string)
 }
@@ -158,24 +152,33 @@ export interface WorkflowCanvasRef {
 
 export const WorkflowCanvas = React.forwardRef<
   WorkflowCanvasRef,
-  React.ComponentPropsWithoutRef<typeof ReactFlow>
->((props, ref) => {
+  React.ComponentPropsWithoutRef<typeof ReactFlow> & { embedded?: boolean }
+>(({ embedded = false }, ref) => {
+  const activeFitViewOptions = embedded
+    ? embeddedFitViewOptions
+    : fitViewOptions
   const containerRef = useRef<HTMLDivElement>(null)
   const connectingNodeId = useRef<string | null>(null)
   const connectingHandleId = useRef<string | null>(null)
-  const [nodes, setNodes, onNodesChange] = useNodesState<Node>([])
-  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
+  const [{ nodes, edges }, setCanvasGraph] = useState<CanvasGraphState>({
+    nodes: [],
+    edges: [],
+  })
   const [reactFlowInstance, setReactFlowInstance] =
     useState<ReactFlowInstance | null>(null)
   const { setViewport, getNode, screenToFlowPosition } = useReactFlow()
   const { toast } = useToast()
   const { workspaceId, workflowId } = useWorkflow()
+  const { selectedNodeId, setSelectedNodeId } = useWorkflowBuilder()
   const { data: graphData } = useGraph(workspaceId, workflowId ?? "")
   const { applyGraphOperations, refetchGraph } = useGraphOperations(
     workspaceId,
     workflowId ?? ""
   )
   const [graphVersion, setGraphVersion] = useState<number>(1)
+  const [hydratedWorkflowId, setHydratedWorkflowId] = useState<string | null>(
+    null
+  )
   const [silhouettePosition, setSilhouettePosition] =
     useState<XYPosition | null>(null)
   const [isConnecting, setIsConnecting] = useState(false)
@@ -184,6 +187,34 @@ export const WorkflowCanvas = React.forwardRef<
   >([])
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   const openContextMenuId = useRef<string | null>(null)
+
+  const setNodes = useCallback((value: SetStateAction<Node[]>) => {
+    setCanvasGraph((current) => ({
+      ...current,
+      nodes: resolveStateAction(value, current.nodes),
+    }))
+  }, [])
+
+  const setEdges = useCallback((value: SetStateAction<Edge[]>) => {
+    setCanvasGraph((current) => ({
+      ...current,
+      edges: resolveStateAction(value, current.edges),
+    }))
+  }, [])
+
+  const onNodesChange = useCallback(
+    (changes: NodeChange[]) => {
+      setNodes((currentNodes) => applyNodeChanges(changes, currentNodes))
+    },
+    [setNodes]
+  )
+
+  const onEdgesChange = useCallback(
+    (changes: EdgeChange[]) => {
+      setEdges((currentEdges) => applyEdgeChanges(changes, currentEdges))
+    },
+    [setEdges]
+  )
 
   /**
    * Convert graph response to React Flow nodes and edges.
@@ -229,6 +260,29 @@ export const WorkflowCanvas = React.forwardRef<
     []
   )
 
+  const hydrateCanvasFromGraph = useCallback(
+    (graphNodes: Node[], graphEdges: Edge[]) => {
+      setCanvasGraph((current) => {
+        const nextNodes = mergeHydratedNodes(current.nodes, graphNodes, {
+          preserveEphemeral: true,
+          isEphemeralNode: isEphemeral,
+        })
+        const nextEdges = mergeHydratedEdges(
+          current.edges,
+          graphEdges,
+          nextNodes,
+          {
+            preserveEphemeral: true,
+            isEphemeralNode: isEphemeral,
+          }
+        )
+
+        return { nodes: nextNodes, edges: nextEdges }
+      })
+    },
+    []
+  )
+
   /**
    * Update canvas state from graph response (used after graph operations).
    */
@@ -237,19 +291,17 @@ export const WorkflowCanvas = React.forwardRef<
       setGraphVersion(graph.version)
       const { nodes: rfNodes, edges: rfEdges } =
         buildNodesAndEdgesFromGraph(graph)
-      setNodes((nodes) => {
-        const selectedNodeIds = new Set(
-          nodes.filter((node) => node.selected).map((node) => node.id)
-        )
-        return rfNodes.map((node) => ({
-          ...node,
-          selected: selectedNodeIds.has(node.id),
-        }))
-      })
-      setEdges(rfEdges)
+      hydrateCanvasFromGraph(rfNodes, rfEdges)
+      setHydratedWorkflowId(workflowId ?? null)
     },
-    [buildNodesAndEdgesFromGraph, setNodes, setEdges]
+    [buildNodesAndEdgesFromGraph, hydrateCanvasFromGraph, workflowId]
   )
+
+  useEffect(() => {
+    setHydratedWorkflowId(null)
+    setCanvasGraph(removeEphemeralGraphElements)
+    openContextMenuId.current = null
+  }, [workflowId])
 
   /**
    * Load graph data when it becomes available.
@@ -263,16 +315,7 @@ export const WorkflowCanvas = React.forwardRef<
       // Build nodes and edges from graph API response
       const { nodes: graphNodes, edges: graphEdges } =
         buildNodesAndEdgesFromGraph(graphData)
-      setNodes((nodes) => {
-        const selectedNodeIds = new Set(
-          nodes.filter((node) => node.selected).map((node) => node.id)
-        )
-        return graphNodes.map((node) => ({
-          ...node,
-          selected: selectedNodeIds.has(node.id),
-        }))
-      })
-      setEdges(graphEdges)
+      hydrateCanvasFromGraph(graphNodes, graphEdges)
       setGraphVersion(graphData.version)
 
       // Set viewport from graph if available
@@ -284,17 +327,63 @@ export const WorkflowCanvas = React.forwardRef<
         y: viewport?.y ?? 0,
         zoom: viewport?.zoom ?? 1,
       })
+      setHydratedWorkflowId(workflowId ?? null)
     } catch (error) {
       console.error("Failed to initialize workflow graph:", error)
     }
   }, [
     graphData,
     reactFlowInstance,
+    workflowId,
     buildNodesAndEdgesFromGraph,
-    setNodes,
-    setEdges,
+    hydrateCanvasFromGraph,
     setViewport,
   ])
+
+  // Keep node selection in sync with builder selection state without
+  // re-running full graph hydration logic.
+  useEffect(() => {
+    // Avoid reconciling selection against stale nodes while switching workflows.
+    if (!workflowId || hydratedWorkflowId !== workflowId) {
+      return
+    }
+
+    if (nodes.length === 0) {
+      return
+    }
+
+    // If a persisted selection points to a missing node, clear it so we
+    // don't keep restoring a stale "not found" state.
+    if (selectedNodeId && !nodes.some((node) => node.id === selectedNodeId)) {
+      setSelectedNodeId(null)
+      return
+    }
+
+    setNodes((currentNodes) => {
+      let changed = false
+      const nextNodes = currentNodes.map((node) => {
+        const shouldBeSelected =
+          selectedNodeId !== null && node.id === selectedNodeId
+        if (node.selected === shouldBeSelected) {
+          return node
+        }
+        changed = true
+        return { ...node, selected: shouldBeSelected }
+      })
+      return changed ? nextNodes : currentNodes
+    })
+  }, [
+    hydratedWorkflowId,
+    nodes,
+    selectedNodeId,
+    setNodes,
+    setSelectedNodeId,
+    workflowId,
+  ])
+
+  const onPaneClick = useCallback(() => {
+    setSelectedNodeId(null)
+  }, [setSelectedNodeId])
 
   // Connections
   const onConnect = useCallback(
@@ -638,7 +727,7 @@ export const WorkflowCanvas = React.forwardRef<
       // apply the changes we kept
       onNodesChange(nextChanges)
     },
-    [nodes, setNodes, pendingDeleteNodes]
+    [getNode, onNodesChange]
   )
 
   /**
@@ -828,6 +917,94 @@ export const WorkflowCanvas = React.forwardRef<
     [reactFlowInstance] // eslint-disable-line react-hooks/exhaustive-deps
   )
 
+  // Handle adding action from toolbar
+  const handleToolbarAddAction = useCallback(
+    async (action: RegistryActionReadMinimal) => {
+      if (!workflowId || !reactFlowInstance) return
+
+      // Get the center of the current viewport in screen coordinates
+      const containerBounds = containerRef.current?.getBoundingClientRect()
+      if (!containerBounds) return
+
+      // screenToFlowPosition expects actual screen coordinates (clientX/clientY)
+      // so we need to add the container's position to get the center in screen space
+      const screenCenterX = containerBounds.left + containerBounds.width / 2
+      const screenCenterY = containerBounds.top + containerBounds.height / 2
+
+      // Convert screen position to flow position
+      const position = screenToFlowPosition({
+        x: screenCenterX,
+        y: screenCenterY,
+      })
+
+      try {
+        const addNodeOp: GraphOperation = {
+          type: "add_node",
+          payload: {
+            type: action.action,
+            title: action.default_title ?? action.action,
+            position_x: position.x,
+            position_y: position.y,
+          },
+        }
+
+        const result = await applyGraphOperations({
+          baseVersion: graphVersion,
+          operations: [addNodeOp],
+        })
+
+        updateStateFromGraph(result)
+        toast({
+          title: "Action added",
+          description: `Added "${action.default_title ?? action.action}" to the workflow.`,
+        })
+      } catch (error) {
+        const apiError = error as { status?: number }
+        if (apiError.status === 409) {
+          try {
+            const latestGraph = await refetchGraph()
+            const addNodeOp: GraphOperation = {
+              type: "add_node",
+              payload: {
+                type: action.action,
+                title: action.default_title ?? action.action,
+                position_x: position.x,
+                position_y: position.y,
+              },
+            }
+            const result = await applyGraphOperations({
+              baseVersion: latestGraph.version,
+              operations: [addNodeOp],
+            })
+            updateStateFromGraph(result)
+          } catch (retryError) {
+            console.error("Failed to add action after retry:", retryError)
+            toast({
+              title: "Failed to add action",
+              description: "Could not add action. Please try again.",
+            })
+          }
+        } else {
+          console.error("Failed to add action:", error)
+          toast({
+            title: "Failed to add action",
+            description: "Could not add action. Please try again.",
+          })
+        }
+      }
+    },
+    [
+      workflowId,
+      reactFlowInstance,
+      screenToFlowPosition,
+      graphVersion,
+      applyGraphOperations,
+      updateStateFromGraph,
+      refetchGraph,
+      toast,
+    ]
+  )
+
   return (
     <div ref={containerRef} style={{ height: "100%", width: "100%" }}>
       <ReactFlow
@@ -843,12 +1020,13 @@ export const WorkflowCanvas = React.forwardRef<
         onEdgesChange={handleEdgesChange}
         onNodeDragStop={onNodesDragStop}
         onMoveEnd={onMoveEnd}
+        onPaneClick={onPaneClick}
         defaultEdgeOptions={defaultEdgeOptions}
         nodeTypes={nodeTypes}
         proOptions={{ hideAttribution: true }}
         deleteKeyCode={["Backspace", "Delete"]}
         fitView
-        fitViewOptions={fitViewOptions}
+        fitViewOptions={activeFitViewOptions}
         nodeDragThreshold={4}
         maxZoom={1}
         minZoom={0.25}
@@ -857,7 +1035,10 @@ export const WorkflowCanvas = React.forwardRef<
         onPaneContextMenu={onPaneContextMenu}
       >
         <Background bgColor="#fcfcfc" />
-        <Controls className="rounded-sm" fitViewOptions={fitViewOptions} />
+        <Controls
+          className="rounded-sm"
+          fitViewOptions={activeFitViewOptions}
+        />
         <Panel position="bottom-right" className="flex items-center gap-1">
           <Badge
             variant="outline"
@@ -880,6 +1061,12 @@ export const WorkflowCanvas = React.forwardRef<
           >
             <MoveHorizontalIcon className="size-3" strokeWidth={2} />
           </Button>
+        </Panel>
+        <Panel position="bottom-center" className="mb-4">
+          <CanvasToolbar
+            onAddAction={handleToolbarAddAction}
+            embedded={embedded}
+          />
         </Panel>
         <NodeSilhouette
           position={silhouettePosition}

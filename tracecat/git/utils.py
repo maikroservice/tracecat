@@ -9,8 +9,8 @@ from tracecat import config
 from tracecat.auth.types import Role
 from tracecat.contexts import ctx_role
 from tracecat.exceptions import TracecatSettingsError
-from tracecat.git.constants import GIT_HTTPS_URL_REGEX, GIT_SSH_URL_REGEX
-from tracecat.git.types import GitScheme, GitUrl
+from tracecat.git.constants import GIT_SSH_URL_REGEX
+from tracecat.git.types import GitUrl
 from tracecat.logger import logger
 from tracecat.registry.repositories.schemas import GitCommitInfo
 from tracecat.registry.repositories.service import RegistryReposService
@@ -21,7 +21,7 @@ from tracecat.ssh import SshEnv
 def parse_git_url(url: str, *, allowed_domains: set[str] | None = None) -> GitUrl:
     """Parse a Git repository URL to extract components.
 
-    Handles Git SSH URLs with 'git+ssh' prefix and HTTPS URLs.
+    Handles Git SSH URLs with 'git+ssh' prefix and optional '@' for branch specification.
     Supports nested groups (GitLab), ports, and various URL structures.
 
     Args:
@@ -34,22 +34,18 @@ def parse_git_url(url: str, *, allowed_domains: set[str] | None = None) -> GitUr
     Raises:
         ValueError: If the URL is not a valid repository URL or host not in allowed domains.
     """
-    # Try SSH URL first
-    match = GIT_SSH_URL_REGEX.match(url)
-    scheme = GitScheme.SSH
-
-    # Try HTTPS URL if SSH doesn't match
-    if not match:
-        match = GIT_HTTPS_URL_REGEX.match(url)
-        scheme = GitScheme.HTTPS
-
-    if match:
+    if match := GIT_SSH_URL_REGEX.match(url):
+        user = match.group("user")
         host = match.group("host")
         port = match.group("port")
         path = match.group("path")
         ref = match.group("ref")
 
-        if not isinstance(host, str) or not isinstance(path, str):
+        if (
+            not isinstance(user, str)
+            or not isinstance(host, str)
+            or not isinstance(path, str)
+        ):
             raise ValueError(f"Invalid Git URL: {url}")
 
         # Combine host and port if port is present
@@ -70,11 +66,9 @@ def parse_git_url(url: str, *, allowed_domains: set[str] | None = None) -> GitUr
                 f"Domain {full_host} not in allowed domains. Must be configured in `git_allowed_domains` organization setting."
             )
 
-        return GitUrl(host=full_host, org=org, repo=repo, ref=ref, scheme=scheme)
+        return GitUrl(host=full_host, org=org, repo=repo, user=user, ref=ref)
 
-    raise ValueError(
-        f"Unsupported URL format: {url}. Must be a valid Git SSH URL (git+ssh://...) or HTTPS URL (https://...)."
-    )
+    raise ValueError(f"Unsupported URL format: {url}. Must be a valid Git SSH URL.")
 
 
 async def resolve_git_ref(
@@ -267,8 +261,8 @@ async def prepare_git_url(
             host=parsed_url.host,
             org=parsed_url.org,
             repo=parsed_url.repo,
+            user=parsed_url.user,
             ref=sha,
-            scheme=parsed_url.scheme,
         )
     except ValueError as e:
         raise TracecatSettingsError(str(e)) from e

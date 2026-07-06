@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Concatenate, ParamSpec, TypeVar
 
 from tracecat.audit.enums import AuditEventStatus
 from tracecat.audit.service import AuditService
 from tracecat.audit.types import AuditAction, AuditResourceType
-from tracecat.auth.types import Role
+from tracecat.auth.types import PlatformRole, Role
 from tracecat.contexts import ctx_role
 from tracecat.logger import logger
-from tracecat.service import BaseService
+from tracecat.service import BasePlatformService, BaseService
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -22,6 +23,14 @@ _RESOURCE_ID_ATTR_MAP: dict[str, str] = {
     "workflow_execution": "wf_id",
     "organization_member": "user_id",
     "organization_session": "session_id",
+    "organization": "org_id",
+    "organization_domain": "domain_id",
+    "organization_invitation": "id",
+    "organization_tier": "org_id",
+    "platform_registry_repository": "repository_id",
+    "platform_registry_version": "version_id",
+    "tier": "tier_id",
+    "user": "id",
 }
 
 
@@ -51,21 +60,35 @@ def audit_log(
             if resource_id_attr is not None
             else _RESOURCE_ID_ATTR_MAP.get(resource_type, "id")
         )
+        signature = inspect.signature(func)
 
         @functools.wraps(func)
         async def wrapper(self: Any, *args: P.args, **kwargs: P.kwargs) -> R:
-            role: Role | None = ctx_role.get()
+            role: Role | PlatformRole | None = (
+                self.role if isinstance(self, BasePlatformService) else ctx_role.get()
+            )
 
-            # Skip audit if we don't have a user role
-            if role is None or role.user_id is None:
+            if role is None or role.actor_id is None:
                 return await func(self, *args, **kwargs)
 
             # Get existing session. Currently only BaseService has a session.
             session = self.session if isinstance(self, BaseService) else None
+            bound_arguments: Mapping[str, Any] = {}
+            try:
+                bound_arguments = signature.bind_partial(
+                    self, *args, **kwargs
+                ).arguments
+            except TypeError as exc:
+                logger.warning("Audit argument binding failed", error=str(exc))
+
             resource_id: uuid.UUID | None = None
             try:
                 resource_id = _extract_resource_id(
-                    args, kwargs, None, resolved_resource_id_attr
+                    args,
+                    kwargs,
+                    None,
+                    resolved_resource_id_attr,
+                    bound_arguments=bound_arguments,
                 )
             except Exception as exc:
                 logger.warning("Audit resource_id extraction failed", error=str(exc))
@@ -87,17 +110,26 @@ def audit_log(
                 # Execute the actual function
                 result = await func(self, *args, **kwargs)
 
-                # Log success
+                # Log success, or a semantic failure for result objects that
+                # complete without raising but report success=False.
                 try:
                     resource_id = _extract_resource_id(
-                        args, kwargs, result, resolved_resource_id_attr
+                        args,
+                        kwargs,
+                        result,
+                        resolved_resource_id_attr,
+                        bound_arguments=bound_arguments,
                     )
                     async with AuditService.with_session(role, session=session) as svc:
                         await svc.create_event(
                             resource_type=resource_type,
                             action=action,
                             resource_id=resource_id,
-                            status=AuditEventStatus.SUCCESS,
+                            status=(
+                                AuditEventStatus.FAILURE
+                                if getattr(result, "success", None) is False
+                                else AuditEventStatus.SUCCESS
+                            ),
                         )
                 except Exception as exc:
                     logger.warning("Audit success log failed", error=str(exc))
@@ -126,13 +158,16 @@ def _extract_resource_id(
     kwargs: dict[str, Any],
     result: Any | None,
     attr: str,
+    *,
+    bound_arguments: Mapping[str, Any] | None = None,
 ) -> uuid.UUID | None:
     """Heuristic to find a resource id.
 
     Priority:
     1) return value `attr` if present
     2) first arg with `attr`
-    3) kwargs value for `attr`
+    3) bound function argument named `attr`
+    4) kwargs value for `attr`
     """
 
     raw: Any | None = None
@@ -144,6 +179,8 @@ def _extract_resource_id(
             if hasattr(arg, attr):
                 raw = getattr(arg, attr)
                 break
+        if raw is None and bound_arguments is not None:
+            raw = bound_arguments.get(attr)
         if raw is None and attr in kwargs:
             raw = kwargs.get(attr)
 

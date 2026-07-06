@@ -3,9 +3,10 @@ from collections.abc import Sequence
 from fastapi import APIRouter, HTTPException, status
 from sqlalchemy.exc import IntegrityError, NoResultFound
 
-from tracecat.auth.dependencies import WorkspaceUserRole
+from tracecat.auth.dependencies import WorkspaceActorRouteRole
+from tracecat.authz.controls import require_scope
 from tracecat.db.dependencies import AsyncDBSession
-from tracecat.db.models import Tag
+from tracecat.db.models import WorkflowTag
 from tracecat.identifiers import TagID
 from tracecat.tags.schemas import TagCreate, TagRead, TagUpdate
 from tracecat.tags.service import TagsService
@@ -15,23 +16,25 @@ router = APIRouter(prefix="/tags", tags=["tags"])
 
 
 @router.get("", response_model=list[TagRead])
+@require_scope("tag:read")
 async def list_tags(
     *,
-    role: WorkspaceUserRole,
+    role: WorkspaceActorRouteRole,
     session: AsyncDBSession,
-) -> Sequence[Tag]:
+) -> Sequence[WorkflowTag]:
     """List all tags for the current workspace."""
     service = TagsService(session, role)
     return await service.list_tags()
 
 
 @router.get("/{tag_id}", response_model=TagRead)
+@require_scope("tag:read")
 async def get_tag(
     *,
-    role: WorkspaceUserRole,
+    role: WorkspaceActorRouteRole,
     session: AsyncDBSession,
     tag_id: TagID,
-) -> Tag:
+) -> WorkflowTag:
     """Get a specific tag by ID."""
     service = TagsService(session, role)
     try:
@@ -44,12 +47,13 @@ async def get_tag(
 
 
 @router.post("", response_model=TagRead)
+@require_scope("tag:create")
 async def create_tag(
     *,
-    role: WorkspaceUserRole,
+    role: WorkspaceActorRouteRole,
     session: AsyncDBSession,
     tag: TagCreate,
-) -> Tag:
+) -> WorkflowTag:
     """Create a new tag."""
     service = TagsService(session, role)
     try:
@@ -62,13 +66,14 @@ async def create_tag(
 
 
 @router.patch("/{tag_id}", response_model=TagRead)
+@require_scope("tag:update")
 async def update_tag(
     *,
-    role: WorkspaceUserRole,
+    role: WorkspaceActorRouteRole,
     session: AsyncDBSession,
     tag_id: TagID,
     tag_update: TagUpdate,
-) -> Tag:
+) -> WorkflowTag:
     """Update an existing tag."""
     service = TagsService(session, role)
     tag = await service.get_tag(tag_id)
@@ -82,9 +87,10 @@ async def update_tag(
 
 
 @router.delete("/{tag_id}")
+@require_scope("tag:delete")
 async def delete_tag(
     *,
-    role: WorkspaceUserRole,
+    role: WorkspaceActorRouteRole,
     session: AsyncDBSession,
     tag_id: TagID,
 ) -> None:

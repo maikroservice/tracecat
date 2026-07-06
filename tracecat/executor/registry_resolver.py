@@ -12,14 +12,17 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from tracecat_registry import RegistrySecretType
 
-from tracecat.db.engine import get_async_session_context_manager
+from tracecat.db.engine import (
+    get_async_session_bypass_rls_context_manager,
+    get_async_session_context_manager,
+)
 from tracecat.db.models import (
     PlatformRegistryRepository,
     PlatformRegistryVersion,
     RegistryRepository,
     RegistryVersion,
 )
-from tracecat.exceptions import RegistryError
+from tracecat.exceptions import EntitlementRequired, RegistryError
 from tracecat.executor.schemas import ActionImplementation
 from tracecat.identifiers import OrganizationID
 from tracecat.logger import logger
@@ -30,6 +33,8 @@ from tracecat.registry.versions.schemas import (
     RegistryVersionManifest,
     RegistryVersionManifestAction,
 )
+from tracecat.tiers.access import is_org_entitled
+from tracecat.tiers.enums import Entitlement
 
 
 def _build_impl_index(
@@ -146,7 +151,7 @@ async def _get_manifest_entry(
 
     This function handles its own DB session and caching via aiocache.
     """
-    async with get_async_session_context_manager() as session:
+    async with get_async_session_bypass_rls_context_manager() as session:
         manifest = await _fetch_manifest(session, origin, version, organization_id)
         impl_index = _build_impl_index(manifest, origin)
 
@@ -160,17 +165,65 @@ async def _get_manifest_entry(
         return (manifest, impl_index)
 
 
+def _custom_registry_entitlement_key_builder(
+    fn: object,
+    organization_id: OrganizationID,
+) -> str:
+    """Build cache key for custom registry entitlement checks."""
+    return f"custom_registry_entitlement:{organization_id}"
+
+
+@cached(
+    ttl=60,
+    cache=Cache.MEMORY,
+    key_builder=_custom_registry_entitlement_key_builder,
+)
+async def _has_custom_registry_entitlement(organization_id: OrganizationID) -> bool:
+    """Check whether an organization can execute custom registry actions."""
+    async with get_async_session_context_manager() as session:
+        return await is_org_entitled(
+            session,
+            organization_id,
+            Entitlement.CUSTOM_REGISTRY,
+        )
+
+
+async def _require_custom_registry_entitlement_if_needed(
+    lock: RegistryLock, organization_id: OrganizationID
+) -> None:
+    """Require custom registry entitlement for locks with custom origins."""
+    custom_origins = {
+        origin for origin in lock.origins if origin != DEFAULT_REGISTRY_ORIGIN
+    }
+    if not custom_origins:
+        return
+    if not await _has_custom_registry_entitlement(organization_id):
+        unavailable_actions = sorted(
+            action_name
+            for action_name, action_origin in lock.actions.items()
+            if action_origin in custom_origins
+        )
+        raise EntitlementRequired(
+            Entitlement.CUSTOM_REGISTRY.value,
+            unavailable_actions=unavailable_actions,
+            unavailable_origins=sorted(custom_origins),
+        )
+
+
 async def prefetch_lock(lock: RegistryLock, organization_id: OrganizationID) -> None:
     """Prefetch all manifests for a registry lock into cache.
 
     Call this once at the start of action execution to warm the cache.
     Uses aiocache with TTL - no session needed (managed internally).
     """
+    await _require_custom_registry_entitlement_if_needed(lock, organization_id)
+
     tasks = [
         _get_manifest_entry(origin, version, organization_id)
         for origin, version in lock.origins.items()
     ]
-    await asyncio.gather(*tasks)
+    if tasks:
+        await asyncio.gather(*tasks)
 
     logger.debug(
         "Prefetched registry lock",
@@ -227,6 +280,30 @@ async def resolve_action(
         )
 
     return impl_index[action_name]
+
+
+async def resolve_manifest_action(
+    action_name: str,
+    lock: RegistryLock,
+    organization_id: OrganizationID,
+) -> RegistryVersionManifestAction:
+    """Resolve an action's frozen manifest entry from a registry lock."""
+    origin = lock.actions.get(action_name)
+    if origin is None:
+        raise RegistryError(f"Action '{action_name}' not bound in registry_lock")
+
+    version = lock.origins.get(origin)
+    if version is None:
+        raise RegistryError(f"Origin '{origin}' not found in registry_lock")
+
+    manifest, _ = await _get_manifest_entry(origin, version, organization_id)
+    manifest_action = manifest.actions.get(action_name)
+    if manifest_action is None:
+        raise RegistryError(
+            f"Action '{action_name}' not found in manifest for "
+            f"origin={origin!r}, version={version!r}"
+        )
+    return manifest_action
 
 
 async def collect_action_secrets_from_manifest(
@@ -324,3 +401,4 @@ async def _collect_secrets_recursive(
 async def clear_cache() -> None:
     """Clear the manifest cache. Useful for testing."""
     await _get_manifest_entry.cache.clear()  # pyright: ignore[reportAttributeAccessIssue]
+    await _has_custom_registry_entitlement.cache.clear()  # pyright: ignore[reportAttributeAccessIssue]

@@ -9,11 +9,13 @@ import { z } from "zod"
 import { ApiError, type TableRead } from "@/client"
 import { SqlTypeDisplay } from "@/components/data-type/sql-type-display"
 import { Spinner } from "@/components/loading/spinner"
+import { ProtectedColumnsAlert } from "@/components/tables/protected-columns-alert"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
@@ -33,19 +35,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table"
 import { toast } from "@/components/ui/use-toast"
 import type { SqlType } from "@/lib/data-type"
 import type { TracecatApiError } from "@/lib/errors"
 import { useGetTable, useImportCsv } from "@/lib/hooks"
-import { type CsvPreviewData, getCsvPreview } from "@/lib/tables"
+import {
+  type CsvPreviewData,
+  getCsvPreview,
+  resolveColumnMapping,
+} from "@/lib/tables"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
 const BYTES_PER_MB = 1024 * 1024
@@ -69,7 +67,10 @@ const csvImportSchema = z.object({
   columnMapping: z
     .record(z.string(), z.string())
     .refine(
-      (mapping) => Object.keys(mapping).length > 0,
+      (mapping) =>
+        Object.values(mapping).some(
+          (value) => typeof value === "string" && value !== "skip"
+        ),
       "Please map at least one column"
     ),
 })
@@ -96,6 +97,7 @@ export function TableImportCsvDialog({
 
   const [isUploading, setIsUploading] = useState(false)
   const [csvPreview, setCsvPreview] = useState<CsvPreviewData | null>(null)
+  const [columnMapping, setColumnMapping] = useState<Record<string, string>>({})
 
   const form = useForm<CsvImportFormValues>({
     resolver: zodResolver(csvImportSchema),
@@ -104,10 +106,41 @@ export function TableImportCsvDialog({
     },
   })
 
+  useEffect(() => {
+    if (!csvPreview || !table) {
+      return
+    }
+
+    const currentMapping = columnMapping
+    const nextMapping = resolveColumnMapping(
+      csvPreview.headers,
+      table.columns.map((column) => column.name),
+      currentMapping
+    )
+
+    const needsUpdate =
+      csvPreview.headers.some(
+        (header) => currentMapping[header] !== nextMapping[header]
+      ) ||
+      Object.keys(currentMapping).some(
+        (header) => !csvPreview.headers.includes(header)
+      )
+    if (!needsUpdate) {
+      return
+    }
+
+    setColumnMapping(nextMapping)
+    form.setValue("columnMapping", nextMapping, {
+      shouldDirty: true,
+      shouldValidate: true,
+    })
+  }, [columnMapping, csvPreview, form, table])
+
   // Reset state when dialog closes
   useEffect(() => {
     if (!open) {
       setCsvPreview(null)
+      setColumnMapping({})
       form.reset()
     }
   }, [open, form])
@@ -116,6 +149,8 @@ export function TableImportCsvDialog({
     const { file } = form.getValues()
     try {
       setIsUploading(true)
+      setColumnMapping({})
+      form.setValue("columnMapping", {})
       const parsedData = await getCsvPreview(file)
       setCsvPreview(parsedData)
     } catch (error) {
@@ -129,14 +164,29 @@ export function TableImportCsvDialog({
     }
   }, [form])
 
-  const onSubmit = async ({ file, columnMapping }: CsvImportFormValues) => {
+  const onSubmit = async ({ file }: CsvImportFormValues) => {
     if (!csvPreview || !table) return
 
     try {
+      const finalColumnMapping = resolveColumnMapping(
+        csvPreview.headers,
+        table.columns.map((column) => column.name),
+        columnMapping
+      )
+      const hasMappedColumns = Object.values(finalColumnMapping).some(
+        (value) => value !== "skip"
+      )
+      if (!hasMappedColumns) {
+        form.setError("root", {
+          type: "manual",
+          message: "Please map at least one column before importing.",
+        })
+        return
+      }
       const response = await importCsv({
         formData: {
           file,
-          column_mapping: JSON.stringify(columnMapping),
+          column_mapping: JSON.stringify(finalColumnMapping),
         },
         tableId: tableId ?? "",
         workspaceId,
@@ -150,16 +200,30 @@ export function TableImportCsvDialog({
       console.error("Error importing data:", error)
       if (error instanceof ApiError) {
         const apiError = error as TracecatApiError
-        form.setError("root", {
-          message:
-            typeof apiError.body.detail === "object"
+        const detail =
+          typeof apiError.body.detail === "string"
+            ? apiError.body.detail
+            : typeof apiError.body.detail === "object"
               ? JSON.stringify(apiError.body.detail)
-              : String(apiError.body.detail),
-        })
+              : undefined
+        let message: string
+        if (
+          detail?.toLowerCase().includes("column") &&
+          detail?.includes("already exists")
+        ) {
+          message =
+            "A column in your CSV conflicts with an existing column. Check for protected names like id, created_at, or updated_at."
+        } else if (detail && error.status !== 500) {
+          message = detail
+        } else {
+          message =
+            "Failed to import data. Please check your CSV file and try again."
+        }
+        form.setError("root", { type: "manual", message })
       } else {
-        toast({
-          title: "Failed to import data",
-          description: "Please try again",
+        form.setError("root", {
+          type: "manual",
+          message: "Failed to import data. Please try again.",
         })
       }
     }
@@ -168,7 +232,7 @@ export function TableImportCsvDialog({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
-        className="max-w-3xl"
+        className="flex max-h-[85vh] max-w-3xl flex-col overflow-hidden"
         aria-describedby="csv-import-description"
       >
         <DialogHeader className="space-y-4">
@@ -176,60 +240,85 @@ export function TableImportCsvDialog({
           <DialogDescription>
             Import data from a CSV file into your table.
           </DialogDescription>
+          <ProtectedColumnsAlert />
         </DialogHeader>
 
         <FormProvider {...form}>
-          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-8">
-            <div className="space-y-6">
-              {!csvPreview ? (
-                <CsvUploadForm
-                  isUploading={isUploading}
-                  nextPage={handleCreatePreview}
-                />
-              ) : (
-                <>
-                  <CsvPreview csvData={csvPreview} />
-                  {table && (
-                    <ColumnMapping csvData={csvPreview} table={table} />
-                  )}
-                  <div>
-                    {form.formState.errors.root && (
-                      <div className="text-sm text-red-500">
-                        {form.formState.errors.root.message}
-                      </div>
+          <form
+            onSubmit={form.handleSubmit(onSubmit)}
+            className="flex min-h-0 flex-1 flex-col overflow-hidden"
+          >
+            <div className="no-scrollbar min-h-0 flex-1 overflow-y-auto">
+              <div className="space-y-6">
+                {!csvPreview ? (
+                  <CsvUploadForm
+                    isUploading={isUploading}
+                    nextPage={handleCreatePreview}
+                  />
+                ) : (
+                  <>
+                    <CsvPreview csvData={csvPreview} />
+                    {table && (
+                      <ColumnMapping
+                        csvData={csvPreview}
+                        table={table}
+                        columnMapping={columnMapping}
+                        onChange={(header, value) => {
+                          const nextMapping = {
+                            ...columnMapping,
+                            [header]: value,
+                          }
+                          setColumnMapping(nextMapping)
+                          form.setValue("columnMapping", nextMapping, {
+                            shouldDirty: true,
+                            shouldValidate: true,
+                          })
+                        }}
+                      />
                     )}
-                  </div>
-                  <div className="flex justify-end space-x-2">
-                    <Button
-                      variant="outline"
-                      onClick={() => {
-                        setCsvPreview(null)
-                        form.reset({ columnMapping: {} })
-                      }}
-                    >
-                      Back
-                    </Button>
-                    <Button
-                      type="submit"
-                      disabled={
-                        importCsvIsPending ||
-                        Object.keys(form.getValues("columnMapping")).length ===
-                          0
-                      }
-                    >
-                      {importCsvIsPending ? (
-                        <>
-                          <Spinner className="mr-2 size-4" />
-                          Importing...
-                        </>
-                      ) : (
-                        "Import Data"
-                      )}
-                    </Button>
-                  </div>
-                </>
-              )}
+                  </>
+                )}
+              </div>
             </div>
+
+            {csvPreview && (
+              <DialogFooter className="pt-4">
+                {form.formState.errors.root && (
+                  <div className="mr-auto text-sm text-red-500">
+                    {form.formState.errors.root.message}
+                  </div>
+                )}
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    setCsvPreview(null)
+                    setColumnMapping({})
+                    form.reset({ columnMapping: {} })
+                  }}
+                >
+                  Back
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={
+                    importCsvIsPending ||
+                    !Object.values(columnMapping).some(
+                      (value) => value !== "skip"
+                    )
+                  }
+                >
+                  {importCsvIsPending ? (
+                    <>
+                      <Spinner className="mr-2 size-4" />
+                      Importing...
+                    </>
+                  ) : (
+                    "Import Data"
+                  )}
+                </Button>
+              </DialogFooter>
+            )}
           </form>
         </FormProvider>
       </DialogContent>
@@ -256,6 +345,7 @@ function CsvUploadForm({ isUploading, nextPage }: CsvUploadFormProps) {
               <Input
                 type="file"
                 accept=".csv"
+                className="min-h-9 py-2"
                 onChange={(e) => {
                   const file = e.target.files?.[0]
                   if (file) {
@@ -298,59 +388,65 @@ interface CsvPreviewProps {
 
 export function CsvPreview({ csvData }: CsvPreviewProps) {
   return (
-    <div className="space-y-4">
-      <div className="text-sm font-medium">Preview (first 5 rows)</div>
-      <div className="max-h-60 overflow-auto rounded border">
-        <div className="overflow-x-auto">
-          <Table className="w-full min-w-max table-auto">
-            <TableHeader>
-              <TableRow>
+    <div className="min-w-0 space-y-2">
+      <div className="flex items-center justify-between">
+        <span className="text-sm font-medium">Preview</span>
+        <span className="text-xs text-muted-foreground">
+          {csvData.headers.length} columns &middot; {csvData.preview.length}{" "}
+          rows
+        </span>
+      </div>
+      <div className="no-scrollbar max-h-[240px] overflow-auto rounded-md border border-border/50">
+        <table className="w-full min-w-max table-auto border-separate border-spacing-0 text-xs">
+          <thead>
+            <tr>
+              <th className="sticky left-0 top-0 z-20 min-w-[40px] border-b border-r border-border/30 bg-muted px-3 py-2 text-left font-medium text-muted-foreground">
+                #
+              </th>
+              {csvData.headers.map((header) => (
+                <th
+                  key={header}
+                  className="sticky top-0 z-10 min-w-[120px] max-w-[200px] whitespace-nowrap border-b border-border/30 bg-muted px-3 py-2 text-left font-medium"
+                >
+                  <div className="truncate" title={header}>
+                    {header}
+                  </div>
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {csvData.preview.map((row, i) => (
+              <tr key={i}>
+                <td className="sticky left-0 z-10 border-r border-border/30 bg-background px-3 py-1.5 font-mono text-[10px] text-muted-foreground">
+                  {i + 1}
+                </td>
                 {csvData.headers.map((header) => {
+                  const cellValue = row[header]
+                  const isObject =
+                    typeof cellValue === "object" && cellValue !== null
+                  const fullValue = isObject
+                    ? JSON.stringify(cellValue)
+                    : String(cellValue ?? "")
+                  const displayValue =
+                    fullValue.length > 80
+                      ? `${fullValue.substring(0, 77)}...`
+                      : fullValue
+
                   return (
-                    <TableHead
+                    <td
                       key={header}
-                      className="sticky top-0 min-w-[120px] max-w-[200px] whitespace-nowrap bg-muted/50 px-3 py-2"
+                      className="min-w-[120px] max-w-[200px] truncate px-3 py-1.5"
+                      title={fullValue}
                     >
-                      <div className="truncate" title={header}>
-                        {header}
-                      </div>
-                    </TableHead>
+                      {displayValue}
+                    </td>
                   )
                 })}
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {csvData.preview.map((row, i) => {
-                return (
-                  <TableRow key={i}>
-                    {csvData.headers.map((header) => {
-                      const cellValue = row[header]
-                      const isObject =
-                        typeof cellValue === "object" && cellValue !== null
-                      const fullValue = isObject
-                        ? JSON.stringify(cellValue)
-                        : String(cellValue || "")
-                      const displayValue =
-                        fullValue.length > 100
-                          ? fullValue.substring(0, 97) + "..."
-                          : fullValue
-
-                      return (
-                        <TableCell
-                          key={header}
-                          className="min-w-[120px] max-w-[200px] truncate px-3 py-2"
-                          title={fullValue}
-                        >
-                          {displayValue}
-                        </TableCell>
-                      )
-                    })}
-                  </TableRow>
-                )
-              })}
-            </TableBody>
-          </Table>
-        </div>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
     </div>
   )
@@ -359,9 +455,16 @@ export function CsvPreview({ csvData }: CsvPreviewProps) {
 interface ColumnMappingProps {
   csvData: CsvPreviewData
   table: TableRead
+  columnMapping: Record<string, string>
+  onChange: (header: string, value: string) => void
 }
 
-function ColumnMapping({ csvData, table }: ColumnMappingProps) {
+function ColumnMapping({
+  csvData,
+  table,
+  columnMapping,
+  onChange,
+}: ColumnMappingProps) {
   const form = useFormContext<CsvImportFormValues>()
 
   return (
@@ -379,10 +482,8 @@ function ColumnMapping({ csvData, table }: ColumnMappingProps) {
                 <div key={header} className="flex items-center gap-2">
                   <FormLabel className="w-1/3 text-sm">{header}</FormLabel>
                   <Select
-                    value={form.watch(`columnMapping.${header}`)}
-                    onValueChange={(value) =>
-                      form.setValue(`columnMapping.${header}`, value)
-                    }
+                    value={columnMapping[header] ?? ""}
+                    onValueChange={(value) => onChange(header, value)}
                   >
                     <SelectTrigger className="w-2/3">
                       <SelectValue placeholder="Select a column" />

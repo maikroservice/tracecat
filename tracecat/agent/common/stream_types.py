@@ -7,18 +7,38 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import StrEnum
 from typing import Any, Literal
 
+type ArtifactEventOp = Literal["upsert", "remove"]
 
-class HarnessType(str, Enum):
+
+@dataclass(frozen=True, slots=True)
+class VercelFrameCursor:
+    """Browser SSE cursor for a Vercel frame fanned out from one Redis entry."""
+
+    redis_id: str
+    frame_index: int
+
+
+def parse_vercel_frame_cursor(event_id: str | None) -> VercelFrameCursor | None:
+    """Parse ``<redis-id>:<frame-index>`` cursors emitted by the Vercel adapter."""
+    if not event_id:
+        return None
+    redis_id, separator, frame_index = event_id.rpartition(":")
+    if not separator or not redis_id or not frame_index.isdecimal():
+        return None
+    return VercelFrameCursor(redis_id=redis_id, frame_index=int(frame_index))
+
+
+class HarnessType(StrEnum):
     """Supported agent harnesses."""
 
     PYDANTIC_AI = "pydantic-ai"
     CLAUDE_CODE = "claude_code"
 
 
-class StreamEventType(str, Enum):
+class StreamEventType(StrEnum):
     """Types of streaming events."""
 
     # Text streaming
@@ -42,6 +62,10 @@ class StreamEventType(str, Enum):
     MESSAGE_STOP = "message_stop"
     USER_MESSAGE = "user_message"
 
+    # System/status events
+    COMPACTION = "compaction"
+    ARTIFACT = "artifact"
+
     # Control events
     ERROR = "error"
     DONE = "done"
@@ -63,6 +87,8 @@ class ToolCallContent:
     """Fully-qualified tool name."""
     input: dict[str, Any] = field(default_factory=dict)
     """Arguments for the tool call."""
+    metadata: dict[str, Any] | None = None
+    """Trusted runtime metadata about the tool call scope."""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ToolCallContent:
@@ -72,15 +98,39 @@ class ToolCallContent:
             id=data["id"],
             name=data["name"],
             input=data.get("input", {}),
+            metadata=data.get("metadata"),
         )
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict for orjson serialization."""
-        return {
+        result: dict[str, Any] = {
             "type": self.type,
             "id": self.id,
             "name": self.name,
             "input": self.input,
+        }
+        if self.metadata is not None:
+            result["metadata"] = self.metadata
+        return result
+
+
+@dataclass(kw_only=True, slots=True)
+class ArtifactEventContent:
+    """Artifact operation surfaced by agent runtimes."""
+
+    op: ArtifactEventOp
+    artifact: dict[str, Any]
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ArtifactEventContent:
+        """Construct from dict (orjson parsed)."""
+        return cls(op=data["op"], artifact=data["artifact"])
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dict for orjson serialization."""
+        return {
+            "op": self.op,
+            "artifact": self.artifact,
         }
 
 
@@ -105,9 +155,13 @@ class UnifiedStreamEvent:
     tool_output: Any | None = None
     is_error: bool = False
     error: str | None = None
+    metadata: dict[str, Any] | None = None
 
     # For APPROVAL_REQUEST events
     approval_items: list[ToolCallContent] | None = None
+
+    # For ARTIFACT events
+    artifact_data: ArtifactEventContent | None = None
 
     timestamp: datetime = field(default_factory=datetime.now)
 
@@ -119,6 +173,9 @@ class UnifiedStreamEvent:
             approval_items = [
                 ToolCallContent.from_dict(item) for item in data["approval_items"]
             ]
+        artifact_data = None
+        if data.get("artifact_data"):
+            artifact_data = ArtifactEventContent.from_dict(data["artifact_data"])
 
         timestamp = data.get("timestamp")
         if isinstance(timestamp, str):
@@ -137,7 +194,9 @@ class UnifiedStreamEvent:
             tool_output=data.get("tool_output"),
             is_error=data.get("is_error", False),
             error=data.get("error"),
+            metadata=data.get("metadata"),
             approval_items=approval_items,
+            artifact_data=artifact_data,
             timestamp=timestamp,
         )
 
@@ -165,8 +224,12 @@ class UnifiedStreamEvent:
             result["is_error"] = self.is_error
         if self.error is not None:
             result["error"] = self.error
+        if self.metadata is not None:
+            result["metadata"] = self.metadata
         if self.approval_items is not None:
             result["approval_items"] = [item.to_dict() for item in self.approval_items]
+        if self.artifact_data is not None:
+            result["artifact_data"] = self.artifact_data.to_dict()
         return result
 
     @classmethod
@@ -178,6 +241,22 @@ class UnifiedStreamEvent:
     def user_message_event(cls, content: str) -> UnifiedStreamEvent:
         """Factory method for creating user message events."""
         return cls(type=StreamEventType.USER_MESSAGE, text=content)
+
+    @classmethod
+    def compaction_event(
+        cls,
+        *,
+        phase: Literal["started", "completed", "failed"],
+        metadata: dict[str, Any] | None = None,
+    ) -> UnifiedStreamEvent:
+        """Factory method for creating compaction status events."""
+        event_metadata: dict[str, Any] = {"phase": phase}
+        if metadata:
+            event_metadata.update(metadata)
+        return cls(
+            type=StreamEventType.COMPACTION,
+            metadata=event_metadata,
+        )
 
     @classmethod
     def tool_result_event(
@@ -194,4 +273,17 @@ class UnifiedStreamEvent:
             tool_name=tool_name,
             tool_output=output,
             is_error=is_error,
+        )
+
+    @classmethod
+    def artifact_event(
+        cls,
+        *,
+        op: ArtifactEventOp,
+        artifact: dict[str, Any],
+    ) -> UnifiedStreamEvent:
+        """Factory method for creating artifact stream events."""
+        return cls(
+            type=StreamEventType.ARTIFACT,
+            artifact_data=ArtifactEventContent(op=op, artifact=artifact),
         )

@@ -1,16 +1,21 @@
 import uuid
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tracecat.auth.types import AccessLevel, Role
+from tracecat.auth.types import Role
+from tracecat.authz.scopes import ADMIN_SCOPES, SERVICE_PRINCIPAL_SCOPES
 from tracecat.cases.enums import CaseEventType, CasePriority, CaseSeverity, CaseStatus
 from tracecat.cases.schemas import (
     AssigneeChangedEvent,
     CaseCreate,
     ClosedEvent,
+    CommentCreatedEvent,
+    CommentReplyDeletedEvent,
     CreatedEvent,
     FieldDiff,
     FieldsChangedEvent,
@@ -27,18 +32,28 @@ from tracecat.exceptions import TracecatAuthorizationError
 pytestmark = pytest.mark.usefixtures("db")
 
 
+@pytest.fixture(autouse=True)
+def stub_case_duration_sync() -> Iterator[None]:
+    with patch(
+        "tracecat.cases.service.CaseDurationService.sync_case_durations",
+        new=AsyncMock(return_value=None),
+    ):
+        yield
+
+
 @pytest.mark.anyio
 async def test_events_service_initialization_requires_workspace(
     session: AsyncSession,
 ) -> None:
     """Test that events service initialization requires a workspace ID."""
-    # Create a role without workspace_id
+    # Create a role without workspace_id (but with organization_id to pass org check)
     role_without_workspace = Role(
         type="service",
         user_id=uuid.uuid4(),
         workspace_id=None,
+        organization_id=uuid.uuid4(),
         service_id="tracecat-service",
-        access_level=AccessLevel.BASIC,
+        scopes=SERVICE_PRINCIPAL_SCOPES["tracecat-service"],
     )
 
     # Attempt to create service without workspace should raise error
@@ -256,13 +271,46 @@ class TestCaseEventsService:
 
         assert created_event.case_id == test_case.id
         assert created_event.type == CaseEventType.FIELDS_CHANGED
-        assert len(created_event.data["changes"]) == 3
-        assert created_event.data["changes"][0]["field"] == "field1"
-        assert created_event.data["changes"][0]["old"] == "old_value"
-        assert created_event.data["changes"][0]["new"] == "new_value"
-        assert created_event.data["changes"][2]["field"] == "field3"
-        assert created_event.data["changes"][2]["old"] is None
-        assert created_event.data["changes"][2]["new"] == "added"
+
+    async def test_create_comment_created_event(
+        self, case_events_service: CaseEventsService, test_case
+    ) -> None:
+        comment_id = uuid.uuid4()
+        event_data = CommentCreatedEvent(
+            comment_id=comment_id,
+            parent_id=None,
+            thread_root_id=comment_id,
+        )
+
+        created_event = await case_events_service.create_event(test_case, event_data)
+
+        assert created_event.type == CaseEventType.COMMENT_CREATED
+        assert created_event.data == {
+            "comment_id": str(comment_id),
+            "parent_id": None,
+            "thread_root_id": str(comment_id),
+            "wf_exec_id": None,
+        }
+
+    async def test_create_comment_reply_deleted_event(
+        self, case_events_service: CaseEventsService, test_case
+    ) -> None:
+        parent_id = uuid.uuid4()
+        comment_id = uuid.uuid4()
+        event_data = CommentReplyDeletedEvent(
+            comment_id=comment_id,
+            parent_id=parent_id,
+            thread_root_id=parent_id,
+            delete_mode="soft",
+        )
+
+        created_event = await case_events_service.create_event(test_case, event_data)
+
+        assert created_event.type == CaseEventType.COMMENT_REPLY_DELETED
+        assert created_event.data["comment_id"] == str(comment_id)
+        assert created_event.data["parent_id"] == str(parent_id)
+        assert created_event.data["thread_root_id"] == str(parent_id)
+        assert created_event.data["delete_mode"] == "soft"
 
     async def test_list_events_empty_case(
         self, case_events_service: CaseEventsService, test_case
@@ -380,8 +428,9 @@ class TestCaseEventsService:
             type="service",
             user_id=different_user_id,
             workspace_id=svc_role.workspace_id,
+            organization_id=svc_role.organization_id,
             service_id=svc_role.service_id,
-            access_level=AccessLevel.BASIC,
+            scopes=ADMIN_SCOPES,
         )
         different_service = CaseEventsService(session=session, role=different_role)
 

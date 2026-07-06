@@ -13,6 +13,9 @@ from temporalio.exceptions import ActivityError
 from tracecat.auth.types import Role
 from tracecat.dsl.action import ScatterActionInput
 
+_SCHEDULER_TASK_SPAWN_YIELD_EVERY = 16
+"""Yield while spawning ready task coroutines to avoid long workflow activations."""
+
 with workflow.unsafe.imports_passed_through():
     from pydantic_core import to_json
     from temporalio.exceptions import ApplicationError
@@ -30,6 +33,7 @@ with workflow.unsafe.imports_passed_through():
         DSLInput,
         edge_components_from_dep,
     )
+    from tracecat.dsl.constants import MAX_DO_WHILE_ITERATIONS
     from tracecat.dsl.enums import (
         EdgeMarker,
         EdgeType,
@@ -44,6 +48,7 @@ with workflow.unsafe.imports_passed_through():
         ActionStatement,
         ExecutionContext,
         GatherArgs,
+        LoopEndArgs,
         RunContext,
         ScatterArgs,
         StreamID,
@@ -55,10 +60,10 @@ with workflow.unsafe.imports_passed_through():
         Task,
         TaskExceptionInfo,
     )
+    from tracecat.dsl.workflow_logging import WorkflowRuntimeLogger, workflow_logger
     from tracecat.exceptions import TaskUnreachable
     from tracecat.expressions.common import ExprContext
     from tracecat.expressions.core import extract_expressions
-    from tracecat.logger import logger
     from tracecat.storage.object import (
         CollectionObject,
         InlineObject,
@@ -101,6 +106,24 @@ class DSLEdge:
         return f"{self.src}-[{self.type.value}]->{self.dst} ({self.stream_id})"
 
 
+@dataclass(frozen=True, slots=True)
+class LoopRegion:
+    """Resolved metadata for one do-while loop region."""
+
+    start_ref: str
+    end_ref: str
+    scope_ref: str
+    members: frozenset[str]
+
+
+class PlatformExecutionError(Exception):
+    """Marks platform work that should fail the workflow, even inside a stream."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
 class DSLScheduler:
     """Manage only scheduling and control flow of tasks in a topological-like order."""
 
@@ -109,19 +132,24 @@ class DSLScheduler:
         *,
         executor: Callable[[ActionStatement], Awaitable[Any]],
         dsl: DSLInput,
+        max_pending_tasks: int,
         skip_strategy: SkipStrategy = SkipStrategy.PROPAGATE,
         context: ExecutionContext,
         role: Role,
         run_context: RunContext,
+        logger: WorkflowRuntimeLogger | None = None,
     ):
         # Static
         self.dsl = dsl
         self.executor = executor
+        if max_pending_tasks < 1:
+            raise ValueError("max_pending_tasks must be greater than 0")
+        self.max_pending_tasks = max_pending_tasks
         self.skip_strategy = skip_strategy
         self.role = role
         self.run_context = run_context
-        # self.logger = ctx_logger.get(logger).bind(unit="dsl-scheduler")
-        self.logger = logger
+        # Workflow-safe logger by default; callers can inject a pre-bound instance.
+        self.logger = logger or workflow_logger
         self.tasks: dict[str, ActionStatement] = {}
         """Task definitions"""
 
@@ -158,6 +186,19 @@ class DSLScheduler:
         }
         """Adjacency list of task dependencies (sorted for determinism)"""
 
+        control_adj = dsl._to_adjacency()
+        (
+            self.action_scopes,
+            self.scope_hierarchy,
+            _scope_openers,
+        ) = dsl._assign_action_scopes(control_adj)
+        self.loop_regions = self._build_loop_regions()
+        self.loop_regions_by_end = {
+            region.end_ref: region for region in self.loop_regions.values()
+        }
+        self.loop_indices: dict[tuple[str, StreamID], int] = {}
+        self.loop_start_skips: set[tuple[str, StreamID]] = set()
+
         # Scope management
         self._root_context = context
         """Points to the worklfow roots stream context"""
@@ -176,12 +217,188 @@ class DSLScheduler:
             adj=self.adj,
             indegrees=self.indegrees,
             task_count=len(self.tasks),
+            max_pending_tasks=self.max_pending_tasks,
         )
 
     @staticmethod
     def _adj_sort_key(adj: AdjDst) -> tuple[str, str]:
         dst_ref, edge_type = adj
         return dst_ref, edge_type.value
+
+    def _build_loop_regions(self) -> dict[str, LoopRegion]:
+        # Phase 1: validate each loop.end and map loop scope -> end ref.
+        loop_end_by_scope: dict[str, str] = {}
+        for stmt in self.dsl.actions:
+            if stmt.action != PlatformAction.LOOP_END:
+                continue
+            if not stmt.depends_on:
+                raise RuntimeError(
+                    f"Loop end action {stmt.ref!r} must depend on loop body actions"
+                )
+
+            dep_scopes = {
+                self.action_scopes[edge_components_from_dep(dep_ref)[0]]
+                for dep_ref in stmt.depends_on
+            }
+            if len(dep_scopes) != 1:
+                raise RuntimeError(
+                    f"Loop end action {stmt.ref!r} must close exactly one loop scope"
+                )
+            loop_scope = next(iter(dep_scopes))
+            loop_start_stmt = self.tasks.get(loop_scope)
+            if (
+                loop_start_stmt is None
+                or loop_start_stmt.action != PlatformAction.LOOP_START
+            ):
+                raise RuntimeError(
+                    f"Loop end action {stmt.ref!r} does not match a loop start action"
+                )
+            if loop_scope in loop_end_by_scope:
+                raise RuntimeError(
+                    f"Loop start action {loop_scope!r} has multiple loop end actions"
+                )
+            loop_end_by_scope[loop_scope] = stmt.ref
+
+        # Phase 2: assign membership in a single pass over all actions. Walk each
+        # action's scope chain upward once; every loop scope on the chain claims
+        # the action. O(actions x depth) total, vs O(loops x actions x depth)
+        # from re-walking the chain per loop.
+        members_by_scope: dict[str, set[str]] = {
+            scope: set() for scope in loop_end_by_scope
+        }
+        for ref, scope in self.action_scopes.items():
+            curr_scope: str | None = scope
+            while curr_scope is not None:
+                if (members := members_by_scope.get(curr_scope)) is not None:
+                    members.add(ref)
+                curr_scope = self.scope_hierarchy.get(curr_scope)
+
+        return {
+            loop_scope: LoopRegion(
+                start_ref=loop_scope,
+                end_ref=end_ref,
+                scope_ref=loop_scope,
+                # The end ref's own scope is the parent (it closes the loop scope),
+                # so it never appears in members_by_scope via the walk above.
+                members=frozenset(members_by_scope[loop_scope] | {end_ref}),
+            )
+            for loop_scope, end_ref in loop_end_by_scope.items()
+        }
+
+    @staticmethod
+    def _stream_within(stream_id: StreamID, base_stream_id: StreamID) -> bool:
+        return stream_id == base_stream_id or str(stream_id).startswith(
+            f"{base_stream_id}/"
+        )
+
+    def _cleanup_loop_descendant_streams(
+        self, region: LoopRegion, stream_id: StreamID
+    ) -> None:
+        streams_to_remove: set[StreamID] = set()
+        for task_key, scoped_streams in self.task_streams.items():
+            if task_key.ref not in region.members or not self._stream_within(
+                task_key.stream_id, stream_id
+            ):
+                continue
+            streams_to_remove.update(scoped_streams)
+
+        if not streams_to_remove:
+            return
+
+        # Include recursively nested streams created under loop-internal scatters.
+        changed = True
+        while changed:
+            changed = False
+            for candidate, parent in self.stream_hierarchy.items():
+                if parent in streams_to_remove and candidate not in streams_to_remove:
+                    streams_to_remove.add(candidate)
+                    changed = True
+
+        for stream in streams_to_remove:
+            self.streams.pop(stream, None)
+            self.stream_hierarchy.pop(stream, None)
+            self.stream_exceptions.pop(stream, None)
+
+        self.completed_tasks = {
+            task
+            for task in self.completed_tasks
+            if task.stream_id not in streams_to_remove
+        }
+        self.indegrees = {
+            task: indegree
+            for task, indegree in self.indegrees.items()
+            if task.stream_id not in streams_to_remove
+        }
+        self.edges = defaultdict(
+            lambda: EdgeMarker.PENDING,
+            {
+                edge: marker
+                for edge, marker in self.edges.items()
+                if edge.stream_id not in streams_to_remove
+            },
+        )
+        self.task_streams = defaultdict(
+            list,
+            {
+                task: streams
+                for task, streams in self.task_streams.items()
+                if task.stream_id not in streams_to_remove
+            },
+        )
+        self.open_streams = {
+            task: n_open
+            for task, n_open in self.open_streams.items()
+            if task.stream_id not in streams_to_remove
+        }
+
+    def _reset_loop_iteration_state(
+        self, region: LoopRegion, stream_id: StreamID
+    ) -> None:
+        # NOTE(loop semantics):
+        # We only reset scheduler bookkeeping (edges/indegrees/completions/streams) to
+        # allow another pass through the loop region. We intentionally DO NOT clear the
+        # loop-region action context. Results are overwritten when an action runs again;
+        # if an action is skipped this iteration, its prior value is retained.
+        self._cleanup_loop_descendant_streams(region, stream_id)
+
+        for task_key in list(self.task_streams.keys()):
+            if task_key.ref in region.members and task_key.stream_id == stream_id:
+                self.task_streams.pop(task_key, None)
+        for task_key in list(self.open_streams.keys()):
+            if task_key.ref in region.members and task_key.stream_id == stream_id:
+                self.open_streams.pop(task_key, None)
+
+        # Reset edge markers within the loop region for this stream.
+        for edge in list(self.edges.keys()):
+            if (
+                edge.stream_id == stream_id
+                and edge.src in region.members
+                and edge.dst in region.members
+            ):
+                self.edges[edge] = EdgeMarker.PENDING
+
+        # Reset indegrees for loop tasks so they can be scheduled again.
+        for ref in region.members:
+            task_key = Task(ref=ref, stream_id=stream_id)
+            self.completed_tasks.discard(task_key)
+            stmt = self.tasks.get(ref)
+            if stmt is None:
+                continue
+
+            internal_deps = 0
+            for dep_ref in stmt.depends_on:
+                source_ref, _ = self._get_edge_components(dep_ref)
+                if source_ref in region.members:
+                    internal_deps += 1
+            self.indegrees[task_key] = internal_deps
+
+        # Reset nested loop indices within this loop scope.
+        for loop_key in list(self.loop_indices.keys()):
+            loop_start_ref, loop_stream = loop_key
+            if loop_start_ref in region.members and self._stream_within(
+                loop_stream, stream_id
+            ):
+                self.loop_indices.pop(loop_key, None)
 
     @property
     def workspace_id(self) -> str:
@@ -196,7 +413,9 @@ class DSLScheduler:
     def __repr__(self) -> str:
         return to_json(self.__dict__, fallback=str, indent=2).decode()
 
-    async def _handle_error_path(self, task: Task, exc: Exception) -> None:
+    async def _handle_error_path(
+        self, task: Task, exc: Exception, *, fail_workflow: bool = False
+    ) -> None:
         ref = task.ref
 
         self.logger.info(
@@ -211,10 +430,17 @@ class DSLScheduler:
             for dst, edge_type in self.adj[ref]
             if edge_type != EdgeType.ERROR
         }
-        if len(non_err_edges) < len(self.adj[ref]):
+        if len(non_err_edges) < len(self.adj[ref]) and not fail_workflow:
             await self._queue_tasks(task, unreachable=non_err_edges)
         else:
-            self.logger.info("Task failed with no error paths", task=task)
+            if fail_workflow:
+                self.logger.warning(
+                    "Task failed with platform error, bypassing stream handling",
+                    task=task,
+                    error=exc,
+                )
+            else:
+                self.logger.info("Task failed with no error paths", task=task)
             # XXX: This can sometimes return null because the exception isn't an ApplicationError
             # But rather a ChildWorkflowError or CancelledError
             if isinstance(exc, ApplicationError) and exc.details:
@@ -329,10 +555,8 @@ class DSLScheduler:
                     type=exc.__class__.__name__,
                     stream_id=task.stream_id,
                 )
-            if task.stream_id == ROOT_STREAM:
-                self.logger.debug(
-                    "Setting task exception in root stream", task=task, details=details
-                )
+            if task.stream_id == ROOT_STREAM or fail_workflow:
+                self.logger.debug("Setting task exception", task=task, details=details)
                 self.task_exceptions[ref] = TaskExceptionInfo(
                     exception=exc, details=details
                 )
@@ -367,6 +591,12 @@ class DSLScheduler:
     async def _handle_skip_path(self, task: Task, stmt: ActionStatement) -> None:
         ref = task.ref
         self.logger.debug("Handling skip path")
+
+        if stmt.action == PlatformAction.LOOP_START:
+            return await self._handle_loop_start(task, stmt, is_skipping=True)
+
+        if stmt.action == PlatformAction.LOOP_END:
+            return await self._handle_loop_end(task, stmt, is_skipping=True)
 
         if stmt.action == PlatformAction.TRANSFORM_SCATTER:
             return await self._handle_scatter(task, stmt, is_skipping=True)
@@ -449,7 +679,21 @@ class DSLScheduler:
             ctx_stream_id.reset(token)
 
     async def _schedule_task(self, task: Task) -> None:
-        """Schedule a task for execution."""
+        """Schedule a task for execution.
+
+        Notes:
+            We evaluate ``run_if`` before the reachability check when possible so a
+            branch-local guard can self-skip before a mixed visited/skipped parent
+            set is treated as unreachable.
+
+            This early evaluation must be defensive. A ``run_if`` expression can
+            reference context that is not populated yet, such as a skipped or
+            otherwise unavailable upstream result. In that case ``_task_should_skip``
+            raises ``ApplicationError``. We defer that error until after the
+            reachability check so we do not replace a genuine ``TaskUnreachable``
+            outcome with a premature expression failure for a task that was never
+            runnable.
+        """
         ref = task.ref
         stmt = self.tasks[ref]
         self.logger.debug("Scheduling task", task=task)
@@ -460,30 +704,45 @@ class DSLScheduler:
         try:
             # 1) Skip propagation (force-skip) takes highest precedence over everything else
             if self._skip_should_propagate(task, stmt):
-                self.logger.info("Task should be force-skipped, propagating", task=task)
+                self.logger.debug(
+                    "Task should be force-skipped, propagating", task=task
+                )
                 return await self._handle_skip_path(task, stmt)
 
-            # 2) Then we check if the task is reachable
+            # 2) Evaluate `run_if` early when possible so branch-local guards can
+            # self-skip before mixed visited/skipped parents are treated as unreachable.
+            run_if_error: ApplicationError | None = None
+            if stmt.run_if is not None:
+                try:
+                    if await self._task_should_skip(task, stmt):
+                        self.logger.debug("Task should self-skip", task=task)
+                        return await self._handle_skip_path(task, stmt)
+                except ApplicationError as e:
+                    run_if_error = e
+
+            # 3) Then we check if the task is reachable
             if not self._is_reachable(task, stmt):
-                self.logger.info("Task cannot proceed, unreachable", task=task)
+                self.logger.debug("Task cannot proceed, unreachable", task=task)
                 raise TaskUnreachable(f"Task {task} is unreachable")
 
-            # 3) Check if the task should self-skip based on its `run_if` condition
-            if await self._task_should_skip(task, stmt):
-                self.logger.info("Task should self-skip", task=task)
-                return await self._handle_skip_path(task, stmt)
+            if run_if_error is not None:
+                raise run_if_error
 
             # 4) If we made it here, the task is reachable and not force-skipped.
 
             # Respect the task delay if it exists. We need this to stagger tasks for scatter.
             if original_delay > 0:
-                self.logger.info(
+                self.logger.debug(
                     "Task has delay, sleeping", task=task, delay=original_delay
                 )
                 await asyncio.sleep(original_delay)
 
             # -- If this is a control flow action (scatter), we need to
             # handle it differently.
+            if stmt.action == PlatformAction.LOOP_START:
+                return await self._handle_loop_start(task, stmt)
+            if stmt.action == PlatformAction.LOOP_END:
+                return await self._handle_loop_end(task, stmt)
             if stmt.action == PlatformAction.TRANSFORM_SCATTER:
                 return await self._handle_scatter(task, stmt)
             # 0) Always handle gather first - its a synchronization barrier that needs
@@ -499,15 +758,20 @@ class DSLScheduler:
             # NOTE: Moved this here to handle single success path
             await self._handle_success_path(task)
         except Exception as e:
+            exc = e.error if isinstance(e, PlatformExecutionError) else e
+            fail_workflow = isinstance(e, PlatformExecutionError)
             kind = e.__class__.__name__
-            non_retryable = getattr(e, "non_retryable", True)
+            non_retryable = getattr(exc, "non_retryable", True)
             self.logger.warning(
-                f"{kind} in DSLScheduler", ref=ref, error=e, non_retryable=non_retryable
+                f"{kind} in DSLScheduler",
+                ref=ref,
+                error=exc,
+                non_retryable=non_retryable,
             )
-            await self._handle_error_path(task, e)
+            await self._handle_error_path(task, exc, fail_workflow=fail_workflow)
         finally:
             # 5) Regardless of the outcome, the task is now complete
-            self.logger.info("Task completed", task=task)
+            self.logger.debug("Task completed", task=task)
             self.completed_tasks.add(task)
 
     async def start(self) -> dict[str, TaskExceptionInfo] | None:
@@ -520,6 +784,10 @@ class DSLScheduler:
 
         pending_tasks: set[asyncio.Task[None]] = set()
 
+        def discard_done_tasks() -> None:
+            done_tasks = {task for task in pending_tasks if task.done()}
+            pending_tasks.difference_update(done_tasks)
+
         while not self.task_exceptions and (not self.queue.empty() or pending_tasks):
             self.logger.trace(
                 "Waiting for tasks",
@@ -528,14 +796,36 @@ class DSLScheduler:
             )
 
             # Clean up completed tasks
-            done_tasks = {t for t in pending_tasks if t.done()}
-            pending_tasks.difference_update(done_tasks)
+            discard_done_tasks()
 
-            if not self.queue.empty():
+            spawned_since_yield = 0
+            while (
+                not self.task_exceptions
+                and not self.queue.empty()
+                and len(pending_tasks) < self.max_pending_tasks
+            ):
                 task_instance = await self.queue.get()
                 self.logger.debug("Scheduling task", task=task_instance)
                 task = asyncio.create_task(self._schedule_task(task_instance))
                 pending_tasks.add(task)
+                spawned_since_yield += 1
+                if spawned_since_yield % _SCHEDULER_TASK_SPAWN_YIELD_EVERY == 0:
+                    # High-fanout scatters can enqueue many ready tasks at once.
+                    # Checkpoint while spawning them so workflow activations do not
+                    # monopolize the event loop long enough to trip Temporal's
+                    # deadlock detector.
+                    await asyncio.sleep(0)
+                    discard_done_tasks()
+            if self.task_exceptions:
+                break
+            if not self.queue.empty() and len(pending_tasks) >= self.max_pending_tasks:
+                self.logger.debug(
+                    "Scheduler throttled by max pending task cap",
+                    pending_tasks=len(pending_tasks),
+                    max_pending_tasks=self.max_pending_tasks,
+                    queue_size=self.queue.qsize(),
+                )
+                await workflow.wait(pending_tasks, return_when=asyncio.FIRST_COMPLETED)
             elif pending_tasks:
                 # Wait for at least one pending task to complete
                 await workflow.wait(pending_tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -583,13 +873,13 @@ class DSLScheduler:
             ValueError: If the join strategy is invalid
         """
 
-        logger.debug("Check task reachability", task=task, marked_edges=self.edges)
+        self.logger.debug("Check task reachability", task=task, marked_edges=self.edges)
         n_deps = len(stmt.depends_on)
         if n_deps == 0:
             # Root nodes are always reachable
             return True
         elif n_deps == 1:
-            logger.debug("Task has only 1 dependency", task=task)
+            self.logger.debug("Task has only 1 dependency", task=task)
             # If there's only 1 dependency, the node is reachable only if the
             # dependency was successful ignoring the join strategy.
             dep_ref = stmt.depends_on[0]
@@ -642,7 +932,7 @@ class DSLScheduler:
         )
 
     def _mark_edge(self, edge: DSLEdge, marker: EdgeMarker) -> None:
-        logger.debug("Marking edge", edge=edge, marker=marker)
+        self.logger.debug("Marking edge", edge=edge, marker=marker)
         self.edges[edge] = marker
 
     def _skip_should_propagate(self, task: Task, stmt: ActionStatement) -> bool:
@@ -684,7 +974,7 @@ class DSLScheduler:
                 ) from e
 
             if not bool(expr_result):
-                self.logger.info("Task `run_if` condition was not met, skipped")
+                self.logger.debug("Task `run_if` condition was not met, skipped")
                 return True
         return False
 
@@ -719,6 +1009,106 @@ class DSLScheduler:
         self.logger.debug("Queueing skip stream", skip_task=skip_task)
         # Acknowledge the new scope
         return await self._queue_tasks(skip_task, unreachable=all_next)
+
+    async def _handle_loop_start(
+        self, task: Task, stmt: ActionStatement, *, is_skipping: bool = False
+    ) -> None:
+        self.logger.debug("Handling loop start", task=task, is_skipping=is_skipping)
+        loop_key = (task.ref, task.stream_id)
+        if is_skipping:
+            # If skip reaches loop_start, treat start->end as one skipped unit.
+            self.loop_start_skips.add(loop_key)
+            unreachable = {
+                DSLEdge(src=task.ref, dst=dst, type=edge_type, stream_id=task.stream_id)
+                for dst, edge_type in self.adj[task.ref]
+            }
+            await self._queue_tasks(task, unreachable=unreachable)
+            return
+
+        self.loop_start_skips.discard(loop_key)
+        index = self.loop_indices.get(loop_key, 0)
+        action_context = self._get_action_context(task.stream_id)
+        action_context[task.ref] = TaskResult.from_result({"iteration": index})
+        await self._execute(task, stmt)
+        await self._handle_success_path(task)
+
+    async def _handle_loop_end(
+        self, task: Task, stmt: ActionStatement, *, is_skipping: bool = False
+    ) -> None:
+        self.logger.debug("Handling loop end", task=task, is_skipping=is_skipping)
+        if task.ref not in self.loop_regions_by_end:
+            raise RuntimeError(f"Unknown loop end action: {task.ref!r}")
+
+        region = self.loop_regions_by_end[task.ref]
+        raw_max_iterations = stmt.args.get("max_iterations", 100)
+        if (
+            isinstance(raw_max_iterations, int)
+            and raw_max_iterations > MAX_DO_WHILE_ITERATIONS
+        ):
+            raise ApplicationError(
+                (
+                    "Loop max_iterations exceeds platform cap: "
+                    f"{raw_max_iterations} > {MAX_DO_WHILE_ITERATIONS}."
+                ),
+                non_retryable=True,
+            )
+        args = LoopEndArgs(**stmt.args)
+        loop_key = (region.start_ref, task.stream_id)
+        current_index = self.loop_indices.get(loop_key, 0)
+        # Skip semantics:
+        # - skip reached loop_start => skip the whole loop unit (start->end)
+        # - skip originated inside loop body => stop skipping at loop_end
+        skip_propagated_from_loop_start = (
+            is_skipping and loop_key in self.loop_start_skips
+        )
+        if skip_propagated_from_loop_start:
+            self.loop_start_skips.discard(loop_key)
+
+        if is_skipping:
+            should_continue = False
+        else:
+            context = self.build_stream_aware_context(stmt, task.stream_id)
+            try:
+                expr_result = await self.resolve_expression(args.condition, context)
+            except Exception as e:
+                raise ApplicationError(
+                    f"Error evaluating `condition` in `core.loop.end`: {e}",
+                    non_retryable=True,
+                ) from e
+            should_continue = bool(expr_result)
+
+        action_context = self._get_action_context(task.stream_id)
+        action_context[task.ref] = TaskResult.from_result({"continue": should_continue})
+
+        if not is_skipping:
+            await self._execute(task, stmt)
+
+        if should_continue:
+            next_index = current_index + 1
+            if next_index >= args.max_iterations:
+                raise ApplicationError(
+                    (
+                        f"Loop '{task.ref}' exceeded max_iterations={args.max_iterations}. "
+                        "Update `condition` or increase `max_iterations`."
+                    ),
+                    non_retryable=True,
+                )
+            self._reset_loop_iteration_state(region, task.stream_id)
+            self.loop_indices[loop_key] = next_index
+            await self.queue.put(Task(ref=region.start_ref, stream_id=task.stream_id))
+            return
+
+        self.loop_indices.pop(loop_key, None)
+        if skip_propagated_from_loop_start:
+            # A loop-start skip means the current iteration is being bypassed; mark every
+            # outgoing edge from this task unreachable so skip semantics propagate downstream.
+            all_edges = {
+                DSLEdge(src=task.ref, dst=dst, type=edge_type, stream_id=task.stream_id)
+                for dst, edge_type in self.adj[task.ref]
+            }
+            await self._queue_tasks(task, unreachable=all_edges)
+            return
+        await self._handle_success_path(task)
 
     async def _handle_scatter(
         self, task: Task, stmt: ActionStatement, *, is_skipping: bool = False
@@ -881,7 +1271,7 @@ class DSLScheduler:
                 gather_ref,
             )
         else:
-            self.logger.info(
+            self.logger.debug(
                 "The execution stream is complete but the gather isn't.",
                 task=task,
                 remaining_open_streams=self.open_streams[parent_scatter],
@@ -1010,7 +1400,7 @@ class DSLScheduler:
                 self.logger.debug("Default gather path", stream_id=stream_id)
                 parent_stream_id = self._get_parent_stream_id_safe(task, stream_id)
             case _:
-                self.logger.info("Invalid gather state", task=task)
+                self.logger.warning("Invalid gather state", task=task)
                 raise ApplicationError("Invalid gather state")
         # =============
         # We only reach this point if we are in an execution stream.

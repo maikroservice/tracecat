@@ -1,4 +1,4 @@
-import type { Node } from "@xyflow/react"
+import { type Node, useNodes } from "@xyflow/react"
 import { Search } from "lucide-react"
 import React, { useEffect } from "react"
 import type { WorkflowRead } from "@/client"
@@ -10,13 +10,19 @@ import { TriggerPanel } from "@/components/builder/panel/trigger-panel"
 import { WorkflowPanel } from "@/components/builder/panel/workflow-panel"
 import { FormLoading } from "@/components/loading/form"
 import { AlertNotification } from "@/components/notifications"
+import { useGraph } from "@/lib/hooks"
 import { useWorkflowBuilder } from "@/providers/builder"
 import { useWorkflow } from "@/providers/workflow"
 
 export const BuilderPanel = React.forwardRef<ActionPanelRef, object>(() => {
-  const { selectedNodeId, getNode } = useWorkflowBuilder()
-  const { workflow, isLoading, error } = useWorkflow()
-  const selectedNode = getNode(selectedNodeId ?? "")
+  const { selectedNodeId } = useWorkflowBuilder()
+  const { workflow, isLoading, error, workspaceId, workflowId } = useWorkflow()
+  const { isLoading: graphIsLoading, error: graphError } = useGraph(
+    workspaceId,
+    workflowId ?? ""
+  )
+  const nodes = useNodes()
+  const selectedNode = nodes.find((node) => node.id === selectedNodeId)
 
   useEffect(() => {
     if (workflow) {
@@ -34,7 +40,24 @@ export const BuilderPanel = React.forwardRef<ActionPanelRef, object>(() => {
       </div>
     )
   }
-  if (selectedNodeId && !selectedNode) {
+  if (selectedNodeId && nodes.length === 0) {
+    if (graphError) {
+      return (
+        <div className="flex size-full items-center justify-center">
+          <AlertNotification level="error" message={graphError.message} />
+        </div>
+      )
+    }
+    if (!graphIsLoading) {
+      return (
+        <div className="size-full overflow-auto">
+          <WorkflowPanel workflow={workflow} />
+        </div>
+      )
+    }
+    return <FormLoading />
+  }
+  if (selectedNodeId && nodes.length > 0 && !selectedNode) {
     return (
       <div className="flex size-full flex-col items-center justify-center">
         <div className="flex max-w-[50%] flex-col items-center gap-6 p-8 text-center">

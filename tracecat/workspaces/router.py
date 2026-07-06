@@ -9,22 +9,27 @@ from fastapi import (
 from sqlalchemy.exc import IntegrityError, NoResultFound
 
 from tracecat.auth.credentials import RoleACL
-from tracecat.auth.types import AccessLevel, Role
-from tracecat.authz.enums import WorkspaceRole
+from tracecat.auth.dependencies import OrgActorRole
+from tracecat.auth.types import Role
+from tracecat.authz.controls import require_scope
 from tracecat.authz.service import MembershipService
 from tracecat.db.dependencies import AsyncDBSession
 from tracecat.exceptions import (
     TracecatAuthorizationError,
     TracecatManagementError,
+    TracecatNotFoundError,
+    TracecatValidationError,
 )
-from tracecat.identifiers import UserID, WorkspaceID
+from tracecat.identifiers import InvitationID, UserID, WorkspaceID
 from tracecat.logger import logger
 from tracecat.workspaces.schemas import (
     WorkspaceCreate,
+    WorkspaceInvitationCreate,
+    WorkspaceInvitationList,
+    WorkspaceInvitationRead,
     WorkspaceMember,
     WorkspaceMembershipCreate,
     WorkspaceMembershipRead,
-    WorkspaceMembershipUpdate,
     WorkspaceRead,
     WorkspaceReadMinimal,
     WorkspaceSearch,
@@ -35,40 +40,14 @@ from tracecat.workspaces.service import WorkspaceService
 
 router = APIRouter(prefix="/workspaces", tags=["workspaces"])
 
-OrgUser = Annotated[
-    Role,
-    RoleACL(
-        allow_user=True,
-        allow_service=False,
-        require_workspace="no",
-    ),
-]
-OrgAdminUser = Annotated[
-    Role,
-    RoleACL(
-        allow_user=True,
-        allow_service=False,
-        require_workspace="no",
-        min_access_level=AccessLevel.ADMIN,
-    ),
-]
+# Workspace role types for path-based workspace access
 WorkspaceUserInPath = Annotated[
     Role,
     RoleACL(
         allow_user=True,
         allow_service=False,
+        allow_api_key=True,
         require_workspace="yes",
-        require_workspace_roles=[WorkspaceRole.EDITOR, WorkspaceRole.ADMIN],
-        workspace_id_in_path=True,
-    ),
-]
-WorkspaceAdminUserInPath = Annotated[
-    Role,
-    RoleACL(
-        allow_user=True,
-        allow_service=False,
-        require_workspace="yes",
-        require_workspace_roles=WorkspaceRole.ADMIN,
         workspace_id_in_path=True,
     ),
 ]
@@ -76,50 +55,54 @@ WorkspaceAdminUserInPath = Annotated[
 
 
 @router.get("")
+@require_scope("org:read", "org:workspace:read", "workspace:read", require_all=False)
 async def list_workspaces(
     *,
-    role: OrgUser,
+    role: OrgActorRole,
     session: AsyncDBSession,
 ) -> list[WorkspaceReadMinimal]:
-    """List workspaces.
+    """List workspaces the user has access to.
 
-    Access Level
-    ------------
-    - Basic: Can list workspaces where they are a member.
-    - Admin: Can list all workspaces regardless of membership.
+    Access
+    ------
+    - Org owners/admins (have `org:workspace:read` scope): See all workspaces in the org.
+    - Org members (have `org:read` scope): See only workspaces where they are a member.
+    - Workspace-bound service accounts: See only their bound workspace.
+
+    Membership limits workspace-scoped access to the actor's workspaces.
     """
     service = WorkspaceService(session, role=role)
-    if role.access_level == AccessLevel.ADMIN:
-        workspaces = await service.admin_list_workspaces()
-    else:
-        if role.user_id is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="User ID is required",
-            )
-        workspaces = await service.list_workspaces(role.user_id)
+    try:
+        workspaces = await service.list_accessible_workspaces()
+    except TracecatAuthorizationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden"
+        ) from e
     return [WorkspaceReadMinimal(id=ws.id, name=ws.name) for ws in workspaces]
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
+@require_scope("workspace:create")
 async def create_workspace(
     *,
-    role: OrgAdminUser,
+    role: OrgActorRole,
     params: WorkspaceCreate,
     session: AsyncDBSession,
 ) -> WorkspaceReadMinimal:
     """Create a new workspace.
 
-    Access Level
-    ------------
+    Authorization
+    -------------
     - Admin: Can create a workspace for any user.
     """
+    if role.type == "service_account" and role.bound_workspace_id is not None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
     service = WorkspaceService(session, role=role)
     try:
         workspace = await service.create_workspace(params.name)
     except TracecatAuthorizationError as e:
         logger.warning(
-            "User does not have the appropriate access level",
+            "User does not have the required scope",
             role=role,
         )
         raise HTTPException(
@@ -134,19 +117,26 @@ async def create_workspace(
 
 # NOTE: This route must be defined before the route for getting a single workspace for both to work
 @router.get("/search")
+@require_scope("org:read", "org:workspace:read", "workspace:read", require_all=False)
 async def search_workspaces(
     *,
-    role: OrgUser,
+    role: OrgActorRole,
     session: AsyncDBSession,
     params: WorkspaceSearch = Depends(),
 ) -> list[WorkspaceReadMinimal]:
     """Return Workflow as title, description, list of Action JSONs, adjacency list of Action IDs."""
     service = WorkspaceService(session, role=role)
-    workspaces = await service.search_workspaces(params)
+    try:
+        workspaces = await service.search_workspaces(params)
+    except TracecatAuthorizationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden"
+        ) from e
     return [WorkspaceReadMinimal(id=ws.id, name=ws.name) for ws in workspaces]
 
 
 @router.get("/{workspace_id}")
+@require_scope("workspace:read")
 async def get_workspace(
     *,
     role: WorkspaceUserInPath,
@@ -164,15 +154,16 @@ async def get_workspace(
     return WorkspaceRead(
         id=workspace.id,
         name=workspace.name,
-        settings=WorkspaceSettingsRead.model_validate(workspace.settings),
+        settings=WorkspaceSettingsRead.model_validate(workspace.settings or {}),
         organization_id=workspace.organization_id,
     )
 
 
 @router.patch("/{workspace_id}", status_code=status.HTTP_204_NO_CONTENT)
+@require_scope("workspace:update")
 async def update_workspace(
     *,
-    role: WorkspaceAdminUserInPath,
+    role: WorkspaceUserInPath,
     workspace_id: WorkspaceID,
     params: WorkspaceUpdate,
     session: AsyncDBSession,
@@ -192,9 +183,10 @@ async def update_workspace(
     "/{workspace_id}",
     status_code=status.HTTP_204_NO_CONTENT,
 )
+@require_scope("workspace:delete")
 async def delete_workspace(
     *,
-    role: WorkspaceAdminUserInPath,
+    role: WorkspaceUserInPath,
     workspace_id: WorkspaceID,
     session: AsyncDBSession,
 ) -> None:
@@ -216,6 +208,7 @@ async def delete_workspace(
 
 # === Memberships === #
 @router.get("/{workspace_id}/members")
+@require_scope("workspace:member:read")
 async def list_workspace_members(
     *,
     role: WorkspaceUserInPath,
@@ -229,6 +222,7 @@ async def list_workspace_members(
 
 
 @router.get("/{workspace_id}/memberships")
+@require_scope("workspace:member:read")
 async def list_workspace_memberships(
     *,
     role: WorkspaceUserInPath,
@@ -242,16 +236,16 @@ async def list_workspace_memberships(
         WorkspaceMembershipRead(
             user_id=membership.user_id,
             workspace_id=membership.workspace_id,
-            role=membership.role,
         )
         for membership in memberships
     ]
 
 
 @router.post("/{workspace_id}/memberships", status_code=status.HTTP_201_CREATED)
+@require_scope("workspace:member:invite")
 async def create_workspace_membership(
     *,
-    role: WorkspaceAdminUserInPath,
+    role: WorkspaceUserInPath,
     workspace_id: WorkspaceID,
     params: WorkspaceMembershipCreate,
     session: AsyncDBSession,
@@ -266,52 +260,22 @@ async def create_workspace_membership(
     except TracecatAuthorizationError as e:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User does not have the appropriate access level",
+            detail="User does not have the required scope",
         ) from e
     except IntegrityError as e:
-        logger.error("INTEGRITY ERROR")
+        logger.error("INTEGRITY ERROR", error=str(e))
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="User is already a member of workspace.",
         ) from e
-
-
-@router.patch(
-    "/{workspace_id}/memberships/{user_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
-async def update_workspace_membership(
-    *,
-    role: WorkspaceAdminUserInPath,
-    workspace_id: WorkspaceID,
-    user_id: UserID,
-    params: WorkspaceMembershipUpdate,
-    session: AsyncDBSession,
-) -> None:
-    """Update a workspace membership for a user."""
-    service = MembershipService(session, role=role)
-    membership_with_org = await service.get_membership(workspace_id, user_id=user_id)
-    if not membership_with_org:
+    except TracecatValidationError as e:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Membership not found",
-        )
-    try:
-        await service.update_membership(membership_with_org.membership, params=params)
-    except TracecatAuthorizationError as e:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User does not have the appropriate access level",
-        ) from e
-    except IntegrityError as e:
-        logger.error("INTEGRITY ERROR")
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="User is already a member of workspace.",
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)
         ) from e
 
 
 @router.get("/{workspace_id}/memberships/{user_id}")
+@require_scope("workspace:member:read")
 async def get_workspace_membership(
     *,
     role: WorkspaceUserInPath,
@@ -331,7 +295,6 @@ async def get_workspace_membership(
     return WorkspaceMembershipRead(
         user_id=membership.user_id,
         workspace_id=membership.workspace_id,
-        role=membership.role,
     )
 
 
@@ -339,9 +302,10 @@ async def get_workspace_membership(
     "/{workspace_id}/memberships/{user_id}",
     status_code=status.HTTP_204_NO_CONTENT,
 )
+@require_scope("workspace:member:remove")
 async def delete_workspace_membership(
     *,
-    role: WorkspaceAdminUserInPath,
+    role: WorkspaceUserInPath,
     workspace_id: WorkspaceID,
     user_id: UserID,
     session: AsyncDBSession,
@@ -349,3 +313,128 @@ async def delete_workspace_membership(
     """Delete a workspace membership."""
     service = MembershipService(session, role=role)
     await service.delete_membership(workspace_id, user_id=user_id)
+
+
+# === Invitations === #
+
+
+@router.post("/{workspace_id}/invitations", status_code=status.HTTP_201_CREATED)
+@require_scope("workspace:member:invite")
+async def create_workspace_invitation(
+    *,
+    role: WorkspaceUserInPath,
+    workspace_id: WorkspaceID,
+    params: WorkspaceInvitationCreate,
+    session: AsyncDBSession,
+) -> WorkspaceInvitationRead:
+    """Create a workspace invitation.
+
+    Authorization
+    -------------
+    - Workspace Admin: Can create invitations for their workspace.
+    """
+    service = WorkspaceService(session, role=role)
+    try:
+        invitation = await service.create_invitation(workspace_id, params)
+    except TracecatAuthorizationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User does not have permission to create invitations",
+        ) from e
+    except TracecatValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(e),
+        ) from e
+    return WorkspaceInvitationRead(
+        id=invitation.id,
+        workspace_id=invitation.workspace_id,
+        email=invitation.email,
+        role_id=str(invitation.role_id),
+        role_name=invitation.role_obj.name,
+        role_slug=invitation.role_obj.slug,
+        status=invitation.status,
+        invited_by=invitation.invited_by,
+        expires_at=invitation.expires_at,
+        accepted_at=invitation.accepted_at,
+        created_at=invitation.created_at,
+    )
+
+
+@router.get("/{workspace_id}/invitations")
+@require_scope("workspace:member:read")
+async def list_workspace_invitations(
+    *,
+    role: WorkspaceUserInPath,
+    workspace_id: WorkspaceID,
+    session: AsyncDBSession,
+    params: WorkspaceInvitationList = Depends(),
+) -> list[WorkspaceInvitationRead]:
+    """List workspace invitations.
+
+    Authorization
+    -------------
+    - Workspace Admin: Can list invitations for their workspace.
+    """
+    service = WorkspaceService(session, role=role)
+    try:
+        invitations = await service.list_invitations(workspace_id, status=params.status)
+    except TracecatAuthorizationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User does not have permission to list invitations",
+        ) from e
+    return [
+        WorkspaceInvitationRead(
+            id=inv.id,
+            workspace_id=inv.workspace_id,
+            email=inv.email,
+            role_id=str(inv.role_id),
+            role_name=inv.role_obj.name,
+            role_slug=inv.role_obj.slug,
+            status=inv.status,
+            invited_by=inv.invited_by,
+            expires_at=inv.expires_at,
+            accepted_at=inv.accepted_at,
+            created_at=inv.created_at,
+        )
+        for inv in invitations
+    ]
+
+
+@router.delete(
+    "/{workspace_id}/invitations/{invitation_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+@require_scope("workspace:member:remove")
+async def revoke_workspace_invitation(
+    *,
+    role: WorkspaceUserInPath,
+    workspace_id: WorkspaceID,
+    invitation_id: InvitationID,
+    session: AsyncDBSession,
+) -> None:
+    """Revoke a workspace invitation.
+
+    Authorization
+    -------------
+    - Workspace Admin: Can revoke invitations for their workspace.
+    """
+    service = WorkspaceService(session, role=role)
+    try:
+        await service.revoke_invitation(workspace_id, invitation_id)
+    except TracecatAuthorizationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="User does not have permission to revoke invitations",
+        ) from e
+    except TracecatNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+    except TracecatValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        ) from e

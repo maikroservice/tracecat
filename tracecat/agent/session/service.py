@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import contextlib
+import copy
+import hashlib
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, Literal
 
 import orjson
 from pydantic_ai.messages import (
@@ -15,13 +17,42 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.tools import ToolApproved, ToolDenied
-from sqlalchemy import delete, select
+from sqlalchemy import (
+    and_,
+    case,
+    column,
+    delete,
+    func,
+    literal,
+    or_,
+    select,
+    update,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.exc import SQLAlchemyError
+from temporalio.common import TypedSearchAttributes
+from tracecat_ee.workspace_chat.policy import is_workspace_chat_entitled
+from tracecat_ee.workspace_chat.skills import (
+    BUILTIN_WORKSPACE_CHAT_SKILLS,
+)
+from tracecat_registry._internal.exceptions import SecretNotFoundError
 
 import tracecat.agent.adapter.vercel
+import tracecat.artifacts.projection as artifact_projection
 from tracecat import config
 from tracecat.agent.approvals.enums import ApprovalStatus
+from tracecat.agent.common.types import MCPServerConfig
+from tracecat.agent.llm import LLMCompletionError
+from tracecat.agent.mcp.metadata import sanitize_message_tool_inputs
 from tracecat.agent.preset.prompts import AgentPresetBuilderPrompt
 from tracecat.agent.preset.service import AgentPresetService
+from tracecat.agent.runtime.claude_code.session_lines import (
+    APPROVAL_INTERRUPT_CONTENT_EXACT,
+    APPROVAL_INTERRUPT_CONTENT_MARKERS,
+    is_approval_interrupt_tool_result,
+    is_continuation_control_artifact,
+    session_line_uuid,
+)
 from tracecat.agent.schemas import RunAgentArgs
 from tracecat.agent.service import AgentManagementService
 from tracecat.agent.session.schemas import (
@@ -29,11 +60,23 @@ from tracecat.agent.session.schemas import (
     AgentSessionRead,
     AgentSessionUpdate,
 )
-from tracecat.agent.session.types import AgentSessionEntity
-from tracecat.agent.types import AgentConfig, ClaudeSDKMessageTA
+from tracecat.agent.session.title_generator import generate_session_title
+from tracecat.agent.session.types import (
+    AgentSessionEntity,
+    TurnLifecycle,
+    TurnLifecycleResult,
+)
+from tracecat.agent.subagents import (
+    ResolvedAgentsConfig,
+)
+from tracecat.agent.types import AgentConfig, ClaudeSDKMessageTA, StreamKey
+from tracecat.artifacts.bindings import ArtifactSideEffect
+from tracecat.artifacts.schemas import Artifact, ArtifactAdapter, ArtifactType
 from tracecat.audit.logger import audit_log
+from tracecat.authz.scopes import SERVICE_PRINCIPAL_SCOPES
 from tracecat.cases.prompts import CaseCopilotPrompts
 from tracecat.cases.service import CasesService
+from tracecat.chat import tokens
 from tracecat.chat.enums import MessageKind
 from tracecat.chat.schemas import (
     ApprovalRead,
@@ -46,18 +89,41 @@ from tracecat.chat.schemas import (
     VercelChatRequest,
 )
 from tracecat.chat.service import ChatService
-from tracecat.chat.tools import get_default_tools
-from tracecat.db.models import AgentSession, AgentSessionHistory, Approval, Chat
+from tracecat.chat.tools import (
+    filter_workspace_chat_tools_for_entitlements,
+    filter_workspace_chat_tools_for_scopes,
+    get_default_tools,
+)
+from tracecat.db.models import (
+    AgentSession,
+    AgentSessionHistory,
+    Approval,
+    Case,
+    Chat,
+    Workflow,
+)
 from tracecat.dsl.client import get_temporal_client
 from tracecat.dsl.common import RETRY_POLICIES
-from tracecat.exceptions import TracecatNotFoundError
+from tracecat.exceptions import TracecatNotFoundError, TracecatValidationError
 from tracecat.identifiers import UserID
 from tracecat.logger import logger
+from tracecat.redis.client import get_redis_client
 from tracecat.service import BaseWorkspaceService
+from tracecat.tiers.entitlements import check_entitlement
+from tracecat.tiers.enums import Entitlement
+from tracecat.workflow.executions.correlation import build_agent_session_correlation_id
+from tracecat.workflow.executions.enums import (
+    ExecutionType,
+    TemporalSearchAttr,
+    TriggerType,
+)
 from tracecat.workspaces.prompts import WorkspaceCopilotPrompts
 
 if TYPE_CHECKING:
     from tracecat.agent.executor.activity import ToolExecutionResult
+
+AUTO_TITLE_SERVICE_ID = "tracecat-api"
+APPROVAL_CONTINUATION_DEDUP_TTL_SECONDS = 5 * 60
 
 
 @dataclass
@@ -74,22 +140,158 @@ class AgentSessionService(BaseWorkspaceService):
 
     service_name = "agent-session"
 
+    async def _get_default_tools(self, entity_type: AgentSessionEntity) -> list[str]:
+        """Get entitlement-aware default tools for a session entity type."""
+        agent_addons_enabled = True
+        if entity_type is AgentSessionEntity.WORKSPACE_CHAT:
+            agent_addons_enabled = await self.has_entitlement(Entitlement.AGENT_ADDONS)
+        return get_default_tools(
+            entity_type.value,
+            agent_addons_enabled=agent_addons_enabled,
+        )
+
+    async def _workspace_chat_tools_for_entitlements(
+        self,
+        tools: list[str] | None,
+    ) -> list[str] | None:
+        """Filter stored Workspace chat tools by current entitlements."""
+        if tools is None:
+            return None
+        return filter_workspace_chat_tools_for_entitlements(
+            tools,
+            agent_addons_enabled=await self.has_entitlement(Entitlement.AGENT_ADDONS),
+        )
+
+    async def _resolve_builtin_workspace_chat_skills(self) -> list[str] | None:
+        """Always-on platform skills staged for entitled workspace-chat sessions.
+
+        Returns the reserved-prefix skill names to stage into the copilot's
+        skills directory, or ``None`` when the org is not entitled to Workspace
+        Chat or the Enterprise package is unavailable. Names only — the executor
+        resolves each to a packaged skill directory at stage time.
+        """
+
+        if not await is_workspace_chat_entitled(self.session, self.role):
+            return None
+        return list(BUILTIN_WORKSPACE_CHAT_SKILLS)
+
+    async def _resolve_workspace_chat_actions(
+        self,
+        agent_session: AgentSession,
+    ) -> list[str] | None:
+        """Merge always-on Workspace chat defaults with the session's extras.
+
+        Defaults are derived at runtime (never frozen per session), so they stay
+        current and are always present. ``agent_session.tools`` holds only the
+        extra tools the user added in the chat tools dialog.
+        """
+        defaults = await self._get_default_tools(AgentSessionEntity.WORKSPACE_CHAT)
+        extras = agent_session.tools or []
+        merged = list(dict.fromkeys([*defaults, *extras]))
+        # Chat tools execute under the executor service principal, which the
+        # internal API routes authorize against the service allowlist rather than
+        # the chat user's RBAC. Enforce the caller's action scopes here -- the
+        # last point where the user's real role is available -- so `agent:execute`
+        # alone cannot grant workflow create/edit or case delete via these tools.
+        merged = filter_workspace_chat_tools_for_scopes(merged, role=self.role)
+        return await self._workspace_chat_tools_for_entitlements(merged)
+
+    async def _resolve_session_mcp_servers(
+        self,
+        agent_session: AgentSession,
+        agent_svc: AgentManagementService,
+    ) -> list[MCPServerConfig] | None:
+        """Resolve attached MCP integration IDs into boundary-safe server refs."""
+        if (
+            not agent_session.mcp_integrations
+            or agent_svc.presets is None
+            or not await self.has_entitlement(Entitlement.AGENT_ADDONS)
+        ):
+            return None
+        return await agent_svc.presets.resolve_mcp_integration_refs(
+            agent_session.mcp_integrations
+        )
+
+    async def _validate_session_mcp_integrations(
+        self, mcp_integrations: list[str] | None
+    ) -> None:
+        """Validate session-attached MCP integrations before persistence."""
+        if not mcp_integrations:
+            return
+        preset_service = AgentPresetService(self.session, self.role)
+        await preset_service.validate_mcp_integrations(mcp_integrations)
+
+    def _build_direct_agent_search_attributes(
+        self, session_id: uuid.UUID
+    ) -> TypedSearchAttributes:
+        """Build Temporal search attributes for direct (non-child) agent runs."""
+        pairs = [
+            TriggerType.MANUAL.to_temporal_search_attr_pair(),
+            ExecutionType.PUBLISHED.to_temporal_search_attr_pair(),
+            TemporalSearchAttr.CORRELATION_ID.create_pair(
+                build_agent_session_correlation_id(session_id)
+            ),
+        ]
+        if self.role.user_id is not None:
+            pairs.append(
+                TemporalSearchAttr.TRIGGERED_BY_USER_ID.create_pair(
+                    str(self.role.user_id)
+                )
+            )
+        if self.role.workspace_id is not None:
+            pairs.append(
+                TemporalSearchAttr.WORKSPACE_ID.create_pair(str(self.role.workspace_id))
+            )
+        return TypedSearchAttributes(search_attributes=pairs)
+
     async def create_session(
         self,
         args: AgentSessionCreate,
+        *,
+        channel_context: dict[str, Any] | None = None,
+        agents_binding: ResolvedAgentsConfig | None = None,
     ) -> AgentSession:
         """Create a new agent session.
 
         Args:
             args: Session creation parameters.
+            channel_context: Trusted external channel metadata to bind to session.
+            agents_binding: Already-resolved internal subagent binding from the
+                workflow.
 
         Returns:
             The created AgentSession model.
         """
-        # Apply default tools based on entity type if tools not provided
+        # Apply default tools based on entity type if tools not provided.
+        # Workspace chat merges its always-on defaults at runtime instead, so
+        # ``tools`` stores only the extras the user added (never the defaults).
         tools = args.tools
-        if not tools and args.entity_type:
-            tools = get_default_tools(args.entity_type.value)
+        if (
+            not tools
+            and args.entity_type
+            and args.entity_type is not AgentSessionEntity.WORKSPACE_CHAT
+        ):
+            tools = await self._get_default_tools(args.entity_type)
+        logical_preset_id = self._resolve_logical_preset_id(
+            entity_type=args.entity_type,
+            entity_id=args.entity_id,
+            agent_preset_id=args.agent_preset_id,
+        )
+        pinned_preset_version_id = await self._validate_preset_version_for_assignment(
+            entity_type=args.entity_type,
+            entity_id=args.entity_id,
+            agent_preset_id=args.agent_preset_id,
+            agent_preset_version_id=args.agent_preset_version_id,
+        )
+        if agents_binding is not None:
+            resolved_agents_binding = agents_binding.model_dump(mode="json")
+        else:
+            resolved_agents_binding = (
+                await self._resolve_agents_binding_for_preset_version_id(
+                    pinned_preset_version_id
+                )
+            )
+        await self._validate_session_mcp_integrations(args.mcp_integrations)
 
         agent_session = AgentSession(
             workspace_id=self.workspace_id,
@@ -98,8 +300,12 @@ class AgentSessionService(BaseWorkspaceService):
             created_by=self.role.user_id,
             entity_type=args.entity_type.value,
             entity_id=args.entity_id,
+            channel_context=channel_context,
             tools=tools,
-            agent_preset_id=args.agent_preset_id,
+            mcp_integrations=args.mcp_integrations,
+            agent_preset_id=logical_preset_id,
+            agent_preset_version_id=pinned_preset_version_id,
+            agents_binding=resolved_agents_binding,
             # Harness
             harness_type=args.harness_type,
         )
@@ -110,6 +316,73 @@ class AgentSessionService(BaseWorkspaceService):
         await self.session.commit()
         await self.session.refresh(agent_session)
         return agent_session
+
+    def _resolve_logical_preset_id(
+        self,
+        *,
+        entity_type: AgentSessionEntity,
+        entity_id: uuid.UUID,
+        agent_preset_id: uuid.UUID | None,
+    ) -> uuid.UUID | None:
+        """Resolve the logical preset ID for a session assignment."""
+        if entity_type is AgentSessionEntity.AGENT_PRESET:
+            return entity_id
+        if agent_preset_id is not None:
+            return agent_preset_id
+        if entity_type is AgentSessionEntity.EXTERNAL_CHANNEL:
+            return entity_id
+        return None
+
+    async def _validate_preset_version_for_assignment(
+        self,
+        *,
+        entity_type: AgentSessionEntity,
+        entity_id: uuid.UUID,
+        agent_preset_id: uuid.UUID | None,
+        agent_preset_version_id: uuid.UUID | None,
+    ) -> uuid.UUID | None:
+        """Validate and return the pinned preset version for a session assignment."""
+        logical_preset_id = self._resolve_logical_preset_id(
+            entity_type=entity_type,
+            entity_id=entity_id,
+            agent_preset_id=agent_preset_id,
+        )
+        if logical_preset_id is None:
+            if agent_preset_version_id is not None:
+                raise TracecatNotFoundError(
+                    "Cannot assign a preset version without a preset"
+                )
+            return None
+
+        preset_service = AgentPresetService(self.session, self.role)
+        if not await preset_service.get_preset(logical_preset_id):
+            raise TracecatNotFoundError(
+                f"Agent preset with ID '{logical_preset_id}' not found"
+            )
+
+        if agent_preset_version_id is None:
+            return None
+
+        version = await preset_service.resolve_agent_preset_version(
+            preset_id=logical_preset_id,
+            preset_version_id=agent_preset_version_id,
+        )
+        return version.id
+
+    async def _resolve_agents_binding_for_preset_version_id(
+        self, preset_version_id: uuid.UUID | None
+    ) -> dict[str, Any] | None:
+        """Resolve the normalized subagent binding for a pinned preset version."""
+        if preset_version_id is None:
+            return None
+
+        preset_service = AgentPresetService(self.session, self.role)
+        version = await preset_service.resolve_agent_preset_version(
+            preset_version_id=preset_version_id
+        )
+        return ResolvedAgentsConfig.model_validate(version.agents).model_dump(
+            mode="json"
+        )
 
     async def get_session(
         self,
@@ -152,6 +425,128 @@ class AgentSessionService(BaseWorkspaceService):
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def build_initial_artifact(
+        self, agent_session: AgentSession
+    ) -> Artifact | None:
+        """Build the session's initial chat artifact, if supported."""
+        entity_type = AgentSessionEntity(agent_session.entity_type)
+        match entity_type:
+            case AgentSessionEntity.CASE:
+                stmt = select(Case).where(
+                    Case.id == agent_session.entity_id,
+                    Case.workspace_id == self.workspace_id,
+                )
+                result = await self.session.execute(stmt)
+                case = result.scalar_one_or_none()
+                if case is None:
+                    return None
+                return ArtifactAdapter.validate_python(
+                    {
+                        "type": "case",
+                        "id": str(case.id),
+                        "title": case.summary,
+                        "severity": case.severity.value,
+                        "status": case.status.value,
+                    }
+                )
+            case AgentSessionEntity.WORKFLOW:
+                stmt = select(Workflow).where(
+                    Workflow.id == agent_session.entity_id,
+                    Workflow.workspace_id == self.workspace_id,
+                )
+                result = await self.session.execute(stmt)
+                workflow = result.scalar_one_or_none()
+                if workflow is None:
+                    return None
+                return ArtifactAdapter.validate_python(
+                    {
+                        "type": "workflow",
+                        "id": str(workflow.id),
+                        "title": workflow.title,
+                        "color": "#64748b",
+                        "isPublished": workflow.status == "online",
+                    }
+                )
+            case _:
+                return None
+
+    def list_artifacts(self, agent_session: AgentSession) -> list[Artifact]:
+        """Return the persisted artifact projection for a session."""
+        return artifact_projection.validate_artifacts(
+            getattr(agent_session, "artifacts", [])
+        )
+
+    async def apply_artifact_side_effects(
+        self,
+        session_id: uuid.UUID,
+        effects: Sequence[ArtifactSideEffect],
+    ) -> list[Artifact]:
+        """Persist artifact side effects onto the session projection."""
+        if not effects:
+            agent_session = await self.get_session(session_id)
+            if agent_session is None:
+                raise TracecatNotFoundError(f"Session {session_id} not found")
+            return self.list_artifacts(agent_session)
+
+        stmt = (
+            select(AgentSession)
+            .where(
+                AgentSession.id == session_id,
+                AgentSession.workspace_id == self.workspace_id,
+            )
+            .with_for_update()
+        )
+        result = await self.session.execute(stmt)
+        agent_session = result.scalar_one_or_none()
+        if agent_session is None:
+            raise TracecatNotFoundError(f"Session {session_id} not found")
+
+        current_artifacts = self.list_artifacts(agent_session)
+        next_artifacts = artifact_projection.apply_artifact_side_effects(
+            current_artifacts,
+            effects,
+        )
+        agent_session.artifacts = artifact_projection.serialize_artifacts(
+            next_artifacts
+        )
+        await self.session.commit()
+        await self.session.refresh(agent_session)
+        return self.list_artifacts(agent_session)
+
+    async def remove_artifact(
+        self,
+        session_id: uuid.UUID,
+        *,
+        artifact_type: ArtifactType,
+        artifact_id: str,
+    ) -> list[Artifact]:
+        """Remove one artifact from the persisted session projection."""
+        stmt = (
+            select(AgentSession)
+            .where(
+                AgentSession.id == session_id,
+                AgentSession.workspace_id == self.workspace_id,
+            )
+            .with_for_update()
+        )
+        result = await self.session.execute(stmt)
+        agent_session = result.scalar_one_or_none()
+        if agent_session is None:
+            raise TracecatNotFoundError(f"Session {session_id} not found")
+
+        current_artifacts = self.list_artifacts(agent_session)
+        next_artifacts = artifact_projection.remove_artifact(
+            current_artifacts,
+            artifact_type=artifact_type,
+            artifact_id=artifact_id,
+        )
+        agent_session.artifacts = artifact_projection.serialize_artifacts(
+            next_artifacts
+        )
+        await self.session.commit()
+        await self.session.refresh(agent_session)
+        return self.list_artifacts(agent_session)
+
     async def is_legacy_session(self, session_id: uuid.UUID) -> bool:
         """Check if a session ID refers to a legacy Chat record.
 
@@ -167,6 +562,8 @@ class AgentSessionService(BaseWorkspaceService):
     async def get_or_create_session(
         self,
         args: AgentSessionCreate,
+        *,
+        agents_binding: ResolvedAgentsConfig | None = None,
     ) -> tuple[AgentSession, bool]:
         """Get an existing session or create a new one.
 
@@ -182,19 +579,19 @@ class AgentSessionService(BaseWorkspaceService):
             existing = await self.get_session(args.id)
             if existing:
                 return existing, False
-        new_session = await self.create_session(args)
+        new_session = await self.create_session(args, agents_binding=agents_binding)
         return new_session, True
 
     async def list_sessions(
         self,
         *,
         created_by: UserID | None = None,
+        filter_created_by_none: bool = False,
         entity_type: AgentSessionEntity | None = None,
         entity_id: uuid.UUID | None = None,
         exclude_entity_types: list[AgentSessionEntity] | None = None,
         parent_session_id: uuid.UUID | None = None,
         limit: int = 100,
-        offset: int = 0,
     ) -> list[AgentSessionRead | ChatReadMinimal]:
         """List agent sessions and legacy chats for the workspace.
 
@@ -203,12 +600,12 @@ class AgentSessionService(BaseWorkspaceService):
 
         Args:
             created_by: Filter by user who created the session.
+            filter_created_by_none: Filter to sessions without a user creator.
             entity_type: Filter by entity type.
             entity_id: Filter by entity ID.
             exclude_entity_types: Entity types to exclude from results.
             parent_session_id: Filter by parent session ID (for finding forked sessions).
             limit: Maximum number of results.
-            offset: Number of results to skip.
 
         Returns:
             List of AgentSessionRead or ChatReadMinimal (legacy, read-only).
@@ -219,6 +616,8 @@ class AgentSessionService(BaseWorkspaceService):
         )
         if created_by is not None:
             session_stmt = session_stmt.where(AgentSession.created_by == created_by)
+        elif filter_created_by_none:
+            session_stmt = session_stmt.where(AgentSession.created_by.is_(None))
         if entity_type is not None:
             session_stmt = session_stmt.where(
                 AgentSession.entity_type == entity_type.value
@@ -235,24 +634,33 @@ class AgentSessionService(BaseWorkspaceService):
             session_stmt = session_stmt.where(
                 AgentSession.parent_session_id == parent_session_id
             )
+        # Bound query cost at the database layer; we still merge+sort below.
+        session_stmt = session_stmt.order_by(AgentSession.created_at.desc()).limit(
+            limit
+        )
 
         session_result = await self.session.execute(session_stmt)
         sessions = list(session_result.scalars().all())
 
-        # Query legacy Chat table
-        # Note: exclude_entity_types is not applied here because legacy Chat records
-        # predate entity types like WORKFLOW and APPROVAL that are typically excluded.
-        # Legacy chats only have entity types like "case" or "agent_preset".
-        chat_stmt = select(Chat).where(Chat.workspace_id == self.workspace_id)
-        if created_by is not None:
-            chat_stmt = chat_stmt.where(Chat.user_id == created_by)
-        if entity_type is not None:
-            chat_stmt = chat_stmt.where(Chat.entity_type == entity_type.value)
-        if entity_id is not None:
-            chat_stmt = chat_stmt.where(Chat.entity_id == entity_id)
+        legacy_chats: list[Chat] = []
+        if parent_session_id is None and not filter_created_by_none:
+            # Query legacy Chat table
+            chat_stmt = select(Chat).where(Chat.workspace_id == self.workspace_id)
+            if created_by is not None:
+                chat_stmt = chat_stmt.where(Chat.user_id == created_by)
+            if entity_type is not None:
+                chat_stmt = chat_stmt.where(Chat.entity_type == entity_type.value)
+            if exclude_entity_types:
+                chat_stmt = chat_stmt.where(
+                    Chat.entity_type.notin_([et.value for et in exclude_entity_types])
+                )
+            if entity_id is not None:
+                chat_stmt = chat_stmt.where(Chat.entity_id == entity_id)
+            # Bound query cost at the database layer; we still merge+sort below.
+            chat_stmt = chat_stmt.order_by(Chat.created_at.desc()).limit(limit)
 
-        chat_result = await self.session.execute(chat_stmt)
-        legacy_chats = list(chat_result.scalars().all())
+            chat_result = await self.session.execute(chat_stmt)
+            legacy_chats = list(chat_result.scalars().all())
 
         # Convert and merge
         items: list[AgentSessionRead | ChatReadMinimal] = []
@@ -264,9 +672,9 @@ class AgentSessionService(BaseWorkspaceService):
             # ChatReadMinimal has is_readonly=True by default
             items.append(ChatReadMinimal.model_validate(c, from_attributes=True))
 
-        # Sort by created_at descending and apply pagination
+        # Sort by created_at descending and apply limit
         items.sort(key=lambda x: x.created_at, reverse=True)
-        return items[offset : offset + limit]
+        return items[:limit]
 
     @audit_log(resource_type="agent_session", action="update")
     async def update_session(
@@ -285,16 +693,69 @@ class AgentSessionService(BaseWorkspaceService):
             The updated AgentSession.
         """
         set_fields = params.model_dump(exclude_unset=True)
+        preset_id_updated = "agent_preset_id" in set_fields
+        version_id_updated = "agent_preset_version_id" in set_fields
+        requested_preset_id = set_fields.pop(
+            "agent_preset_id", agent_session.agent_preset_id
+        )
+        requested_version_id = set_fields.pop(
+            "agent_preset_version_id", agent_session.agent_preset_version_id
+        )
+        if "mcp_integrations" in set_fields:
+            await self._validate_session_mcp_integrations(
+                set_fields["mcp_integrations"]
+            )
 
-        if "agent_preset_id" in set_fields:
-            preset_id = set_fields.pop("agent_preset_id")
-            if preset_id is not None:
-                preset_service = AgentPresetService(self.session, self.role)
-                if not await preset_service.get_preset(preset_id):
-                    raise TracecatNotFoundError(
-                        f"Agent preset with ID '{preset_id}' not found"
+        if preset_id_updated or version_id_updated:
+            try:
+                entity_type = AgentSessionEntity(agent_session.entity_type)
+            except (TypeError, ValueError) as e:
+                raise TracecatValidationError(
+                    "Cannot update preset assignment for a session with an invalid entity type"
+                ) from e
+            logical_preset_id = self._resolve_logical_preset_id(
+                entity_type=entity_type,
+                entity_id=agent_session.entity_id,
+                agent_preset_id=requested_preset_id,
+            )
+            if logical_preset_id is None:
+                agent_session.agent_preset_id = None
+                agent_session.agent_preset_version_id = None
+                agent_session.agents_binding = None
+            else:
+                if preset_id_updated and (
+                    requested_preset_id != agent_session.agent_preset_id
+                ):
+                    pinned_version_id = (
+                        await self._validate_preset_version_for_assignment(
+                            entity_type=entity_type,
+                            entity_id=agent_session.entity_id,
+                            agent_preset_id=requested_preset_id,
+                            agent_preset_version_id=(
+                                requested_version_id if version_id_updated else None
+                            ),
+                        )
                     )
-            agent_session.agent_preset_id = preset_id
+                elif version_id_updated and requested_version_id is None:
+                    pinned_version_id = None
+                elif version_id_updated:
+                    pinned_version_id = (
+                        await self._validate_preset_version_for_assignment(
+                            entity_type=entity_type,
+                            entity_id=agent_session.entity_id,
+                            agent_preset_id=requested_preset_id,
+                            agent_preset_version_id=requested_version_id,
+                        )
+                    )
+                else:
+                    pinned_version_id = requested_version_id
+                agent_session.agent_preset_id = logical_preset_id
+                agent_session.agent_preset_version_id = pinned_version_id
+                agent_session.agents_binding = (
+                    await self._resolve_agents_binding_for_preset_version_id(
+                        pinned_version_id
+                    )
+                )
 
         # Update remaining fields if provided
         for field, value in set_fields.items():
@@ -321,13 +782,13 @@ class AgentSessionService(BaseWorkspaceService):
     async def update_last_stream_id(
         self,
         agent_session: AgentSession,
-        last_stream_id: str,
+        last_stream_id: str | None,
     ) -> AgentSession:
         """Update the last stream ID for an agent session.
 
         Args:
             agent_session: The agent session to update.
-            last_stream_id: The Redis stream ID to store.
+            last_stream_id: The Redis stream ID to store, or None to clear it.
 
         Returns:
             The updated AgentSession.
@@ -337,6 +798,59 @@ class AgentSessionService(BaseWorkspaceService):
         await self.session.commit()
         await self.session.refresh(agent_session)
         return agent_session
+
+    async def finalize_turn(
+        self,
+        session_id: uuid.UUID,
+        run_id: uuid.UUID,
+    ) -> None:
+        """Clear the active-turn pointers at terminal (compare-and-clear).
+
+        Nulls ``curr_run_id`` and ``active_stream_id`` only while the session
+        still points at ``run_id``. The compare guards against a newer turn that
+        already overwrote these pointers: a stale terminal must not clear the
+        live turn's state. Nulling ``curr_run_id`` is what flips the mid-turn DB
+        filter off (final rows become visible) and makes reconnect resolve to
+        NONE -> 204.
+        """
+        stmt = (
+            update(AgentSession)
+            .where(
+                AgentSession.id == session_id,
+                AgentSession.workspace_id == self.workspace_id,
+                AgentSession.curr_run_id == run_id,
+            )
+            .values(curr_run_id=None, active_stream_id=None)
+        )
+        await self.session.execute(stmt)
+        await self.session.commit()
+
+    async def clear_active_turn(
+        self,
+        session_id: uuid.UUID,
+        *,
+        expected_stream_id: uuid.UUID,
+    ) -> None:
+        """Clear active-turn pointers on turn-startup failure (compare-and-clear).
+
+        The workflow never started, so we drop the pointers optimistically
+        written by ``run_turn``. Compare on ``active_stream_id`` (minted per turn
+        at the HTTP layer) so a newer turn that already overwrote these pointers
+        between our optimistic write and this cleanup is not clobbered: turns are
+        not serialized, so a concurrent turn can pin its own pointers in that
+        window. Only clear while the session still points at our stream id.
+        """
+        stmt = (
+            update(AgentSession)
+            .where(
+                AgentSession.id == session_id,
+                AgentSession.workspace_id == self.workspace_id,
+                AgentSession.active_stream_id == expected_stream_id,
+            )
+            .values(curr_run_id=None, active_stream_id=None)
+        )
+        await self.session.execute(stmt)
+        await self.session.commit()
 
     # =========================================================================
     # Session History Management (for Claude SDK session persistence)
@@ -371,10 +885,12 @@ class AgentSessionService(BaseWorkspaceService):
 
         # For forked sessions, only fork on the first turn (when child has no sdk_session_id yet)
         # On subsequent turns, child has its own sdk_session_id and should resume normally
+        is_fork = False
         if (
             agent_session.parent_session_id is not None
             and agent_session.sdk_session_id is None
         ):
+            is_fork = True
             parent_session = await self.get_session(agent_session.parent_session_id)
             if parent_session is None:
                 logger.warning(
@@ -417,17 +933,58 @@ class AgentSessionService(BaseWorkspaceService):
             )
             return None
 
-        # Reconstruct JSONL from history entries (content stored pristine)
+        # Reconstruct JSONL from model-visible history entries. Internal rows are
+        # stored for debugging/UI filtering but should not be fed back into Claude
+        # on later resumes.
         lines = []
+        included_uuids: set[str] = set()
+        internal_uuids: set[str] = set()
+        last_visible_uuid: str | None = None
         for entry in history_entries:
-            line = orjson.dumps(entry.content).decode("utf-8")
+            content = orjson.loads(orjson.dumps(entry.content))
+            if not isinstance(content, dict):
+                continue
+
+            line_uuid = session_line_uuid(content)
+            if entry.kind == MessageKind.INTERNAL.value:
+                if line_uuid is not None:
+                    internal_uuids.add(line_uuid)
+                continue
+
+            if is_continuation_control_artifact(content, internal_uuids):
+                if line_uuid is not None:
+                    internal_uuids.add(line_uuid)
+                continue
+
+            parent_uuid = content.get("parentUuid")
+            if (
+                isinstance(parent_uuid, str)
+                and parent_uuid not in included_uuids
+                and last_visible_uuid is not None
+            ):
+                content["parentUuid"] = last_visible_uuid
+
+            if line_uuid is not None:
+                included_uuids.add(line_uuid)
+                last_visible_uuid = line_uuid
+
+            line = orjson.dumps(content).decode("utf-8")
             lines.append(line)
+
+        if not lines:
+            logger.warning(
+                "sdk_session_id set but no model-visible history entries",
+                session_id=source_session_id,
+                sdk_session_id=sdk_session_id,
+            )
+            return None
 
         sdk_session_data = "\n".join(lines)
 
         return SessionHistoryData(
             sdk_session_id=sdk_session_id,
             sdk_session_data=sdk_session_data,
+            is_fork=is_fork,
         )
 
     async def get_session_history(
@@ -452,6 +1009,265 @@ class AgentSessionService(BaseWorkspaceService):
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
+    async def _is_first_prompt_for_session(self, session_id: uuid.UUID) -> bool:
+        """Check whether this session has any persisted local history yet."""
+        stmt = (
+            select(AgentSessionHistory.id)
+            .where(
+                AgentSessionHistory.workspace_id == self.workspace_id,
+                AgentSessionHistory.session_id == session_id,
+            )
+            .limit(1)
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none() is None
+
+    async def should_seed_initial_artifact(self, agent_session: AgentSession) -> bool:
+        """Return whether the session should receive its initial artifact seed."""
+        return await self._is_first_prompt_for_session(agent_session.id)
+
+    async def has_pending_approvals(self, session_id: uuid.UUID) -> bool:
+        """Return whether the session has pending approval decisions."""
+        stmt = (
+            select(Approval.id)
+            .where(
+                Approval.workspace_id == self.workspace_id,
+                Approval.session_id == session_id,
+                Approval.status == ApprovalStatus.PENDING,
+            )
+            .limit(1)
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none() is not None
+
+    async def claim_external_channel_approval_sink(
+        self,
+        *,
+        session_id: uuid.UUID,
+        source: Literal["inbox", "slack"],
+    ) -> Literal["inbox", "slack"]:
+        """Legacy no-op sink claim kept for backwards compatibility.
+
+        External-channel approvals are no longer source-locked. Decisions can be
+        submitted from Slack or inbox; first accepted continuation wins.
+        """
+        stmt = select(AgentSession).where(
+            AgentSession.id == session_id,
+            AgentSession.workspace_id == self.workspace_id,
+        )
+        result = await self.session.execute(stmt)
+        agent_session = result.scalar_one_or_none()
+        if agent_session is None:
+            raise TracecatNotFoundError(f"Session with ID {session_id} not found")
+        return source
+
+    async def _emit_noop_continuation_done(
+        self,
+        *,
+        session_id: uuid.UUID,
+        active_stream_id: uuid.UUID | None,
+    ) -> None:
+        """Emit an end marker so duplicate/no-op continuations don't hang SSE clients."""
+        if self.workspace_id is None:
+            return
+        try:
+            redis_client = await get_redis_client()
+            await redis_client.xadd(
+                StreamKey(
+                    workspace_id=self.workspace_id,
+                    session_id=session_id,
+                    stream_id=active_stream_id,
+                ),
+                {
+                    tokens.DATA_KEY: orjson.dumps(
+                        {tokens.END_TOKEN: tokens.END_TOKEN_VALUE},
+                        default=str,
+                    ).decode()
+                },
+                maxlen=10000,
+                approximate=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to emit no-op continuation done marker",
+                session_id=str(session_id),
+                error=str(exc),
+            )
+
+    @staticmethod
+    def _approval_dedup_key(
+        *,
+        workspace_id: uuid.UUID,
+        session_id: uuid.UUID,
+        run_id: uuid.UUID,
+        tool_call_ids: Sequence[str],
+    ) -> str:
+        digest = hashlib.sha256(
+            ",".join(sorted(tool_call_ids)).encode("utf-8")
+        ).hexdigest()[:16]
+        return f"agent-approval-submit:{workspace_id}:{session_id}:{run_id}:{digest}"
+
+    async def auto_title_session_on_first_prompt(
+        self,
+        agent_session: AgentSession,
+        user_prompt: str,
+    ) -> None:
+        """Best-effort auto-title on first prompt via direct PydanticAI call."""
+        prompt = user_prompt.strip()
+        entity_type = agent_session.entity_type
+        old_title = agent_session.title
+
+        if not prompt:
+            logger.info(
+                "session_auto_title_skip",
+                session_id=str(agent_session.id),
+                entity_type=entity_type,
+                prompt_length=0,
+                old_title_length=len(old_title),
+                new_title_length=0,
+                reason="empty_prompt",
+            )
+            return
+
+        if not await self._is_first_prompt_for_session(agent_session.id):
+            logger.info(
+                "session_auto_title_skip",
+                session_id=str(agent_session.id),
+                entity_type=entity_type,
+                prompt_length=len(prompt),
+                old_title_length=len(old_title),
+                new_title_length=0,
+                reason="not_first_prompt",
+            )
+            return
+
+        logger.info(
+            "session_auto_title_attempt",
+            session_id=str(agent_session.id),
+            entity_type=entity_type,
+            prompt_length=len(prompt),
+            old_title_length=len(old_title),
+        )
+
+        try:
+            service_role = self.role.model_copy(
+                update={
+                    "type": "service",
+                    "service_id": AUTO_TITLE_SERVICE_ID,
+                    "scopes": SERVICE_PRINCIPAL_SCOPES.get(
+                        AUTO_TITLE_SERVICE_ID,
+                        frozenset(),
+                    ),
+                }
+            )
+            new_title = await generate_session_title(
+                user_prompt=prompt,
+                session=self.session,
+                role=service_role,
+            )
+        except (
+            LLMCompletionError,
+            SecretNotFoundError,
+            TracecatNotFoundError,
+            TracecatValidationError,
+            ValueError,
+        ) as e:
+            logger.warning(
+                "session_auto_title_failure",
+                session_id=str(agent_session.id),
+                entity_type=entity_type,
+                prompt_length=len(prompt),
+                old_title_length=len(old_title),
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            return
+
+        if not new_title:
+            logger.info(
+                "session_auto_title_skip",
+                session_id=str(agent_session.id),
+                entity_type=entity_type,
+                prompt_length=len(prompt),
+                old_title_length=len(old_title),
+                new_title_length=0,
+                reason="generation_failed_or_empty",
+            )
+            return
+
+        if new_title == old_title:
+            logger.info(
+                "session_auto_title_skip",
+                session_id=str(agent_session.id),
+                entity_type=entity_type,
+                prompt_length=len(prompt),
+                old_title_length=len(old_title),
+                new_title_length=len(new_title),
+                reason="title_unchanged",
+            )
+            return
+
+        history_exists = (
+            select(AgentSessionHistory.id)
+            .where(
+                AgentSessionHistory.workspace_id == self.workspace_id,
+                AgentSessionHistory.session_id == agent_session.id,
+            )
+            .limit(1)
+            .exists()
+        )
+
+        try:
+            result = await self.session.execute(
+                update(AgentSession)
+                .where(
+                    AgentSession.id == agent_session.id,
+                    AgentSession.workspace_id == self.workspace_id,
+                    AgentSession.title == old_title,
+                    ~history_exists,
+                )
+                .values(title=new_title)
+                .returning(AgentSession.id)
+            )
+            await self.session.commit()
+        except SQLAlchemyError as e:
+            await self.session.rollback()
+            logger.warning(
+                "session_auto_title_failure",
+                session_id=str(agent_session.id),
+                entity_type=entity_type,
+                prompt_length=len(prompt),
+                old_title_length=len(old_title),
+                new_title_length=len(new_title),
+                error=str(e),
+                error_type=type(e).__name__,
+            )
+            return
+
+        updated_session_id = result.scalar_one_or_none()
+        if updated_session_id is not None:
+            agent_session.title = new_title
+            logger.info(
+                "session_auto_title_success",
+                session_id=str(agent_session.id),
+                entity_type=entity_type,
+                prompt_length=len(prompt),
+                old_title_length=len(old_title),
+                new_title_length=len(new_title),
+            )
+            return
+
+        await self.session.refresh(agent_session)
+        logger.info(
+            "session_auto_title_skip",
+            session_id=str(agent_session.id),
+            entity_type=entity_type,
+            prompt_length=len(prompt),
+            old_title_length=len(old_title),
+            new_title_length=len(agent_session.title),
+            reason="compare_and_set_guard_failed",
+        )
+
     # =========================================================================
     # Chat / Message Turn Operations
     # =========================================================================
@@ -459,7 +1275,9 @@ class AgentSessionService(BaseWorkspaceService):
     async def run_turn(
         self,
         session_id: uuid.UUID,
-        request: ChatRequest | ContinueRunRequest,
+        request: ChatRequest | ContinueRunRequest | BasicChatRequest,
+        *,
+        active_stream_id: uuid.UUID | None = None,
     ) -> ChatResponse | None:
         """Run a session turn by spawning a DurableAgentWorkflow.
 
@@ -468,6 +1286,10 @@ class AgentSessionService(BaseWorkspaceService):
 
         Args:
             session_id: The ID of the session.
+            active_stream_id: Per-turn stream id minted by the HTTP layer. Pinned
+                into the workflow input and onto the session row so the producer
+                and reader share the same per-turn Redis key. Defaults to a freshly
+                minted id for callers that don't manage their own stream.
             request: Either a ChatRequest (start) or ContinueRunRequest (continue).
 
         Returns:
@@ -487,13 +1309,14 @@ class AgentSessionService(BaseWorkspaceService):
         if workspace_id is None:
             raise ValueError("Workspace ID is required")
 
-        # Get the session
-        agent_session = await self.get_session(session_id)
-        if not agent_session:
-            raise TracecatNotFoundError(f"Session with ID {session_id} not found")
+        agent_session = await self.validate_turn_request(
+            session_id=session_id,
+            request=request,
+        )
 
         # Parse request to extract user prompt
         user_prompt: str | None = None
+        request_instructions: str | None = None
         is_continuation = False
 
         match request:
@@ -512,8 +1335,9 @@ class AgentSessionService(BaseWorkspaceService):
                                 raise ValueError(f"Unsupported user prompt: {content}")
                     case _:
                         raise ValueError(f"Unsupported message: {message}")
-            case BasicChatRequest(message=prompt):
+            case BasicChatRequest(message=prompt, instructions=instructions):
                 user_prompt = prompt
+                request_instructions = instructions
             case _:
                 raise ValueError(f"Unsupported request type: {type(request)}")
 
@@ -524,20 +1348,37 @@ class AgentSessionService(BaseWorkspaceService):
         if is_continuation and isinstance(request, ContinueRunRequest):
             return await self._continue_with_approvals(session_id, request)
 
+        if user_prompt is not None:
+            await self.auto_title_session_on_first_prompt(agent_session, user_prompt)
+
         # Build agent config and spawn workflow for new turn
         async with self._build_agent_config(agent_session) as agent_config:
+            if request_instructions:
+                agent_config = replace(
+                    agent_config,
+                    instructions="\n\n".join(
+                        part
+                        for part in (agent_config.instructions, request_instructions)
+                        if part
+                    ),
+                )
+            if agent_config.tool_approvals:
+                await check_entitlement(
+                    self.session, self.role, Entitlement.AGENT_ADDONS
+                )
             run_id = uuid.uuid4()
-
-            # Copilot uses org-level credentials; other entities use workspace credentials
-            use_workspace_credentials = (
-                agent_session.entity_type != AgentSessionEntity.COPILOT
-            )
+            # Per-turn stream id: use the HTTP-minted id when provided, else mint
+            # one. Pinned into the workflow input so the worker producer writes to
+            # the same per-turn Redis key the reader joins (immune to the
+            # stale-turn overwrite race).
+            stream_id = active_stream_id or uuid.uuid4()
 
             args = RunAgentArgs(
                 user_prompt=user_prompt or "",
                 session_id=session_id,
+                active_stream_id=stream_id,
+                curr_run_id=run_id,
                 config=agent_config,
-                use_workspace_credentials=use_workspace_credentials,
             )
 
             client = await get_temporal_client()
@@ -551,10 +1392,19 @@ class AgentSessionService(BaseWorkspaceService):
                 entity_id=agent_session.entity_id,
                 tools=agent_session.tools,
                 agent_preset_id=agent_session.agent_preset_id,
+                agent_preset_version_id=agent_session.agent_preset_version_id,
             )
 
-            # Update session with current run_id for approval lookups
+            # Pin run_id (approval lookups) and the per-turn stream id before
+            # launching the workflow. Clear last_error in the same transaction
+            # that records the new run id: create_session_activity also clears
+            # it, but that runs inside the workflow on the agent worker. If the
+            # worker is queued/unavailable after a retry, the stale last_error
+            # would otherwise make _resolve_live_statuses report the old failure
+            # for a turn that is actually starting.
             agent_session.curr_run_id = run_id
+            agent_session.active_stream_id = stream_id
+            agent_session.last_error = None
             self.session.add(agent_session)
             await self.session.commit()
 
@@ -575,13 +1425,98 @@ class AgentSessionService(BaseWorkspaceService):
                 workflow_args,
                 id=str(workflow_id),
                 task_queue=config.TRACECAT__AGENT_QUEUE,
-                execution_timeout=timedelta(hours=1),
                 retry_policy=RETRY_POLICIES["workflow:fail_fast"],
+                search_attributes=self._build_direct_agent_search_attributes(
+                    session_id
+                ),
             )
 
-        # Return ChatResponse with session_id for streaming
+        # Return ChatResponse with session_id for streaming. Surface run_id so the
+        # HTTP layer builds the stable bubble id from the value we just minted
+        # rather than re-reading curr_run_id, which finalize_turn may clear before
+        # the post-run refresh on a fast turn.
         stream_url = f"/api/agent/sessions/{session_id}/stream"
-        return ChatResponse(stream_url=stream_url, chat_id=session_id)
+        return ChatResponse(
+            stream_url=stream_url, chat_id=session_id, curr_run_id=run_id
+        )
+
+    async def get_turn_lifecycle(
+        self, agent_session: AgentSession
+    ) -> TurnLifecycleResult:
+        """Resolve the live turn lifecycle from Temporal (cold reconnect path).
+
+        Temporal owns lifecycle - we never cache it in the DB. Returns the
+        decision plus the run id used to compute it (None when there is no
+        current run). On any describe error we fall back to FAILED so a
+        reconnecting client gets a terminal frame instead of hanging.
+        """
+        from temporalio.client import WorkflowExecutionStatus
+        from temporalio.service import RPCError
+        from tracecat_ee.agent.types import AgentWorkflowID
+        from tracecat_ee.agent.workflows.durable import DurableAgentWorkflow
+
+        curr_run_id = agent_session.curr_run_id
+        if curr_run_id is None:
+            return TurnLifecycleResult(TurnLifecycle.NONE, None)
+
+        client = await get_temporal_client()
+        handle = client.get_workflow_handle_for(
+            DurableAgentWorkflow.run, AgentWorkflowID(curr_run_id)
+        )
+        try:
+            description = await handle.describe()
+        except RPCError:
+            # Workflow history already gone / never started -> treat as failed so
+            # the client receives a terminal frame and refetches DB history.
+            logger.warning(
+                "Failed to describe agent workflow for reconnect",
+                session_id=str(agent_session.id),
+                run_id=str(curr_run_id),
+            )
+            return TurnLifecycleResult(TurnLifecycle.FAILED, curr_run_id)
+
+        match description.status:
+            case (
+                WorkflowExecutionStatus.RUNNING
+                | WorkflowExecutionStatus.CONTINUED_AS_NEW
+            ):
+                # CONTINUED_AS_NEW is not currently reachable - DurableAgentWorkflow
+                # loops turns internally rather than calling continue_as_new - but
+                # treat it as still-running (not failed) for consistency with how
+                # the inbox provider classifies Temporal workflow statuses.
+                return TurnLifecycleResult(TurnLifecycle.RUNNING, curr_run_id)
+            case WorkflowExecutionStatus.COMPLETED:
+                return TurnLifecycleResult(TurnLifecycle.COMPLETED, curr_run_id)
+            case _:
+                # FAILED | TERMINATED | CANCELED | TIMED_OUT
+                return TurnLifecycleResult(TurnLifecycle.FAILED, curr_run_id)
+
+    async def validate_turn_request(
+        self,
+        session_id: uuid.UUID,
+        request: ChatRequest | ContinueRunRequest | BasicChatRequest,
+    ) -> AgentSession:
+        """Assert a turn can start before mutating session or stream state."""
+        agent_session = await self.get_session(session_id)
+        if not agent_session:
+            raise TracecatNotFoundError(f"Session with ID {session_id} not found")
+
+        match request:
+            case ContinueRunRequest():
+                if agent_session.curr_run_id is None:
+                    raise TracecatNotFoundError(
+                        f"No active workflow run for session {session_id}"
+                    )
+                return agent_session
+            case VercelChatRequest() | BasicChatRequest():
+                if await self.has_pending_approvals(session_id):
+                    raise ValueError(
+                        "This session is waiting for approval decisions. "
+                        "Submit all pending approvals before sending another message."
+                    )
+                return agent_session
+            case _:
+                raise ValueError(f"Unsupported request type: {type(request)}")
 
     async def _continue_with_approvals(
         self,
@@ -612,35 +1547,106 @@ class AgentSessionService(BaseWorkspaceService):
             raise TracecatNotFoundError(
                 f"No active agent session found with ID {session_id}"
             )
-        if agent_session.curr_run_id is None:
+        curr_run_id = agent_session.curr_run_id
+        if curr_run_id is None:
             raise TracecatNotFoundError(
                 f"No active workflow run for session {session_id}"
             )
 
+        source: Literal["inbox", "slack"] = request.source
+
+        # Idempotency path: if approvals are already resolved, accept duplicate
+        # submissions as a no-op (cross-surface races Slack <-> inbox).
+        if not await self.has_pending_approvals(session_id):
+            logger.info(
+                "Ignoring approval continuation without pending approvals",
+                session_id=str(session_id),
+                run_id=str(curr_run_id),
+                source=source,
+            )
+            await self._emit_noop_continuation_done(
+                session_id=session_id,
+                active_stream_id=agent_session.active_stream_id,
+            )
+            return None
+
         # Build ApprovalMap from the request decisions
         approval_map: ApprovalMap = {}
+        decision_metadata: dict[str, dict[str, Any]] = {}
         for decision in request.decisions:
             if decision.action == "approve":
-                if decision.override_args:
-                    approval_map[decision.tool_call_id] = ToolApproved(
-                        override_args=decision.override_args
-                    )
-                else:
-                    approval_map[decision.tool_call_id] = True
-            else:
+                approval_map[decision.tool_call_id] = True
+            elif decision.action == "override":
+                approval_map[decision.tool_call_id] = ToolApproved(
+                    override_args=decision.override_args or {}
+                )
+            elif decision.action == "deny":
                 approval_map[decision.tool_call_id] = ToolDenied(
                     message=decision.reason or "Tool denied by user"
+                )
+            else:
+                logger.warning(
+                    "Unknown approval decision action; defaulting to deny",
+                    action=decision.action,
+                    tool_call_id=decision.tool_call_id,
+                )
+                approval_map[decision.tool_call_id] = ToolDenied(
+                    message=decision.reason or "Tool denied by user"
+                )
+            merged_metadata: dict[str, Any] = {"source": source}
+            if decision.metadata:
+                merged_metadata.update(decision.metadata)
+                merged_metadata["source"] = source
+            decision_metadata[decision.tool_call_id] = merged_metadata
+
+        # First decision submission wins per (session, run, pending tool-set).
+        dedup_client = None
+        dedup_key: str | None = None
+        if self.workspace_id is not None:
+            dedup_key = self._approval_dedup_key(
+                workspace_id=self.workspace_id,
+                session_id=session_id,
+                run_id=curr_run_id,
+                tool_call_ids=tuple(approval_map.keys()),
+            )
+            try:
+                dedup_client = await get_redis_client()
+                inserted = await dedup_client.set_if_not_exists(
+                    dedup_key,
+                    source,
+                    expire_seconds=APPROVAL_CONTINUATION_DEDUP_TTL_SECONDS,
+                )
+                if not inserted:
+                    logger.info(
+                        "Skipping duplicate approval continuation submission",
+                        session_id=str(session_id),
+                        run_id=str(curr_run_id),
+                        source=source,
+                        dedup_key=dedup_key,
+                    )
+                    await self._emit_noop_continuation_done(
+                        session_id=session_id,
+                        active_stream_id=agent_session.active_stream_id,
+                    )
+                    return None
+            except Exception as exc:
+                logger.warning(
+                    "Approval continuation dedup unavailable; proceeding best-effort",
+                    session_id=str(session_id),
+                    run_id=str(curr_run_id),
+                    source=source,
+                    error=str(exc),
                 )
 
         # Get workflow handle using curr_run_id
         client = await get_temporal_client()
-        workflow_id = AgentWorkflowID(agent_session.curr_run_id)
+        workflow_id = AgentWorkflowID(curr_run_id)
 
         logger.info(
             "Submitting approval decisions to workflow",
             workflow_id=str(workflow_id),
-            session_id=str(agent_session.id),
-            run_id=str(agent_session.curr_run_id),
+            session_id=str(session_id),
+            run_id=str(curr_run_id),
             num_decisions=len(approval_map),
         )
 
@@ -649,18 +1655,26 @@ class AgentSessionService(BaseWorkspaceService):
             str(workflow_id),
         )
 
-        await handle.execute_update(
-            DurableAgentWorkflow.set_approvals,
-            WorkflowApprovalSubmission(
-                approvals=approval_map,
-                approved_by=self.role.user_id,
-            ),
-        )
+        try:
+            await handle.execute_update(
+                DurableAgentWorkflow.set_approvals,
+                WorkflowApprovalSubmission(
+                    approvals=approval_map,
+                    approved_by=self.role.user_id,
+                    decision_metadata=decision_metadata or None,
+                ),
+            )
+        except Exception:
+            # Allow retriable failures to be resubmitted by clearing dedup marker.
+            if dedup_client is not None and dedup_key is not None:
+                with contextlib.suppress(Exception):
+                    await dedup_client.delete(dedup_key)
+            raise
 
         logger.info(
             "Approval decisions submitted successfully",
             workflow_id=str(workflow_id),
-            session_id=str(agent_session.id),
+            session_id=str(session_id),
         )
 
         return None
@@ -684,14 +1698,13 @@ class AgentSessionService(BaseWorkspaceService):
         agent_svc = AgentManagementService(self.session, self.role)
 
         if agent_session.entity_type is None:
-            # No entity type - use default config with workspace credentials
-            async with agent_svc.with_model_config(
-                use_workspace_credentials=True
-            ) as model_config:
+            # No entity type - use the org's default model
+            async with agent_svc.with_model_config() as model_config:
                 yield AgentConfig(
                     instructions="",
                     model_name=model_config.name,
                     model_provider=model_config.provider,
+                    catalog_id=model_config.catalog_id,
                     actions=agent_session.tools,
                 )
             return
@@ -702,7 +1715,8 @@ class AgentSessionService(BaseWorkspaceService):
             entity_instructions = await self._entity_to_prompt(agent_session)
             if agent_session.agent_preset_id:
                 async with agent_svc.with_preset_config(
-                    preset_id=agent_session.agent_preset_id
+                    preset_id=agent_session.agent_preset_id,
+                    preset_version_id=agent_session.agent_preset_version_id,
                 ) as preset_config:
                     combined_instructions = (
                         f"{preset_config.instructions}\n\n{entity_instructions}"
@@ -712,20 +1726,27 @@ class AgentSessionService(BaseWorkspaceService):
                     config = replace(preset_config, instructions=combined_instructions)
                     yield config
             else:
-                # Case chat without preset uses workspace credentials
-                async with agent_svc.with_model_config(
-                    use_workspace_credentials=True
-                ) as model_config:
+                # Case chat without preset uses the org's default model
+                async with agent_svc.with_model_config() as model_config:
                     yield AgentConfig(
                         instructions=entity_instructions,
                         model_name=model_config.name,
                         model_provider=model_config.provider,
+                        catalog_id=model_config.catalog_id,
                         actions=agent_session.tools,
                     )
         elif session_entity is AgentSessionEntity.AGENT_PRESET:
-            # Live chat uses workspace-level credentials
             async with agent_svc.with_preset_config(
-                preset_id=agent_session.entity_id, use_workspace_credentials=True
+                preset_id=agent_session.entity_id,
+                preset_version_id=agent_session.agent_preset_version_id,
+            ) as preset_config:
+                yield preset_config
+        elif session_entity is AgentSessionEntity.EXTERNAL_CHANNEL:
+            # External channels always execute against the linked preset.
+            preset_id = agent_session.agent_preset_id or agent_session.entity_id
+            async with agent_svc.with_preset_config(
+                preset_id=preset_id,
+                preset_version_id=agent_session.agent_preset_version_id,
             ) as preset_config:
                 yield preset_config
         elif session_entity is AgentSessionEntity.AGENT_PRESET_BUILDER:
@@ -733,16 +1754,14 @@ class AgentSessionService(BaseWorkspaceService):
                 raise ValueError("Agent preset builder requires entity_id")
             instructions = await self._entity_to_prompt(agent_session)
             try:
-                # Agent preset builder uses workspace credentials
                 # Tools are resolved via MCP path in the durable workflow
                 # (internal tools + bundled registry actions)
-                async with agent_svc.with_model_config(
-                    use_workspace_credentials=True
-                ) as model_config:
+                async with agent_svc.with_model_config() as model_config:
                     yield AgentConfig(
                         instructions=instructions,
                         model_name=model_config.name,
                         model_provider=model_config.provider,
+                        catalog_id=model_config.catalog_id,
                         actions=None,
                     )
             except TracecatNotFoundError as exc:
@@ -750,29 +1769,59 @@ class AgentSessionService(BaseWorkspaceService):
                     "Agent preset builder requires a default AI model with valid provider credentials. "
                     "Configure credentials in Workspace settings before chatting."
                 ) from exc
-        elif session_entity is AgentSessionEntity.COPILOT:
+        elif session_entity is AgentSessionEntity.WORKSPACE_CHAT:
             # Copilot uses org-level credentials, not workspace credentials
             entity_instructions = await self._entity_to_prompt(agent_session)
+            # Always-on platform skills (e.g. workflow management) staged for
+            # every entitled workspace-chat session, with or without a preset.
+            builtin_skills = await self._resolve_builtin_workspace_chat_skills()
             if agent_session.agent_preset_id:
                 async with agent_svc.with_preset_config(
                     preset_id=agent_session.agent_preset_id,
-                    use_workspace_credentials=False,
+                    preset_version_id=agent_session.agent_preset_version_id,
                 ) as preset_config:
                     combined_instructions = (
                         f"{preset_config.instructions}\n\n{entity_instructions}"
                         if preset_config.instructions
                         else entity_instructions
                     )
-                    config = replace(preset_config, instructions=combined_instructions)
+                    # A preset carries its own actions/namespaces, so it must pass
+                    # the same user-scope gate as the no-preset path -- otherwise
+                    # attaching a preset (only `agent:execute` is needed) would let
+                    # the agent run actions the user lacks scopes for. (`namespaces`
+                    # only narrows this set at tool-build time, never widens it, so
+                    # filtering `actions` is sufficient.)
+                    scoped_actions = (
+                        filter_workspace_chat_tools_for_scopes(
+                            preset_config.actions, role=self.role
+                        )
+                        if preset_config.actions is not None
+                        else None
+                    )
+                    config = replace(
+                        preset_config,
+                        instructions=combined_instructions,
+                        actions=scoped_actions,
+                        builtin_skills=builtin_skills,
+                    )
                     yield config
             else:
-                # Copilot without preset uses org-level credentials (default)
+                # Copilot without preset uses org-level credentials (default).
+                # Always-on defaults merge with session extras at runtime, and
+                # any attached MCP integrations resolve into mcp_servers.
                 async with agent_svc.with_model_config() as model_config:
+                    actions = await self._resolve_workspace_chat_actions(agent_session)
+                    mcp_servers = await self._resolve_session_mcp_servers(
+                        agent_session, agent_svc
+                    )
                     yield AgentConfig(
                         instructions=entity_instructions,
                         model_name=model_config.name,
                         model_provider=model_config.provider,
-                        actions=agent_session.tools,
+                        catalog_id=model_config.catalog_id,
+                        actions=actions,
+                        mcp_servers=mcp_servers,
+                        builtin_skills=builtin_skills,
                     )
         elif session_entity in (
             AgentSessionEntity.WORKFLOW,
@@ -793,7 +1842,7 @@ class AgentSessionService(BaseWorkspaceService):
                     # Use parent's preset with forked context prepended
                     async with agent_svc.with_preset_config(
                         preset_id=parent_session.agent_preset_id,
-                        use_workspace_credentials=True,
+                        preset_version_id=parent_session.agent_preset_version_id,
                     ) as preset_config:
                         combined_instructions = (
                             f"{fork_context}{preset_config.instructions}"
@@ -804,35 +1853,35 @@ class AgentSessionService(BaseWorkspaceService):
                             instructions=combined_instructions,
                             model_name=preset_config.model_name,
                             model_provider=preset_config.model_provider,
+                            catalog_id=preset_config.catalog_id,
                             actions=[],  # No tools for forked sessions
+                            enable_thinking=preset_config.enable_thinking,
                         )
                 else:
-                    # No preset - use workspace model with fork context
-                    async with agent_svc.with_model_config(
-                        use_workspace_credentials=True
-                    ) as model_config:
+                    # No preset - use org default model with fork context
+                    async with agent_svc.with_model_config() as model_config:
                         yield AgentConfig(
                             instructions=fork_context.strip(),
                             model_name=model_config.name,
                             model_provider=model_config.provider,
+                            catalog_id=model_config.catalog_id,
                             actions=[],  # No tools for forked sessions
                         )
             elif agent_session.agent_preset_id:
                 # Workflow sessions with preset use the preset config
                 async with agent_svc.with_preset_config(
                     preset_id=agent_session.agent_preset_id,
-                    use_workspace_credentials=True,
+                    preset_version_id=agent_session.agent_preset_version_id,
                 ) as preset_config:
                     yield preset_config
             else:
-                # Workflow without preset uses workspace credentials
-                async with agent_svc.with_model_config(
-                    use_workspace_credentials=True
-                ) as model_config:
+                # Workflow without preset uses the org's default model
+                async with agent_svc.with_model_config() as model_config:
                     yield AgentConfig(
                         instructions="",
                         model_name=model_config.name,
                         model_provider=model_config.provider,
+                        catalog_id=model_config.catalog_id,
                         actions=agent_session.tools,
                     )
         else:
@@ -860,7 +1909,7 @@ class AgentSessionService(BaseWorkspaceService):
                 )
             prompt = AgentPresetBuilderPrompt(preset=preset)
             return prompt.instructions
-        if entity_type == AgentSessionEntity.COPILOT:
+        if entity_type == AgentSessionEntity.WORKSPACE_CHAT:
             return WorkspaceCopilotPrompts().instructions
         else:
             raise ValueError(
@@ -877,6 +1926,7 @@ class AgentSessionService(BaseWorkspaceService):
         session_id: uuid.UUID,
         *,
         kinds: Sequence[MessageKind] | None = None,
+        include_active: bool = False,
     ) -> list[ChatMessage]:
         """Retrieve session messages, optionally filtered by message kind.
 
@@ -887,6 +1937,12 @@ class AgentSessionService(BaseWorkspaceService):
         Args:
             session_id: The session UUID (could be AgentSession.id or Chat.id).
             kinds: Optional list of message kinds to filter by.
+            include_active: When True, do not hide the active turn's rows. The
+                mid-turn filter exists for live UI reads (the assistant streams
+                from Redis). Terminal loads that build ``AgentOutput`` must set
+                this True: they run before ``finalize_turn`` clears
+                ``curr_run_id``, so the default filter would otherwise omit the
+                just-completed turn from the returned ``message_history``.
 
         Returns:
             List of ChatMessage objects (parent messages + current if forked).
@@ -909,6 +1965,18 @@ class AgentSessionService(BaseWorkspaceService):
             .where(AgentSessionHistory.session_id.in_(session_ids))
             .order_by(AgentSessionHistory.surrogate_id)
         )
+        # While a turn is live (curr_run_id set), the active run's partial rows
+        # are durability-only - the live assistant streams from Redis. Hide them
+        # here so the active assistant has exactly one source (no dedupe). The
+        # gate is the cheap curr_run_id pointer; terminal nulls it (see
+        # finish/fail paths), at which point the final rows become visible.
+        if not include_active and agent_session.curr_run_id is not None:
+            all_history_stmt = all_history_stmt.where(
+                or_(
+                    AgentSessionHistory.curr_run_id.is_(None),
+                    AgentSessionHistory.curr_run_id != agent_session.curr_run_id,
+                )
+            )
         all_history_result = await self.session.execute(all_history_stmt)
         all_entries = list(all_history_result.scalars().all())
 
@@ -924,6 +1992,7 @@ class AgentSessionService(BaseWorkspaceService):
         # Process both chat-message and internal entries in order
         # Internal entries contain tool results that the adapter will extract
         messages: list[ChatMessage] = []
+        internal_uuids: set[str] = set()
         for entry in all_entries:
             content = entry.content
             if not content:
@@ -931,6 +2000,41 @@ class AgentSessionService(BaseWorkspaceService):
 
             # Skip internal entries (e.g., continuation prompts)
             if entry.kind == MessageKind.INTERNAL.value:
+                if line_uuid := session_line_uuid(content):
+                    internal_uuids.add(line_uuid)
+                continue
+
+            if is_continuation_control_artifact(content, internal_uuids):
+                if line_uuid := session_line_uuid(content):
+                    internal_uuids.add(line_uuid)
+                continue
+
+            # Handle compaction entries: these are badges showing when compaction happened
+            if entry.kind == MessageKind.COMPACTION.value:
+                kind = MessageKind.COMPACTION
+
+                # Filter by kinds if specified
+                if kinds and kind not in kinds:
+                    continue
+
+                # Compaction badge data: extract metadata from the system message
+                # The system compact_boundary message has compactMetadata at the top level
+                compaction_data: dict[str, Any] = {"phase": "completed"}
+
+                # Extract pre_tokens from compactMetadata if available
+                compact_metadata = content.get("compactMetadata")
+                if isinstance(compact_metadata, dict):
+                    pre_tokens = compact_metadata.get("preTokens")
+                    if isinstance(pre_tokens, int):
+                        compaction_data["pre_tokens"] = pre_tokens
+
+                messages.append(
+                    ChatMessage(
+                        id=str(entry.id),
+                        kind=kind,
+                        compaction=compaction_data,
+                    )
+                )
                 continue
 
             # Skip non-message entries (e.g., system metadata)
@@ -938,7 +2042,7 @@ class AgentSessionService(BaseWorkspaceService):
             if msg_type not in ("user", "assistant"):
                 continue
 
-            # All AgentSessionHistory entries are CHAT_MESSAGE kind
+            # Standard chat messages
             kind = MessageKind.CHAT_MESSAGE
 
             # Filter by kinds if specified
@@ -950,13 +2054,16 @@ class AgentSessionService(BaseWorkspaceService):
             if not inner_message:
                 inner_message = content
 
+            # Strip internal proxy metadata before returning persisted tool inputs.
+            sanitized_message = sanitize_message_tool_inputs(inner_message)
+
             # Deserialize the content using Claude SDK TypeAdapter
-            message = ClaudeSDKMessageTA.validate_python(inner_message)
+            message = ClaudeSDKMessageTA.validate_python(sanitized_message)
             messages.append(ChatMessage(id=str(entry.id), message=message))
 
             # For assistant messages, check for tool calls needing approval bubbles
             if msg_type == "assistant":
-                tool_uses = self._extract_tool_uses_from_message(inner_message)
+                tool_uses = self._extract_tool_uses_from_message(sanitized_message)
                 for tool_use in tool_uses:
                     tool_use_id = tool_use.get("id")
                     if tool_use_id and (
@@ -1006,14 +2113,18 @@ class AgentSessionService(BaseWorkspaceService):
         session_id: uuid.UUID,
         tool_results: Sequence[ToolExecutionResult],
     ) -> None:
-        """Replace interrupt entries with proper tool_result entry.
+        """Replace interrupted approval artifacts with a real tool_result entry.
 
         After approval execution, the session history contains SDK-generated
         interrupt entries (error tool_result, interrupt text, synthetic message).
         This method:
-        1. Finds the assistant message with tool_use blocks (for parentUuid)
+        1. Finds the assistant message with tool_use blocks
         2. Deletes the interrupt entries
-        3. Inserts a proper tool_result JSONL entry
+        3. Inserts the approved/denied tool_result as the next user entry
+
+        Claude Code must see tool_result immediately after the assistant tool_use
+        when it loads the resumed session. If we stream tool_result after the CLI
+        starts, the CLI may first append a synthetic no-op assistant entry.
 
         Args:
             session_id: The session UUID.
@@ -1030,81 +2141,185 @@ class AgentSessionService(BaseWorkspaceService):
 
         tool_call_ids = {tr.tool_call_id for tr in tool_results}
 
-        # Find the assistant message containing these tool_uses (for parentUuid)
+        # Find the assistant message containing these tool_uses so we only delete
+        # interrupt artifacts that follow the pending tool call.
         history = await self.get_session_history(session_id)
-        assistant_uuid = None
-        assistant_surrogate_id = None
+        assistant_entry: AgentSessionHistory | None = None
 
         for entry in reversed(history):
             if entry.content.get("type") == "assistant":
                 tool_uses = self._extract_tool_uses_from_message(
                     entry.content.get("message", {})
                 )
-                if any(tu.get("id") in tool_call_ids for tu in tool_uses):
-                    assistant_uuid = entry.content.get("uuid")
-                    assistant_surrogate_id = entry.surrogate_id
+                assistant_tool_call_ids = {
+                    tool_use_id
+                    for tool_use in tool_uses
+                    if isinstance(tool_use_id := tool_use.get("id"), str)
+                }
+                if tool_call_ids.issubset(assistant_tool_call_ids):
+                    assistant_entry = entry
                     break
 
-        if assistant_uuid is None:
+        if assistant_entry is None:
             logger.warning(
-                "Could not find assistant message with tool_use for replacement",
+                "Could not find assistant message with tool_use for continuation",
                 session_id=session_id,
                 tool_call_ids=tool_call_ids,
             )
             return
-        if assistant_surrogate_id is None:
+
+        assistant_content = assistant_entry.content
+        assistant_uuid = assistant_content.get("uuid")
+        if not isinstance(assistant_uuid, str):
             logger.warning(
-                "Could not find assistant message with tool_use for replacement",
+                "Assistant tool_use entry is missing uuid for continuation",
                 session_id=session_id,
                 tool_call_ids=tool_call_ids,
             )
             return
+
         # Delete interrupt entries that follow the assistant message
         await self._delete_interrupt_entries_for_tool_calls(
-            session_id, assistant_surrogate_id, tool_call_ids
+            session_id, assistant_entry.surrogate_id, tool_call_ids
         )
 
-        # Build and insert proper tool_result entry
-        entry_content = {
+        # Avoid duplicate tool_result rows if the activity is retried after the
+        # replacement has already been committed.
+        if await self._has_tool_result_entry_after(
+            session_id, assistant_entry.surrogate_id, tool_call_ids
+        ):
+            await self.session.commit()
+            logger.info(
+                "Tool_result entry already exists for approval continuation",
+                session_id=session_id,
+                tool_call_ids=list(tool_call_ids),
+            )
+            return
+
+        entry_content: dict[str, Any] = {
             "uuid": str(uuid.uuid4()),
             "parentUuid": assistant_uuid,
             "sessionId": session.sdk_session_id,
             "type": "user",
             "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-            "cwd": "/home/agent",
-            "version": "2.0.72",
-            "userType": "external",
-            "gitBranch": "",
+            "cwd": assistant_content.get("cwd") or "/home/agent",
+            "version": assistant_content.get("version") or "2.1.85",
+            "userType": assistant_content.get("userType") or "external",
+            "gitBranch": assistant_content.get("gitBranch") or "",
+            "entrypoint": assistant_content.get("entrypoint") or "sdk-py",
             "isSidechain": False,
+            "permissionMode": "default",
+            "promptId": str(uuid.uuid4()),
             "message": {
                 "role": "user",
                 "content": [
                     {
                         "type": "tool_result",
-                        "tool_use_id": tr.tool_call_id,
-                        "content": self._serialize_tool_result(tr.result),
-                        "is_error": tr.is_error,
+                        "tool_use_id": result.tool_call_id,
+                        "content": self._serialize_tool_result(result.result),
+                        "is_error": result.is_error,
                     }
-                    for tr in tool_results
+                    for result in tool_results
                 ],
             },
         }
 
-        history_entry = AgentSessionHistory(
-            session_id=session_id,
-            workspace_id=self.workspace_id,
-            content=entry_content,
-            kind="chat-message",
+        # Tag the inserted tool_result with the active run id so the mid-turn
+        # filter hides it alongside its (also active-run-tagged) assistant
+        # tool_use row. A NULL tag would leave this row visible while the
+        # matching tool_use stays hidden, rendering a dangling/duplicate tool
+        # result on a mid-turn DB reload until terminal cleanup. Terminal nulls
+        # curr_run_id, at which point both rows become visible together.
+        self.session.add(
+            AgentSessionHistory(
+                session_id=session_id,
+                workspace_id=self.workspace_id,
+                content=entry_content,
+                kind=MessageKind.CHAT_MESSAGE.value,
+                curr_run_id=session.curr_run_id,
+            )
         )
-        self.session.add(history_entry)
         await self.session.commit()
 
         logger.info(
-            "Replaced interrupt entries with proper tool_result",
+            "Replaced interrupt entries with tool_result",
             session_id=session_id,
             tool_call_ids=list(tool_call_ids),
             parent_uuid=assistant_uuid,
         )
+
+    async def _has_tool_result_entry_after(
+        self,
+        session_id: uuid.UUID,
+        assistant_surrogate_id: int,
+        tool_call_ids: set[str],
+    ) -> bool:
+        """Return True when all approval tool calls already have real results.
+
+        This is the idempotency guard for approval reconciliation retries. SDK
+        approval interrupts also write error `tool_result` blocks, so those
+        placeholder rows must be ignored here; otherwise a retry could mistake
+        stale interrupt state for the approved/denied tool execution result.
+        """
+        if not tool_call_ids:
+            return False
+
+        # Only user messages with list content can contain Anthropic
+        # `tool_result` blocks. Treat other content shapes as empty so malformed
+        # or text-only rows cannot satisfy the idempotency check.
+        message_content = AgentSessionHistory.content["message"]["content"]
+        message_content_array = case(
+            (func.jsonb_typeof(message_content) == "array", message_content),
+            else_=literal([], type_=JSONB),
+        )
+        content_blocks = (
+            func.jsonb_array_elements(message_content_array)
+            .table_valued(column("value", JSONB))
+            .alias("content_block")
+        )
+        block = content_blocks.c.value
+
+        # The SDK writes approval-interrupt placeholders as error tool_results
+        # for the same tool_use IDs. Those rows should be deleted/replaced, not
+        # treated as the real reconciled tool result.
+        block_text = func.lower(func.btrim(block["content"].astext))
+        is_approval_interrupt = and_(
+            block["is_error"].astext == "true",
+            or_(
+                block_text == APPROVAL_INTERRUPT_CONTENT_EXACT,
+                *(
+                    block_text.contains(marker)
+                    for marker in APPROVAL_INTERRUPT_CONTENT_MARKERS
+                ),
+            ),
+        )
+        # A multi-tool approval continuation is only reconciled once every
+        # pending tool_use has a non-placeholder result after the assistant row.
+        matching_tool_result_count = (
+            select(func.count(func.distinct(block["tool_use_id"].astext)))
+            .select_from(content_blocks)
+            .where(
+                block["type"].astext == "tool_result",
+                block["tool_use_id"].astext.in_(tool_call_ids),
+                ~is_approval_interrupt,
+            )
+            .correlate(AgentSessionHistory)
+            .scalar_subquery()
+        )
+
+        stmt = (
+            select(literal(True))
+            .where(
+                AgentSessionHistory.workspace_id == self.workspace_id,
+                AgentSessionHistory.session_id == session_id,
+                AgentSessionHistory.surrogate_id > assistant_surrogate_id,
+                AgentSessionHistory.content["type"].astext == "user",
+                matching_tool_result_count == len(tool_call_ids),
+            )
+            .limit(1)
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none() is True
 
     async def _delete_interrupt_entries_for_tool_calls(
         self,
@@ -1153,11 +2368,7 @@ class AgentSessionService(BaseWorkspaceService):
                     if not isinstance(block, dict):
                         continue
                     # Check for error tool_result matching our tool_call_ids
-                    if (
-                        block.get("type") == "tool_result"
-                        and block.get("is_error") is True
-                        and block.get("tool_use_id") in tool_call_ids
-                    ):
+                    if is_approval_interrupt_tool_result(block, tool_call_ids):
                         entries_to_delete.append(entry)
                         break
                     # Check for interrupt text
@@ -1188,7 +2399,7 @@ class AgentSessionService(BaseWorkspaceService):
 
     @staticmethod
     def _serialize_tool_result(result: Any) -> str:
-        """Serialize a tool result to string for Claude SDK format."""
+        """Serialize a tool result to Claude's string tool_result content."""
         if isinstance(result, str):
             return result
         try:
@@ -1237,8 +2448,10 @@ class AgentSessionService(BaseWorkspaceService):
             created_by=self.role.user_id,
             entity_type=entity_type.value if entity_type else parent.entity_type,
             entity_id=parent.entity_id,
+            channel_context=parent.channel_context,
             tools=[],
             agent_preset_id=None,
+            work_dir_snapshot=copy.deepcopy(parent.work_dir_snapshot),
             # Harness - inherit from parent
             harness_type=parent.harness_type,
             # Fork reference

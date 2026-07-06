@@ -1,15 +1,16 @@
 "use client"
 
 import {
-  BookOpenIcon,
   BuildingIcon,
   ChevronsUpDown,
   CircleCheck,
   Plus,
+  RadarIcon,
 } from "lucide-react"
 import Link from "next/link"
 import { usePathname, useRouter, useSearchParams } from "next/navigation"
 import { useState } from "react"
+import { useScopeCheck } from "@/components/auth/scope-guard"
 import { Button } from "@/components/ui/button"
 import {
   Dialog,
@@ -36,16 +37,17 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
 } from "@/components/ui/sidebar"
-import { useAuth } from "@/hooks/use-auth"
 import { useWorkspaceManager } from "@/lib/hooks"
 import { cn } from "@/lib/utils"
+import { getWorkspaceLandingPath } from "@/lib/workspace-navigation"
 
 export function AppMenu({ workspaceId }: { workspaceId: string }) {
   const router = useRouter()
   const pathname = usePathname()
   const searchParams = useSearchParams()
   const { workspaces, createWorkspace } = useWorkspaceManager()
-  const { user } = useAuth()
+  const canAdministerOrg = useScopeCheck("org:update")
+  const canCreateWorkspace = useScopeCheck("workspace:create")
   const [dialogOpen, setDialogOpen] = useState(false)
   const [workspaceName, setWorkspaceName] = useState("")
   const [isCreating, setIsCreating] = useState(false)
@@ -60,11 +62,11 @@ export function AppMenu({ workspaceId }: { workspaceId: string }) {
     const currentPath = pathname ?? ""
     const search = searchParams?.toString()
     if (!preserveRelativePath || !currentPath.startsWith("/workspaces/")) {
-      return `/workspaces/${targetWorkspaceId}/workflows`
+      return getWorkspaceLandingPath(targetWorkspaceId)
     }
     const relativePath = currentPath.replace(/^\/workspaces\/[^/]+/, "")
     const normalizedPath =
-      relativePath && relativePath !== "/" ? relativePath : "/workflows"
+      relativePath && relativePath !== "/" ? relativePath : "/chat"
 
     return `/workspaces/${targetWorkspaceId}${normalizedPath}${
       search ? `?${search}` : ""
@@ -149,67 +151,69 @@ export function AppMenu({ workspaceId }: { workspaceId: string }) {
                 </Link>
               </DropdownMenuItem>
             ))}
-            <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-              <DialogTrigger asChild>
-                <DropdownMenuItem
-                  className="gap-2 py-1 px-2"
-                  onSelect={(e) => {
-                    e.preventDefault()
-                    setDialogOpen(true)
-                  }}
-                >
-                  <div className="flex size-6 items-center justify-center rounded-md border bg-background">
-                    <Plus className="size-4" />
-                  </div>
-                  <div className="font-medium text-muted-foreground">
-                    Add workspace
-                  </div>
-                </DropdownMenuItem>
-              </DialogTrigger>
-              <DialogContent className="sm:max-w-[425px]">
-                <form onSubmit={handleCreateWorkspace}>
-                  <DialogHeader>
-                    <DialogTitle>Create a new workspace</DialogTitle>
-                    <DialogDescription>
-                      Workspaces are isolated environments where a team can work
-                      on cases, automations, and credentials.
-                    </DialogDescription>
-                  </DialogHeader>
-                  <div className="grid gap-4 py-4">
-                    <div className="grid gap-2">
-                      <Label htmlFor="workspace-name">Workspace name</Label>
-                      <Input
-                        id="workspace-name"
-                        value={workspaceName}
-                        onChange={(e) => setWorkspaceName(e.target.value)}
-                        placeholder="My workspace"
-                        disabled={isCreating}
-                      />
+            {canCreateWorkspace === true && (
+              <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+                <DialogTrigger asChild>
+                  <DropdownMenuItem
+                    className="gap-2 py-1 px-2"
+                    onSelect={(e) => {
+                      e.preventDefault()
+                      setDialogOpen(true)
+                    }}
+                  >
+                    <div className="flex size-6 items-center justify-center rounded-md border bg-background">
+                      <Plus className="size-4" />
                     </div>
-                  </div>
-                  <DialogFooter>
-                    <DialogClose asChild>
+                    <div className="font-medium text-muted-foreground">
+                      Add workspace
+                    </div>
+                  </DropdownMenuItem>
+                </DialogTrigger>
+                <DialogContent className="sm:max-w-[425px]">
+                  <form onSubmit={handleCreateWorkspace}>
+                    <DialogHeader>
+                      <DialogTitle>Create a new workspace</DialogTitle>
+                      <DialogDescription>
+                        Workspaces are isolated environments where a team can
+                        work on cases, automations, and credentials.
+                      </DialogDescription>
+                    </DialogHeader>
+                    <div className="grid gap-4 py-4">
+                      <div className="grid gap-2">
+                        <Label htmlFor="workspace-name">Workspace name</Label>
+                        <Input
+                          id="workspace-name"
+                          value={workspaceName}
+                          onChange={(e) => setWorkspaceName(e.target.value)}
+                          placeholder="My workspace"
+                          disabled={isCreating}
+                        />
+                      </div>
+                    </div>
+                    <DialogFooter>
+                      <DialogClose asChild>
+                        <Button
+                          type="button"
+                          variant="outline"
+                          disabled={isCreating}
+                        >
+                          Cancel
+                        </Button>
+                      </DialogClose>
                       <Button
-                        type="button"
-                        variant="outline"
-                        disabled={isCreating}
+                        type="submit"
+                        disabled={isCreating || !workspaceName.trim()}
                       >
-                        Cancel
+                        {isCreating ? "Creating..." : "Create workspace"}
                       </Button>
-                    </DialogClose>
-                    <Button
-                      type="submit"
-                      disabled={isCreating || !workspaceName.trim()}
-                    >
-                      {isCreating ? "Creating..." : "Create workspace"}
-                    </Button>
-                  </DialogFooter>
-                </form>
-              </DialogContent>
-            </Dialog>
+                    </DialogFooter>
+                  </form>
+                </DialogContent>
+              </Dialog>
+            )}
 
             <DropdownMenuSeparator />
-            {user?.isPrivileged() && (
+            {canAdministerOrg && (
               <DropdownMenuItem asChild>
                 <Link
                   href="/organization"
@@ -222,17 +226,19 @@ export function AppMenu({ workspaceId }: { workspaceId: string }) {
                 </Link>
               </DropdownMenuItem>
             )}
-            <DropdownMenuItem asChild>
-              <Link
-                href="/registry/actions"
-                className="flex items-center gap-2 py-1 px-2 cursor-default"
-              >
-                <div className="flex size-6 items-center justify-center">
-                  <BookOpenIcon className="size-4" />
-                </div>
-                <span>Registry</span>
-              </Link>
-            </DropdownMenuItem>
+            {canAdministerOrg && (
+              <DropdownMenuItem asChild>
+                <Link
+                  href="/watchtower"
+                  className="flex items-center gap-2 py-1 px-2 cursor-default"
+                >
+                  <div className="flex size-6 items-center justify-center">
+                    <RadarIcon className="size-4" />
+                  </div>
+                  <span>Watchtower</span>
+                </Link>
+              </DropdownMenuItem>
+            )}
           </DropdownMenuContent>
         </DropdownMenu>
       </SidebarMenuItem>

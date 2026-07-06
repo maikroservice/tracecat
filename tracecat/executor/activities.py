@@ -6,6 +6,7 @@ dispatched from DSL workflows.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any
 
@@ -18,20 +19,40 @@ from tenacity import (
     wait_exponential,
 )
 
+from tracecat import config
 from tracecat.auth.types import Role
+from tracecat.authz.scopes import backfill_legacy_role_scopes
 from tracecat.contexts import ctx_logger, ctx_role, ctx_run
 from tracecat.dsl.action import materialize_context
 from tracecat.dsl.schemas import RunActionInput
 from tracecat.dsl.types import ActionErrorInfo
 from tracecat.exceptions import (
+    EntitlementRequired,
     ExecutionError,
     LoopExecutionError,
     RateLimitExceeded,
+    ScopeDeniedError,
 )
 from tracecat.executor.backends import get_executor_backend
 from tracecat.executor.service import dispatch_action
 from tracecat.logger import logger
 from tracecat.storage.object import StoredObject, action_key, get_object_storage
+
+
+async def _heartbeat_loop(interval: int, task_ref: str, action_name: str) -> None:
+    """Send periodic heartbeats to Temporal until cancelled.
+
+    Runs as a background asyncio task alongside the long-running
+    dispatch_action() call. Cancelled by the caller when dispatch completes.
+    """
+    elapsed = 0
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            elapsed += interval
+            activity.heartbeat(f"{action_name} ({task_ref}): {elapsed}s elapsed")
+    except asyncio.CancelledError:
+        pass
 
 
 class ExecutorActivities:
@@ -68,6 +89,9 @@ class ExecutorActivities:
         Secrets/variables are still handled inside the sandbox (Phase 2 will move them here).
         """
         ctx_run.set(input.run_context)
+        # Backfill scopes for roles serialized before the RBAC migration.
+        # Temporal history may contain Role objects with empty/None scopes.
+        role = backfill_legacy_role_scopes(role)
         ctx_role.set(role)
 
         task = input.task
@@ -96,8 +120,21 @@ class ExecutorActivities:
             update={"exec_context": await materialize_context(input.exec_context)}
         )
 
+        heartbeat_interval = config.TRACECAT__ACTIVITY_HEARTBEAT_INTERVAL
+
+        # Run a background heartbeat task for the full activity lifetime
+        # (including tenacity backoff sleeps) so Temporal can detect a dead
+        # worker without waiting for start_to_close_timeout.
+        heartbeat_task: asyncio.Task[None] | None = None
+        if heartbeat_interval > 0:
+            activity.heartbeat(f"{action_name} ({task.ref}) starting")
+            heartbeat_task = asyncio.create_task(
+                _heartbeat_loop(heartbeat_interval, task.ref, action_name)
+            )
+
         try:
             backend = get_executor_backend()
+
             async for attempt_manager in AsyncRetrying(
                 retry=retry_if_exception_type(RateLimitExceeded),
                 stop=stop_after_attempt(20),
@@ -112,6 +149,11 @@ class ExecutorActivities:
                         backend=backend, input=materialized_input
                     )
 
+                    if heartbeat_interval > 0:
+                        activity.heartbeat(
+                            f"{action_name} ({task.ref}) completed, storing result"
+                        )
+
                     # Always wrap result in StoredObject envelope
                     # - get_object_storage() returns S3ObjectStorage when externalization is enabled
                     #   (externalizes if above threshold), else InlineObjectStorage (always inline)
@@ -123,6 +165,47 @@ class ExecutorActivities:
                     )
                     stored = await get_object_storage().store(key, result)
                     return stored
+        except ScopeDeniedError as e:
+            # ScopeDeniedError from dispatch_action (user lacks action permission)
+            kind = e.__class__.__name__
+            msg = f"Permission denied: missing scope(s) {e.missing_scopes} to execute action '{action_name}'"
+            log.warning(
+                "Action scope denied",
+                action=action_name,
+                required_scopes=e.required_scopes,
+                missing_scopes=e.missing_scopes,
+            )
+            err_info = ActionErrorInfo(
+                ref=task.ref,
+                message=msg,
+                type=kind,
+                attempt=act_attempt,
+                stream_id=input.stream_id,
+            )
+            err_msg = err_info.format("execute_action")
+            # Non-retryable: retrying won't help if user lacks permission
+            raise ApplicationError(
+                err_msg, err_info, type=kind, non_retryable=True
+            ) from e
+        except EntitlementRequired as e:
+            # Entitlement errors are user-facing and non-retryable
+            kind = e.__class__.__name__
+            msg = str(e)
+            log.warning("Action entitlement denied", action=action_name, error=msg)
+            err_info = ActionErrorInfo(
+                ref=task.ref,
+                message=msg,
+                type=kind,
+                attempt=act_attempt,
+                stream_id=input.stream_id,
+            )
+            err_msg = err_info.format("execute_action")
+            raise ApplicationError(
+                err_msg,
+                err_info,
+                type=kind,
+                non_retryable=True,
+            ) from e
         except ExecutionError as e:
             # ExecutionError from dispatch_action (single action failure)
             kind = e.__class__.__name__
@@ -182,6 +265,13 @@ class ExecutorActivities:
             raise ApplicationError(
                 err_msg, err_info, type=kind, non_retryable=True
             ) from e
+        finally:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
 
         # Unreachable: AsyncRetrying either returns in the loop or raises RetryError
         # (caught by Exception handler above) when retries are exhausted

@@ -3,7 +3,8 @@ from typing import cast
 from fastapi import APIRouter, HTTPException, status
 from pydantic import ValidationError
 
-from tracecat.auth.dependencies import WorkspaceUserRole
+from tracecat.auth.dependencies import WorkspaceActorRouteRole
+from tracecat.authz.controls import require_scope
 from tracecat.db.dependencies import AsyncDBSession
 from tracecat.exceptions import TracecatValidationError
 from tracecat.identifiers.workflow import AnyWorkflowIDPath, WorkflowUUID
@@ -27,8 +28,9 @@ router = APIRouter(prefix="/actions", tags=["actions"])
 
 
 @router.post("/batch-positions", status_code=status.HTTP_204_NO_CONTENT)
+@require_scope("workflow:update")
 async def batch_update_positions(
-    role: WorkspaceUserRole,
+    role: WorkspaceActorRouteRole,
     workflow_id: AnyWorkflowIDPath,
     params: BatchPositionUpdate,
     session: AsyncDBSession,
@@ -47,8 +49,9 @@ async def batch_update_positions(
 
 
 @router.get("")
+@require_scope("workflow:read")
 async def list_actions(
-    role: WorkspaceUserRole,
+    role: WorkspaceActorRouteRole,
     workflow_id: AnyWorkflowIDPath,
     session: AsyncDBSession,
 ) -> list[ActionReadMinimal]:
@@ -70,8 +73,9 @@ async def list_actions(
 
 
 @router.post("")
+@require_scope("workflow:create")
 async def create_action(
-    role: WorkspaceUserRole,
+    role: WorkspaceActorRouteRole,
     params: ActionCreate,
     session: AsyncDBSession,
 ) -> ActionReadMinimal:
@@ -101,8 +105,9 @@ async def create_action(
 
 
 @router.get("/{action_id}")
+@require_scope("workflow:read")
 async def get_action(
-    role: WorkspaceUserRole,
+    role: WorkspaceActorRouteRole,
     action_id: AnyActionIDPath,
     workflow_id: AnyWorkflowIDPath,
     session: AsyncDBSession,
@@ -170,8 +175,9 @@ async def get_action(
 
 
 @router.post("/{action_id}")
+@require_scope("workflow:update")
 async def update_action(
-    role: WorkspaceUserRole,
+    role: WorkspaceActorRouteRole,
     action_id: AnyActionIDPath,
     workflow_id: AnyWorkflowIDPath,
     params: ActionUpdate,
@@ -190,8 +196,9 @@ async def update_action(
 
 
 @router.delete("/{action_id}", status_code=status.HTTP_204_NO_CONTENT)
+@require_scope("workflow:delete")
 async def delete_action(
-    role: WorkspaceUserRole,
+    role: WorkspaceActorRouteRole,
     action_id: AnyActionIDPath,
     workflow_id: AnyWorkflowIDPath,
     session: AsyncDBSession,

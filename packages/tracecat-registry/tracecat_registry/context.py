@@ -15,9 +15,12 @@ from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
-    from tracecat_registry.sdk.client import TracecatClient
+    from tracecat_registry.sdk.agents import AgentsClient
     from tracecat_registry.sdk.cases import CasesClient
+    from tracecat_registry.sdk.client import TracecatClient
+    from tracecat_registry.sdk.deduplicate import DeduplicateClient
     from tracecat_registry.sdk.tables import TablesClient
+    from tracecat_registry.sdk.variables import VariablesClient
     from tracecat_registry.sdk.workflows import WorkflowsClient
 
 
@@ -48,7 +51,6 @@ class RegistryContext:
     api_url: str = "http://api:8000"
     executor_url: str = "http://executor:8000"
     token: str = ""
-
     # Lazily initialized SDK client
     _client: TracecatClient | None = field(default=None, repr=False)
 
@@ -108,14 +110,29 @@ class RegistryContext:
         )
 
     @property
+    def deduplicate(self) -> "DeduplicateClient":
+        """Get the Deduplicate API client."""
+        return self.client.deduplicate
+
+    @property
     def cases(self) -> "CasesClient":
         """Get the Cases API client."""
         return self.client.cases
 
     @property
+    def agents(self) -> "AgentsClient":
+        """Get the Agents API client."""
+        return self.client.agents
+
+    @property
     def tables(self) -> "TablesClient":
         """Get the Tables API client."""
         return self.client.tables
+
+    @property
+    def variables(self) -> "VariablesClient":
+        """Get the Variables API client."""
+        return self.client.variables
 
     @property
     def workflows(self) -> "WorkflowsClient":

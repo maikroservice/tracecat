@@ -4,17 +4,13 @@ from __future__ import annotations
 
 import csv
 import io
-from typing import TYPE_CHECKING, Annotated, Any, Iterable, Literal
+from typing import Annotated, Any, Iterable, Literal
 
 import httpx
 from typing_extensions import Doc
 
-from tracecat_registry import RegistrySecret, registry, secrets
-from tracecat_registry import config
+from tracecat_registry import RegistrySecret, ctx, registry, secrets
 
-
-if not config.flags.registry_client or TYPE_CHECKING:
-    from tracecat.variables.service import VariablesService
 
 splunk_secret = RegistrySecret(
     name="splunk",
@@ -168,7 +164,7 @@ async def _download_csv(
         "create, append, or override modes."
     ),
     display_group="Splunk",
-    doc_url="https://help.splunk.com/en/splunk-enterprise/rest-api-reference/9.4/kv-store-endpoints",
+    doc_url="https://help.splunk.com/en/splunk-enterprise/rest-api-reference/9.4/kv-store-endpoints/kv-store-endpoint-descriptions",
     namespace="tools.splunk",
     secrets=[splunk_secret],
 )
@@ -200,7 +196,8 @@ async def upload_csv_to_kv_collection(
     base_url: Annotated[
         str | None,
         Doc(
-            "Splunk base URL (e.g. https://localhost:8089 or https://example.splunkcloud.com:8089)."
+            "Splunk base URL (e.g. https://localhost:8089 or https://example.splunkcloud.com:8089). "
+            "If not provided, falls back to the workspace variable `splunk.base_url`."
         ),
     ] = None,
     verify_ssl: Annotated[
@@ -210,19 +207,16 @@ async def upload_csv_to_kv_collection(
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
 
-    splunk_base_url: str | None = base_url
-    if not splunk_base_url:
-        if config.flags.registry_client:
-            raise SplunkKVStoreError(
-                "Splunk base_url is required when running in registry-client mode. "
-                "Pass it directly as a parameter."
-            )
-        splunk_base_url = await VariablesService.get_current_value(
-            name="splunk", key="base_url"
+    # Resolve base_url: parameter takes precedence, then workspace variable
+    resolved_base_url = base_url
+    if not resolved_base_url:
+        resolved_base_url = await ctx.variables.aio.get_or_default(
+            "splunk", "base_url", None
         )
-    if not splunk_base_url:
+    if not resolved_base_url:
         raise SplunkKVStoreError(
-            "Splunk base_url is required. Pass it directly or set splunk.base_url in the workspace variables."
+            "Splunk base_url is required. Either pass it directly as a parameter "
+            "or set the workspace variable `splunk.base_url`."
         )
 
     token = secrets.get("SPLUNK_API_KEY")
@@ -235,7 +229,7 @@ async def upload_csv_to_kv_collection(
     }
 
     async with httpx.AsyncClient(
-        base_url=splunk_base_url,
+        base_url=resolved_base_url,
         follow_redirects=True,
         verify=verify_ssl,
         timeout=httpx.Timeout(10.0, read=60.0),

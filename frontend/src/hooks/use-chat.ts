@@ -5,8 +5,12 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query"
-import { DefaultChatTransport, type UIMessage } from "ai"
-import { useMemo, useState } from "react"
+import {
+  type ChatOnDataCallback,
+  DefaultChatTransport,
+  type UIMessage,
+} from "ai"
+import { useCallback, useMemo, useState } from "react"
 import {
   type AgentSessionCreate,
   type AgentSessionEntity,
@@ -14,6 +18,8 @@ import {
   type AgentSessionsGetSessionResponse,
   type AgentSessionsGetSessionVercelResponse,
   type AgentSessionsListSessionsResponse,
+  type AgentSessionsRemoveSessionArtifactData,
+  type AgentSessionsRemoveSessionArtifactResponse,
   type AgentSessionUpdate,
   type ApiError,
   agentSessionsCreateSession,
@@ -21,16 +27,59 @@ import {
   agentSessionsGetSession,
   agentSessionsGetSessionVercel,
   agentSessionsListSessions,
+  agentSessionsRemoveSessionArtifact,
   agentSessionsUpdateSession,
   type ContinueRunRequest,
   type VercelChatRequest,
 } from "@/client"
 import { toast } from "@/components/ui/use-toast"
 import { getBaseUrl } from "@/lib/api"
-import type { ModelInfo } from "@/lib/chat"
+import { type ModelInfo, toServerUIMessage } from "@/lib/chat"
 
 const DEFAULT_CHAT_ERROR_MESSAGE =
   "The assistant couldn't complete that request. Please try again."
+
+type UpdateableChatRecord =
+  | AgentSessionsGetSessionResponse
+  | AgentSessionsGetSessionVercelResponse
+  | AgentSessionsListSessionsResponse[number]
+
+type UpdateChatContext = {
+  previousChat?: AgentSessionsGetSessionResponse
+  previousChatVercel?: AgentSessionsGetSessionVercelResponse
+  previousChatLists: Array<
+    [readonly unknown[], AgentSessionsListSessionsResponse | undefined]
+  >
+}
+
+type RemoveSessionArtifactInput = Omit<
+  AgentSessionsRemoveSessionArtifactData,
+  "workspaceId"
+>
+
+function applyOptimisticChatUpdate<T extends UpdateableChatRecord>(
+  chat: T,
+  update: AgentSessionUpdate
+): T {
+  return {
+    ...chat,
+    updated_at: new Date().toISOString(),
+    ...(typeof update.title === "string" ? { title: update.title } : {}),
+    ...(update.tools !== undefined ? { tools: update.tools ?? [] } : {}),
+    ...(update.mcp_integrations !== undefined
+      ? { mcp_integrations: update.mcp_integrations ?? [] }
+      : {}),
+    ...(update.agent_preset_id !== undefined
+      ? { agent_preset_id: update.agent_preset_id }
+      : {}),
+    ...(update.agent_preset_version_id !== undefined
+      ? { agent_preset_version_id: update.agent_preset_version_id }
+      : {}),
+    ...("harness_type" in chat && update.harness_type !== undefined
+      ? { harness_type: update.harness_type }
+      : {}),
+  }
+}
 
 export function parseChatError(error: unknown): string {
   if (!error) {
@@ -141,6 +190,8 @@ export function useListChats(
         limit,
       }),
     enabled: options?.enabled ?? true,
+    staleTime: 60 * 1000,
+    refetchOnWindowFocus: false,
   })
 
   return { chats, chatsLoading, chatsError, refetchChats: refetch }
@@ -174,7 +225,8 @@ export function useUpdateChat(workspaceId: string) {
   const mutation = useMutation<
     AgentSessionRead,
     ApiError,
-    { chatId: string; update: AgentSessionUpdate }
+    { chatId: string; update: AgentSessionUpdate },
+    UpdateChatContext
   >({
     mutationFn: ({ chatId, update }) =>
       agentSessionsUpdateSession({
@@ -182,7 +234,84 @@ export function useUpdateChat(workspaceId: string) {
         workspaceId,
         requestBody: update,
       }),
-    onSuccess: (_, variables) => {
+    onMutate: async ({ chatId, update }) => {
+      await Promise.all([
+        queryClient.cancelQueries({
+          queryKey: ["chat", chatId, workspaceId],
+        }),
+        queryClient.cancelQueries({
+          queryKey: ["chat", chatId, workspaceId, "vercel"],
+        }),
+        queryClient.cancelQueries({
+          queryKey: ["chats", workspaceId],
+        }),
+      ])
+
+      const previousChat =
+        queryClient.getQueryData<AgentSessionsGetSessionResponse>([
+          "chat",
+          chatId,
+          workspaceId,
+        ])
+      const previousChatVercel =
+        queryClient.getQueryData<AgentSessionsGetSessionVercelResponse>([
+          "chat",
+          chatId,
+          workspaceId,
+          "vercel",
+        ])
+      const previousChatLists =
+        queryClient.getQueriesData<AgentSessionsListSessionsResponse>({
+          queryKey: ["chats", workspaceId],
+        })
+
+      queryClient.setQueryData<AgentSessionsGetSessionResponse>(
+        ["chat", chatId, workspaceId],
+        (current) =>
+          current ? applyOptimisticChatUpdate(current, update) : current
+      )
+      queryClient.setQueryData<AgentSessionsGetSessionVercelResponse>(
+        ["chat", chatId, workspaceId, "vercel"],
+        (current) =>
+          current ? applyOptimisticChatUpdate(current, update) : current
+      )
+
+      for (const [queryKey] of previousChatLists) {
+        queryClient.setQueryData<AgentSessionsListSessionsResponse>(
+          queryKey,
+          (current) =>
+            current?.map((chatRecord) =>
+              chatRecord.id === chatId
+                ? applyOptimisticChatUpdate(chatRecord, update)
+                : chatRecord
+            ) ?? current
+        )
+      }
+
+      return {
+        previousChat,
+        previousChatVercel,
+        previousChatLists,
+      }
+    },
+    onError: (_, variables, context) => {
+      if (!context) {
+        return
+      }
+
+      queryClient.setQueryData(
+        ["chat", variables.chatId, workspaceId],
+        context.previousChat
+      )
+      queryClient.setQueryData(
+        ["chat", variables.chatId, workspaceId, "vercel"],
+        context.previousChatVercel
+      )
+      for (const [queryKey, previousData] of context.previousChatLists) {
+        queryClient.setQueryData(queryKey, previousData)
+      }
+    },
+    onSettled: (_, __, variables) => {
       queryClient.invalidateQueries({
         queryKey: ["chat", variables.chatId, workspaceId],
       })
@@ -259,17 +388,67 @@ export function useGetChatVercel({
   return { chat, chatLoading, chatError }
 }
 
+function applyArtifactsToVercelChat(
+  chat: AgentSessionsGetSessionVercelResponse | undefined,
+  response: AgentSessionsRemoveSessionArtifactResponse
+): AgentSessionsGetSessionVercelResponse | undefined {
+  if (!chat || !("artifacts" in chat)) {
+    return chat
+  }
+  return {
+    ...chat,
+    artifacts: response.artifacts ?? [],
+  }
+}
+
+export function useRemoveSessionArtifact(workspaceId: string) {
+  const queryClient = useQueryClient()
+  const mutation = useMutation({
+    mutationFn: async (input: RemoveSessionArtifactInput) =>
+      await agentSessionsRemoveSessionArtifact({
+        ...input,
+        workspaceId,
+      }),
+    onSuccess: (response, variables) => {
+      queryClient.setQueryData<
+        AgentSessionsGetSessionVercelResponse | undefined
+      >(["chat", variables.sessionId, workspaceId, "vercel"], (current) =>
+        applyArtifactsToVercelChat(current, response)
+      )
+      queryClient.invalidateQueries({
+        queryKey: ["chat", variables.sessionId, workspaceId, "vercel"],
+      })
+    },
+  })
+
+  return {
+    removeArtifact: mutation.mutateAsync,
+    isRemovingArtifact: mutation.isPending,
+    removeArtifactError: mutation.error,
+  }
+}
+
 // Combined hook for chat functionality with Vercel AI SDK streaming
 export function useVercelChat({
   chatId,
   workspaceId,
   messages,
   modelInfo,
+  onData,
+  resume = true,
 }: {
   chatId?: string
   workspaceId: string
   messages: UIMessage[]
   modelInfo: ModelInfo
+  onData?: ChatOnDataCallback<UIMessage>
+  /**
+   * Reconnect to the live event stream on mount. Defaults to true. Set to
+   * false for terminal sessions whose history is already seeded from the DB:
+   * resuming there replays the last persisted turn on top of the seeded
+   * messages, duplicating the chat.
+   */
+  resume?: boolean
 }) {
   const queryClient = useQueryClient()
   const [lastError, setLastError] = useState<string | null>(null)
@@ -282,13 +461,25 @@ export function useVercelChat({
     return url.toString()
   }, [chatId, workspaceId])
 
-  // Use Vercel's useChat hook for streaming
+  // Use Vercel's useChat hook for streaming. On reconnect the server replays the
+  // whole active turn from the start (it hides the active run's DB rows mid-turn,
+  // so Redis is the sole source for the live assistant); we therefore do not send
+  // a Last-Event-ID cursor.
   const chat = aiSdk.useChat({
     id: chatId,
+    resume: !!chatId && resume,
     messages,
     transport: new DefaultChatTransport({
       api: apiEndpoint,
       credentials: "include",
+      prepareReconnectToStreamRequest: ({ id }) => {
+        const url = new URL(`/api/agent/sessions/${id}/stream`, getBaseUrl())
+        url.searchParams.set("workspace_id", workspaceId)
+        return {
+          api: url.toString(),
+          credentials: "include",
+        }
+      },
       prepareSendMessagesRequest: ({ messages }) => {
         // Support both normal vercel chat turns and approval continuations.
         const last = messages[messages.length - 1]
@@ -300,6 +491,7 @@ export function useVercelChat({
           const body: ContinueRunRequest = {
             kind: "continue",
             decisions: dataPart.data.decisions,
+            source: dataPart.data.source ?? "inbox",
           }
           return { body }
         }
@@ -309,7 +501,7 @@ export function useVercelChat({
           kind: "vercel",
           model: modelInfo?.name,
           model_provider: modelInfo?.provider,
-          message: last,
+          message: toServerUIMessage(last),
         }
         const baseUrl = (modelInfo as { baseUrl?: string | null })?.baseUrl
         if (baseUrl != null) body.base_url = baseUrl
@@ -331,13 +523,25 @@ export function useVercelChat({
         queryKey: ["chat", chatId, workspaceId, "vercel"],
       })
       queryClient.invalidateQueries({ queryKey: ["chats", workspaceId] })
+      // A completed turn can change a session's inbox status (e.g. an approval
+      // continuation moves a row from "Review required" to "Completed"). The
+      // inbox detail pane derives its status/approval state from these queries,
+      // so refresh them here too — otherwise the open pane keeps showing the
+      // stale "Approval required" card until a hard reload. Both are already
+      // polled, so this just makes the update prompt; it is a no-op when no
+      // inbox view is mounted to observe them.
+      queryClient.invalidateQueries({ queryKey: ["inbox-items"] })
+      queryClient.invalidateQueries({
+        queryKey: ["pending-approvals-count", workspaceId],
+      })
     },
+    onData,
   })
 
   return {
     ...chat,
     lastError,
-    clearError: () => setLastError(null),
+    clearError: useCallback(() => setLastError(null), []),
   }
 }
 
@@ -354,7 +558,8 @@ export type ApprovalCard = {
  * Pass this message to your chat messages array before sending.
  */
 export function makeContinueMessage(
-  decisions: ContinueRunRequest["decisions"]
+  decisions: ContinueRunRequest["decisions"],
+  source: ContinueRunRequest["source"] = "inbox"
 ): UIMessage {
   return {
     id: `continue-${Date.now()}`,
@@ -362,7 +567,7 @@ export function makeContinueMessage(
     parts: [
       {
         type: "data-continue",
-        data: { format: "continue", decisions },
+        data: { kind: "continue", source, decisions },
       } as UIMessage["parts"][number],
     ],
   }

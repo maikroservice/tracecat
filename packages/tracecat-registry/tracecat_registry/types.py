@@ -7,7 +7,7 @@ and datetimes become ISO format strings.
 
 from uuid import UUID
 from datetime import datetime
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 
 # ============================================================================
@@ -55,6 +55,29 @@ class CaseFieldRead(TypedDict):
     value: Any
 
 
+class CaseDropdownValueRead(TypedDict):
+    """Per-case dropdown value with full definition/option info."""
+
+    id: UUID
+    definition_id: UUID
+    definition_ref: str
+    definition_name: str
+    option_id: UUID | None
+    option_label: str | None
+    option_ref: str | None
+    option_icon_name: str | None
+    option_color: str | None
+
+
+class CaseDropdownValueInput(TypedDict):
+    """Dropdown selection payload for case create/update operations."""
+
+    definition_id: NotRequired[UUID]
+    definition_ref: NotRequired[str]
+    option_id: NotRequired[UUID | None]
+    option_ref: NotRequired[str | None]
+
+
 class Case(TypedDict):
     """Case information returned by create/update/assign operations.
 
@@ -71,6 +94,18 @@ class Case(TypedDict):
     payload: dict[str, Any] | None
     assignee_id: UUID | None
     workspace_id: UUID
+    created_at: datetime
+    updated_at: datetime
+
+
+class CaseTableRowRead(TypedDict):
+    id: UUID
+    case_id: UUID
+    table_id: UUID
+    table_name: str | None
+    row_id: UUID
+    row_data: dict[str, Any] | None
+    is_row_available: bool
     created_at: datetime
     updated_at: datetime
 
@@ -92,7 +127,9 @@ class CaseRead(TypedDict):
     payload: dict[str, Any] | None
     fields: list[CaseFieldRead]
     tags: list[CaseTagRead]
+    dropdown_values: list[CaseDropdownValueRead]
     assignee: UserRead | None
+    rows: list[CaseTableRowRead]
     created_at: datetime
     updated_at: datetime
 
@@ -110,7 +147,9 @@ class CaseReadMinimal(TypedDict):
     severity: str
     status: str
     tags: list[CaseTagRead]
+    dropdown_values: list[CaseDropdownValueRead]
     assignee: UserRead | None
+    rows: list[CaseTableRowRead]
     created_at: datetime
     updated_at: datetime
     num_tasks_completed: int
@@ -136,7 +175,23 @@ class CaseComment(TypedDict):
     updated_at: datetime
     content: str
     parent_id: UUID | None
+    workflow_id: UUID | None
+    workflow_title: str | None
+    workflow_alias: str | None
+    workflow_wf_exec_id: str | None
+    workflow_status: str | None
     last_edited_at: datetime | None
+    deleted_at: datetime | None
+
+
+class CaseCommentWorkflowRead(TypedDict):
+    """Workflow metadata attached to a case comment."""
+
+    workflow_id: UUID | None
+    title: str
+    alias: str | None
+    wf_exec_id: str | None
+    status: str
 
 
 class CaseCommentRead(TypedDict):
@@ -147,8 +202,20 @@ class CaseCommentRead(TypedDict):
     updated_at: datetime
     content: str
     parent_id: UUID | None
+    workflow: CaseCommentWorkflowRead | None
     user: UserRead | None
     last_edited_at: datetime | None
+    deleted_at: datetime | None
+    is_deleted: bool
+
+
+class CaseCommentThreadRead(TypedDict):
+    """Threaded case comment information."""
+
+    comment: CaseCommentRead
+    replies: list[CaseCommentRead]
+    reply_count: int
+    last_activity_at: datetime
 
 
 class CaseTaskRead(TypedDict):
@@ -180,6 +247,9 @@ class CaseDurationMetric(TypedDict):
     case_status: str
     case_id: str
     case_short_id: str
+    fields: list[CaseFieldRead]
+    tags: list[CaseTagRead]
+    dropdown_values: list[CaseDropdownValueRead]
 
 
 class TagRead(TypedDict):
@@ -441,6 +511,42 @@ class TaskWorkflowChangedEvent(TypedDict, total=False):
     new: str | None
 
 
+class DropdownValueChangedEvent(TypedDict, total=False):
+    """Event for when a case dropdown value is changed."""
+
+    user_id: UUID | None
+    created_at: str
+    wf_exec_id: str | None
+    type: str
+    definition_id: str
+    definition_ref: str
+    definition_name: str
+    old_option_id: str | None
+    old_option_label: str | None
+    new_option_id: str | None
+    new_option_label: str | None
+
+
+class TableRowLinkedEvent(TypedDict, total=False):
+    user_id: UUID | None
+    created_at: str
+    wf_exec_id: str | None
+    type: str
+    table_id: UUID
+    table_name: str | None
+    row_id: UUID
+
+
+class TableRowUnlinkedEvent(TypedDict, total=False):
+    user_id: UUID | None
+    created_at: str
+    wf_exec_id: str | None
+    type: str
+    table_id: UUID
+    table_name: str | None
+    row_id: UUID
+
+
 # Union type for all case events
 type CaseEvent = (
     CreatedEvent
@@ -464,6 +570,9 @@ type CaseEvent = (
     | TaskStatusChangedEvent
     | TaskPriorityChangedEvent
     | TaskWorkflowChangedEvent
+    | DropdownValueChangedEvent
+    | TableRowLinkedEvent
+    | TableRowUnlinkedEvent
 )
 
 
@@ -549,3 +658,68 @@ class TableRead(TypedDict):
     id: UUID
     name: str
     columns: list[TableColumnRead]
+
+
+class TableSearchResponse(TypedDict):
+    """Cursor-paginated table row search response."""
+
+    items: list[dict[str, Any]]
+    next_cursor: str | None
+    prev_cursor: str | None
+    has_more: bool
+    has_previous: bool
+    total_estimate: NotRequired[int | None]
+
+
+# ============================================================================
+# Agent Types
+# ============================================================================
+
+
+class RunUsage(TypedDict):
+    """Agent run usage statistics."""
+
+    requests: int
+    tool_calls: int
+    input_tokens: int
+    output_tokens: int
+
+
+class AgentOutputRead(TypedDict):
+    """Agent execution output returned by run endpoint."""
+
+    output: Any
+    message_history: list[dict[str, Any]] | None
+    duration: float
+    usage: RunUsage | None
+    session_id: str  # UUID serialized as string
+
+
+class AgentPresetRead(TypedDict):
+    """Agent preset information."""
+
+    id: UUID
+    workspace_id: UUID
+    name: str
+    slug: str
+    # Deprecated legacy model fields retained for backward compatibility.
+    # catalog_id is the canonical model selector for new callers.
+    model_name: str
+    model_provider: str
+    catalog_id: UUID | None
+    description: str | None
+    instructions: str | None
+    base_url: str | None
+    output_type: Any
+    actions: list[str] | None
+    namespaces: list[str] | None
+    tool_approvals: dict[str, bool] | None
+    mcp_integrations: list[str] | None
+    agents: dict[str, Any]
+    retries: int
+    enable_thinking: bool
+    enable_internet_access: bool
+    skills: list[dict[str, Any]]
+    current_version_id: UUID | None
+    created_at: datetime
+    updated_at: datetime

@@ -1,21 +1,25 @@
 """AI agent with tool calling capabilities. Returns the output and full message history."""
 
 from typing import Annotated, Any
+
+from pydantic import Field
 from typing_extensions import Doc
 
-from tracecat_registry.fields import ActionType, AgentPreset, TextArea
-from tracecat_registry.sdk.agents import (
-    AgentConfig,
-    OutputType,
-    build_agent,
-    run_agent_sync,
-)
 from tracecat_registry import (
-    ActionIsInterfaceError,
     RegistrySecret,
     RegistrySecretType,
     registry,
 )
+from tracecat_registry._internal.exceptions import ActionIsInterfaceError
+from tracecat_registry.fields import (
+    ActionType,
+    AgentModel,
+    AgentPreset,
+    MCPIntegration,
+    ModelSelection,
+    TextArea,
+)
+from tracecat_registry.sdk.agents import OutputType
 
 anthropic_secret = RegistrySecret(
     name="anthropic",
@@ -60,28 +64,33 @@ bedrock_secret = RegistrySecret(
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_REGION",
-        "AWS_PROFILE",
         "AWS_ROLE_ARN",
         "AWS_ROLE_SESSION_NAME",
         "AWS_SESSION_TOKEN",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_MODEL_ID",
+        "AWS_INFERENCE_PROFILE_ID",
     ],
     optional=True,
 )
-"""AWS credentials.
+"""AWS Bedrock credentials.
 
 - name: `amazon_bedrock`
 - optional_keys:
-    Either:
-        - `AWS_ACCESS_KEY_ID`
-        - `AWS_SECRET_ACCESS_KEY`
-        - `AWS_REGION`
-    Or:
-        - `AWS_PROFILE`
-    Or:
+    Authentication (one of):
         - `AWS_ROLE_ARN`
-        - `AWS_ROLE_SESSION_NAME` (optional)
-    Or:
-        - `AWS_SESSION_TOKEN`
+        - `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`
+        - `AWS_BEARER_TOKEN_BEDROCK`
+    Optional role settings:
+        - `AWS_ROLE_SESSION_NAME`: Audit session name for AssumeRole requests.
+    Region:
+        - `AWS_REGION`: AWS region (e.g., us-east-1)
+
+Model selection (inference profile ID or direct model ID) is configured per
+catalog entry under Organization settings → Models, not via these credentials.
+
+Tracecat automatically injects the workspace-scoped external ID required for
+cross-account AssumeRole requests.
 """
 
 
@@ -118,20 +127,101 @@ custom_model_provider_secret = RegistrySecret(
     - `CUSTOM_MODEL_PROVIDER_BASE_URL`: Optional custom model provider base URL.
 """
 
+azure_openai_secret = RegistrySecret(
+    name="azure_openai",
+    optional_keys=[
+        "AZURE_API_BASE",
+        "AZURE_API_VERSION",
+        "AZURE_DEPLOYMENT_NAME",
+        "AZURE_API_KEY",
+        "AZURE_AD_TOKEN",
+        "AZURE_TENANT_ID",
+        "AZURE_CLIENT_ID",
+        "AZURE_CLIENT_SECRET",
+    ],
+    optional=True,
+)
+"""Azure OpenAI credentials.
+
+- name: `azure_openai`
+- optional_keys:
+    - `AZURE_API_BASE`: Azure OpenAI endpoint (e.g., https://<resource>.openai.azure.com).
+    - `AZURE_API_VERSION`: Azure OpenAI API version.
+    - `AZURE_API_KEY`: Azure OpenAI API key. Required if not using Entra authentication.
+    - `AZURE_AD_TOKEN`: Azure Entra (AD) token. Required if not using API key or client credentials.
+    - `AZURE_TENANT_ID`: Azure Entra tenant ID for client-credential auth.
+    - `AZURE_CLIENT_ID`: Azure Entra application client ID for client-credential auth.
+    - `AZURE_CLIENT_SECRET`: Azure Entra application client secret for client-credential auth.
+
+The deployment name is configured per catalog entry under Organization settings →
+Models, not via these credentials.
+"""
+
+azure_ai_secret = RegistrySecret(
+    name="azure_ai",
+    optional_keys=[
+        "AZURE_API_BASE",
+        "AZURE_API_KEY",
+        "AZURE_AD_TOKEN",
+        "AZURE_TENANT_ID",
+        "AZURE_CLIENT_ID",
+        "AZURE_CLIENT_SECRET",
+        "AZURE_API_VERSION",
+        "AZURE_AI_MODEL_NAME",
+    ],
+    optional=True,
+)
+"""Azure AI credentials.
+
+- name: `azure_ai`
+- optional_keys:
+    - `AZURE_API_BASE`: Azure AI endpoint (e.g., https://<resource>.services.ai.azure.com/anthropic).
+    - `AZURE_API_KEY`: Azure AI API key. Required if not using Entra authentication.
+    - `AZURE_AD_TOKEN`: Azure Entra (AD) token. Required if not using API key or client credentials.
+    - `AZURE_TENANT_ID`: Azure Entra tenant ID for client-credential auth.
+    - `AZURE_CLIENT_ID`: Azure Entra application client ID for client-credential auth.
+    - `AZURE_CLIENT_SECRET`: Azure Entra application client secret for client-credential auth.
+    - `AZURE_API_VERSION`: Optional Azure AI API version appended as the api-version query parameter.
+
+The Azure AI model name is configured per catalog entry under Organization
+settings → Models, not via these credentials.
+"""
+
+litellm_secret = RegistrySecret(
+    name="litellm",
+    keys=["LITELLM_BASE_URL"],
+    optional=True,
+)
+"""LiteLLM credentials.
+
+- name: `litellm`
+- keys:
+    - `LITELLM_BASE_URL`: LiteLLM base URL.
+"""
+
 PYDANTIC_AI_REGISTRY_SECRETS: list[RegistrySecretType] = [
     anthropic_secret,
     openai_secret,
     gemini_secret,
     bedrock_secret,
     custom_model_provider_secret,
+    azure_openai_secret,
+    azure_ai_secret,
+    litellm_secret,
 ]
+
+LEGACY_MODEL_FIELD_DEPRECATION_MESSAGE = "Use `model` instead."
+"""Deprecation message for raw model selection fields."""
+LEGACY_MODEL_FIELD_SCHEMA_EXTRA: dict[str, Any] = {
+    "x-tracecat-deprecation-message": LEGACY_MODEL_FIELD_DEPRECATION_MESSAGE
+}
 
 
 @registry.register(
     default_title="AI agent",
     description="AI agent with tool calling capabilities. Returns the output and full message history.",
     display_group="AI",
-    doc_url="https://ai.pydantic.dev/agents/",
+    doc_url="https://docs.tracecat.com/agents/ai-agent",
     secrets=[*PYDANTIC_AI_REGISTRY_SECRETS],
     namespace="ai",
 )
@@ -141,13 +231,37 @@ async def agent(
         Doc("User prompt to the agent."),
         TextArea(),
     ],
-    model_name: Annotated[str, Doc("Name of the model to use.")],
-    model_provider: Annotated[str, Doc("Provider of the model to use.")],
+    model: Annotated[
+        ModelSelection | None,
+        Doc("Model to use. Pick from the list of models enabled for this workspace."),
+        AgentModel(),
+    ] = None,
+    model_name: Annotated[
+        str | None,
+        Doc("Deprecated model name. Use `model` instead."),
+        Field(
+            deprecated=True,
+            json_schema_extra=LEGACY_MODEL_FIELD_SCHEMA_EXTRA,
+        ),
+    ] = None,
+    model_provider: Annotated[
+        str | None,
+        Doc("Deprecated model provider. Use `model` instead."),
+        Field(
+            deprecated=True,
+            json_schema_extra=LEGACY_MODEL_FIELD_SCHEMA_EXTRA,
+        ),
+    ] = None,
     actions: Annotated[
-        list[str],
+        list[str] | None,
         Doc("Actions (e.g. 'tools.slack.post_message') to include in the agent."),
         ActionType(multiple=True),
-    ],
+    ] = None,
+    mcp_integrations: Annotated[
+        list[str] | None,
+        Doc("Saved MCP integrations to include in the agent."),
+        MCPIntegration(multiple=True),
+    ] = None,
     instructions: Annotated[
         str | None, Doc("Instructions for the agent."), TextArea()
     ] = None,
@@ -155,6 +269,12 @@ async def agent(
         OutputType | None,
         Doc(
             "Output type for agent responses. Select from a list of supported types or provide a JSONSchema."
+        ),
+    ] = None,
+    session_id: Annotated[
+        str | None,
+        Doc(
+            "Optional existing agent session ID to continue from. If provided, the session must already exist."
         ),
     ] = None,
     model_settings: Annotated[
@@ -165,7 +285,10 @@ async def agent(
     ] = 15,
     max_requests: Annotated[int, Doc("Maximum number of requests for the agent.")] = 45,
     retries: Annotated[int, Doc("Number of retries for the agent.")] = 3,
-    base_url: Annotated[str | None, Doc("Base URL of the model to use.")] = None,
+    enable_thinking: Annotated[
+        bool,
+        Doc("Whether to enable high thinking for agent runs."),
+    ] = True,
     # Paid feature
     tool_approvals: Annotated[
         dict[str, bool] | None,
@@ -183,6 +306,7 @@ async def agent(
     display_group="AI",
     secrets=[*PYDANTIC_AI_REGISTRY_SECRETS],
     namespace="ai",
+    required_entitlements=["agent_addons"],
 )
 async def preset_agent(
     preset: Annotated[
@@ -195,6 +319,10 @@ async def preset_agent(
         Doc("User prompt to the agent."),
         TextArea(),
     ],
+    preset_version: Annotated[
+        int | None,
+        Doc("Optional preset version number to pin for this run."),
+    ] = None,
     actions: Annotated[
         list[str] | None,
         Doc(
@@ -209,6 +337,12 @@ async def preset_agent(
         ),
         TextArea(),
     ] = None,
+    session_id: Annotated[
+        str | None,
+        Doc(
+            "Optional existing agent session ID to continue from. If provided, the session must already exist."
+        ),
+    ] = None,
     max_tool_calls: Annotated[
         int, Doc("Maximum number of tool calls for the agent.")
     ] = 15,
@@ -221,7 +355,7 @@ async def preset_agent(
     default_title="AI action",
     description="Call an LLM with a given prompt and model.",
     display_group="AI",
-    doc_url="https://ai.pydantic.dev/agents/",
+    doc_url="https://docs.tracecat.com/agents/ai-action",
     namespace="ai",
     secrets=[*PYDANTIC_AI_REGISTRY_SECRETS],
 )
@@ -231,8 +365,27 @@ async def action(
         Doc("User prompt to the agent."),
         TextArea(),
     ],
-    model_name: Annotated[str, Doc("Name of the model to use.")],
-    model_provider: Annotated[str, Doc("Provider of the model to use.")],
+    model: Annotated[
+        ModelSelection | None,
+        Doc("Model to use. Pick from the list of models enabled for this workspace."),
+        AgentModel(),
+    ] = None,
+    model_name: Annotated[
+        str | None,
+        Doc("Deprecated model name. Use `model` instead."),
+        Field(
+            deprecated=True,
+            json_schema_extra=LEGACY_MODEL_FIELD_SCHEMA_EXTRA,
+        ),
+    ] = None,
+    model_provider: Annotated[
+        str | None,
+        Doc("Deprecated model provider. Use `model` instead."),
+        Field(
+            deprecated=True,
+            json_schema_extra=LEGACY_MODEL_FIELD_SCHEMA_EXTRA,
+        ),
+    ] = None,
     instructions: Annotated[
         str | None, Doc("Instructions for the agent."), TextArea()
     ] = None,
@@ -245,20 +398,12 @@ async def action(
     model_settings: Annotated[
         dict[str, Any] | None, Doc("Model settings for the agent.")
     ] = None,
-    max_requests: Annotated[int, Doc("Maximum number of requests for the agent.")] = 20,
-    retries: Annotated[int, Doc("Number of retries for the agent.")] = 6,
-    base_url: Annotated[str | None, Doc("Base URL of the model to use.")] = None,
-) -> Any:
-    agent = await build_agent(
-        AgentConfig(
-            model_name=model_name,
-            model_provider=model_provider,
-            instructions=instructions,
-            output_type=output_type,
-            model_settings=model_settings,
-            retries=retries,
-            base_url=base_url,
-        )
-    )
-    result = await run_agent_sync(agent, user_prompt, max_requests=max_requests)
-    return result.model_dump()
+    max_requests: Annotated[int, Doc("Maximum number of requests for the agent.")] = 45,
+    retries: Annotated[int, Doc("Number of retries for the agent.")] = 3,
+    enable_thinking: Annotated[
+        bool,
+        Doc("Whether to enable high thinking for agent runs."),
+    ] = True,
+) -> dict[str, Any]:
+    """Call an LLM with a given prompt and model (no tools)."""
+    raise ActionIsInterfaceError()

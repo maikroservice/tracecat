@@ -78,9 +78,11 @@ SessionID = uuid.UUID
 WorkflowTagID = uuid.UUID
 TagID = WorkflowTagID
 CaseTagID = uuid.UUID
+AgentTagID = uuid.UUID
 TableID = uuid.UUID
 TableColumnID = uuid.UUID
 TableRowID = uuid.UUID
+InvitationID = uuid.UUID
 
 InternalServiceID = Literal[
     "tracecat-api",
@@ -88,6 +90,7 @@ InternalServiceID = Literal[
     "tracecat-cli",
     "tracecat-executor",
     "tracecat-agent-executor",
+    "tracecat-case-triggers",
     "tracecat-llm-gateway",
     "tracecat-mcp",
     "tracecat-runner",
@@ -119,8 +122,10 @@ __all__ = [
     "TagID",
     "WorkflowTagID",
     "CaseTagID",
+    "AgentTagID",
     "SessionID",
     "VariableID",
+    "InvitationID",
     "id_factory",
     "action",
     "workflow",

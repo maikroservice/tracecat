@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from cryptography.fernet import InvalidToken
 from fastapi import status
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
@@ -96,6 +97,32 @@ async def test_list_secrets_with_type_filter(
 
 
 @pytest.mark.anyio
+async def test_list_secrets_with_corrupted_values(
+    client: TestClient,
+    test_admin_role: Role,
+    mock_secret: Secret,
+) -> None:
+    """Test GET /secrets tolerates decryption failures for corrupted rows."""
+    with patch.object(secrets_router, "SecretsService") as MockService:
+        mock_svc = AsyncMock()
+        mock_svc.list_secrets.return_value = [mock_secret]
+        mock_svc.decrypt_keys = MagicMock(side_effect=InvalidToken())
+        MockService.return_value = mock_svc
+
+        response = client.get(
+            "/secrets",
+            params={"workspace_id": str(test_admin_role.workspace_id)},
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["name"] == "test_secret"
+        assert data[0]["keys"] == []
+        assert data[0]["is_corrupted"] is True
+
+
+@pytest.mark.anyio
 async def test_list_secret_definitions_success(
     client: TestClient,
     test_admin_role: Role,
@@ -127,10 +154,90 @@ async def test_list_secret_definitions_success(
                 "keys": ["KEY1"],
                 "optional_keys": None,
                 "optional": False,
+                "secret_type": "custom",
                 "actions": ["tools.alpha.action_one"],
                 "action_count": 1,
             }
         ]
+
+
+@pytest.mark.anyio
+async def test_list_secret_definitions_returns_registry_definitions_without_builtins(
+    client: TestClient,
+    test_admin_role: Role,
+) -> None:
+    """Test GET /secrets/definitions reflects registry definitions only."""
+    with patch.object(secrets_router, "RegistryActionsService") as MockService:
+        mock_svc = AsyncMock()
+        mock_svc.get_aggregated_secrets.return_value = []
+        MockService.return_value = mock_svc
+
+        response = client.get(
+            "/secrets/definitions",
+            params={"workspace_id": str(test_admin_role.workspace_id)},
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json() == []
+
+
+@pytest.mark.anyio
+async def test_get_aws_assume_role_access_success(
+    client: TestClient,
+    test_admin_role: Role,
+) -> None:
+    """Test GET /secrets/aws-assume-role returns workspace-scoped trust details."""
+    with (
+        patch.object(
+            secrets_router,
+            "get_tracecat_aws_account_id",
+            return_value="123456789012",
+        ),
+        patch.object(
+            secrets_router,
+            "get_tracecat_aws_principal_arn",
+            return_value="arn:aws:iam::123456789012:role/tracecat-executor",
+        ),
+        patch.object(
+            secrets_router,
+            "build_workspace_external_id",
+            return_value="11111111111111111111111111111111",
+        ),
+    ):
+        response = client.get(
+            "/secrets/aws-assume-role",
+            params={"workspace_id": str(test_admin_role.workspace_id)},
+        )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json() == {
+        "tracecat_aws_account_id": "123456789012",
+        "tracecat_aws_principal_arn": "arn:aws:iam::123456789012:role/tracecat-executor",
+        "external_id": "11111111111111111111111111111111",
+    }
+
+
+@pytest.mark.anyio
+async def test_get_aws_assume_role_access_hides_internal_config_errors(
+    client: TestClient,
+    test_admin_role: Role,
+) -> None:
+    with patch.object(
+        secrets_router,
+        "get_tracecat_aws_account_id",
+        side_effect=ValueError(
+            "TRACECAT__AWS_ASSUME_ROLE_ACCOUNT_ID is not configured"
+        ),
+    ):
+        response = client.get(
+            "/secrets/aws-assume-role",
+            params={"workspace_id": str(test_admin_role.workspace_id)},
+        )
+
+    assert response.status_code == status.HTTP_503_SERVICE_UNAVAILABLE
+    assert response.json() == {
+        "detail": "AWS AssumeRole access is not available right now."
+    }
 
 
 @pytest.mark.anyio
@@ -411,6 +518,29 @@ async def test_list_org_secrets_success(
         data = response.json()
         assert len(data) == 1
         assert data[0]["name"] == "org_secret"
+
+
+@pytest.mark.anyio
+async def test_list_org_secrets_with_corrupted_values(
+    client: TestClient,
+    test_admin_role: Role,
+    mock_org_secret: OrganizationSecret,
+) -> None:
+    """Test GET /organization/secrets tolerates decryption failures."""
+    with patch.object(secrets_router, "SecretsService") as MockService:
+        mock_svc = AsyncMock()
+        mock_svc.list_org_secrets.return_value = [mock_org_secret]
+        mock_svc.decrypt_keys = MagicMock(side_effect=InvalidToken())
+        MockService.return_value = mock_svc
+
+        response = client.get("/organization/secrets")
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert len(data) == 1
+        assert data[0]["name"] == "org_secret"
+        assert data[0]["keys"] == []
+        assert data[0]["is_corrupted"] is True
 
 
 @pytest.mark.anyio

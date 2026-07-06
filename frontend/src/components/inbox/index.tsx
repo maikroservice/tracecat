@@ -1,151 +1,175 @@
 "use client"
 
-import { useEffect, useState } from "react"
-import { agentSessionsListSessions, type InboxItemRead } from "@/client"
+import { useEffect, useRef } from "react"
+import { useInboxChat } from "@/app/workspaces/[workspaceId]/inbox/layout"
+import type { AgentSessionEntity, InboxGroup } from "@/client"
+import { useScopeCheck } from "@/components/auth/scope-guard"
+import { InboxHeader } from "@/components/inbox/inbox-header"
+import { RunsTable } from "@/components/inbox/runs-table"
 import { CenteredSpinner } from "@/components/loading/spinner"
-import { useWorkspaceId } from "@/providers/workspace-id"
-import { InboxDetail } from "./inbox-detail"
-import { InboxEmptyState } from "./inbox-empty-state"
-import { InboxList } from "./inbox-list"
+import { toast } from "@/components/ui/use-toast"
+import {
+  type DateFilterValue,
+  type InboxGroupState,
+  type InboxOrderBy,
+  type UseInboxFilters,
+  useDeleteApproval,
+} from "@/hooks/use-inbox"
+import type { InboxSessionItem } from "@/lib/agents"
 
-interface InboxLayoutProps {
-  items: InboxItemRead[]
+interface ActivityLayoutProps {
+  sessions: InboxSessionItem[]
+  groups: Record<InboxGroup, InboxGroupState>
   selectedId: string | null
-  onSelect: (id: string) => void
+  onSelect: (id: string | null) => void
   isLoading: boolean
   error: Error | null
+  filters: UseInboxFilters
+  onSearchChange: (query: string) => void
+  onEntityTypeChange: (type: AgentSessionEntity | "all") => void
+  onLimitChange: (limit: number) => void
+  onUpdatedAfterChange: (value: DateFilterValue) => void
+  onCreatedAfterChange: (value: DateFilterValue) => void
+  orderBy: InboxOrderBy
+  sort: "asc" | "desc"
+  onSort: (key: InboxOrderBy) => void
 }
 
-export function InboxLayout({
-  items,
+export function ActivityLayout({
+  sessions,
+  groups,
   selectedId,
   onSelect,
   isLoading,
   error,
-}: InboxLayoutProps) {
-  const workspaceId = useWorkspaceId()
+  filters,
+  onSearchChange,
+  onEntityTypeChange,
+  onLimitChange,
+  onUpdatedAfterChange,
+  onCreatedAfterChange,
+  orderBy,
+  sort,
+  onSort,
+}: ActivityLayoutProps) {
+  const { setSelectedSession, setChatOpen, registerOnClose } = useInboxChat()
+  const canDeleteApproval = useScopeCheck("agent:delete")
+  const {
+    mutateAsync: deleteApproval,
+    variables,
+    isPending: isDeletePending,
+  } = useDeleteApproval()
+  const deletingId = isDeletePending ? (variables ?? null) : null
 
-  // Track the forked session ID and pending message for the currently selected item
-  // This is keyed by the selected item ID to prevent cross-contamination
-  const [forkedState, setForkedState] = useState<
-    Record<string, { sessionId: string; pendingMessage?: string }>
-  >({})
-
-  const selectedItem = items.find((item) => item.id === selectedId)
-
-  // Fetch existing forked session when selecting an inbox item
+  // Always reflects the current selectedId without closing over a stale value.
+  const selectedIdRef = useRef(selectedId)
   useEffect(() => {
-    if (!selectedItem?.source_id || !workspaceId) return
-    // Skip if we already have a forked session for this item
-    if (forkedState[selectedItem.id]) return
+    selectedIdRef.current = selectedId
+  }, [selectedId])
 
-    const fetchForkedSession = async () => {
-      try {
-        const sessions = await agentSessionsListSessions({
-          workspaceId,
-          parentSessionId: selectedItem.source_id,
-          limit: 1,
-        })
-        if (sessions.length > 0) {
-          // Use the most recent forked session
-          setForkedState((prev) => ({
-            ...prev,
-            [selectedItem.id]: { sessionId: sessions[0].id },
-          }))
-        }
-      } catch (err) {
-        // Silently fail - user can still fork manually
-        console.error("Failed to fetch forked session:", err)
-      }
-    }
+  // Sync selected session with layout context
+  const selectedSession = sessions.find((s) => s.id === selectedId) ?? null
 
-    fetchForkedSession()
-  }, [selectedItem?.id, selectedItem?.source_id, workspaceId, forkedState])
+  // Register callback to clear selection when chat is closed from layout
+  useEffect(() => {
+    registerOnClose(() => onSelect(null))
+  }, [registerOnClose, onSelect])
 
-  // Get the forked state for the current item, if any
-  const currentForkedState = selectedId ? forkedState[selectedId] : null
-
-  // Use forked session if available, otherwise use the selected item's source
-  const activeSessionId =
-    currentForkedState?.sessionId ?? selectedItem?.source_id
-
-  const handleForked = (forkedId: string, pendingMessage: string) => {
-    if (!selectedId) return
-    setForkedState((prev) => ({
-      ...prev,
-      [selectedId]: { sessionId: forkedId, pendingMessage },
-    }))
-  }
-
-  const handlePendingMessageSent = () => {
-    if (!selectedId) return
-    setForkedState((prev) => {
-      const current = prev[selectedId]
-      if (!current) return prev
-      return {
-        ...prev,
-        [selectedId]: { ...current, pendingMessage: undefined },
-      }
-    })
-  }
+  useEffect(() => {
+    setSelectedSession(selectedSession)
+    setChatOpen(!!selectedSession)
+  }, [selectedSession, setSelectedSession, setChatOpen])
 
   const handleSelectItem = (id: string) => {
     onSelect(id)
   }
 
+  const handleDeleteItem = async (id: string) => {
+    try {
+      await deleteApproval(id)
+      if (selectedIdRef.current === id) {
+        onSelect(null)
+      }
+    } catch {
+      toast({
+        title: "Failed to delete approval",
+        description: "Could not delete this approval. Please try again.",
+        variant: "destructive",
+      })
+    }
+  }
+
   if (isLoading) {
     return (
-      <div className="flex size-full items-center justify-center">
-        <CenteredSpinner />
+      <div className="flex size-full flex-col">
+        <InboxHeader
+          searchQuery={filters.searchQuery}
+          onSearchChange={onSearchChange}
+          entityType={filters.entityType}
+          onEntityTypeChange={onEntityTypeChange}
+          limit={filters.limit}
+          onLimitChange={onLimitChange}
+          updatedAfter={filters.updatedAfter}
+          onUpdatedAfterChange={onUpdatedAfterChange}
+          createdAfter={filters.createdAfter}
+          onCreatedAfterChange={onCreatedAfterChange}
+        />
+        <div className="flex flex-1 items-center justify-center">
+          <CenteredSpinner />
+        </div>
       </div>
     )
   }
 
   if (error) {
     return (
-      <div className="flex size-full items-center justify-center">
-        <span className="text-sm text-red-500">
-          Failed to load inbox: {error.message}
-        </span>
+      <div className="flex size-full flex-col">
+        <InboxHeader
+          searchQuery={filters.searchQuery}
+          onSearchChange={onSearchChange}
+          entityType={filters.entityType}
+          onEntityTypeChange={onEntityTypeChange}
+          limit={filters.limit}
+          onLimitChange={onLimitChange}
+          updatedAfter={filters.updatedAfter}
+          onUpdatedAfterChange={onUpdatedAfterChange}
+          createdAfter={filters.createdAfter}
+          onCreatedAfterChange={onCreatedAfterChange}
+        />
+        <div className="flex flex-1 items-center justify-center">
+          <span className="text-sm text-red-500">
+            Failed to load activity: {error.message}
+          </span>
+        </div>
       </div>
     )
   }
 
-  if (items.length === 0) {
-    return <InboxEmptyState />
-  }
-
   return (
-    <div className="flex size-full">
-      {/* Left panel: List */}
-      <div className="w-80 shrink-0 border-r">
-        <InboxList
-          items={items}
+    <div className="flex size-full flex-col">
+      <InboxHeader
+        searchQuery={filters.searchQuery}
+        onSearchChange={onSearchChange}
+        entityType={filters.entityType}
+        onEntityTypeChange={onEntityTypeChange}
+        limit={filters.limit}
+        onLimitChange={onLimitChange}
+        updatedAfter={filters.updatedAfter}
+        onUpdatedAfterChange={onUpdatedAfterChange}
+        createdAfter={filters.createdAfter}
+        onCreatedAfterChange={onCreatedAfterChange}
+      />
+      <div className="min-h-0 flex-1">
+        <RunsTable
+          groups={groups}
           selectedId={selectedId}
+          deletingId={deletingId ?? null}
           onSelect={handleSelectItem}
+          onDelete={canDeleteApproval ? handleDeleteItem : undefined}
+          orderBy={orderBy}
+          sort={sort}
+          onSort={onSort}
         />
-      </div>
-
-      {/* Right panel: Detail */}
-      <div className="min-w-0 flex-1">
-        {activeSessionId && selectedItem ? (
-          <InboxDetail
-            // Key by activeSessionId to force remount when switching to forked session
-            key={activeSessionId}
-            sessionId={activeSessionId}
-            parentSessionId={selectedItem.source_id}
-            item={selectedItem}
-            onForked={handleForked}
-            pendingMessage={currentForkedState?.pendingMessage}
-            onPendingMessageSent={handlePendingMessageSent}
-          />
-        ) : (
-          <div className="flex h-full items-center justify-center">
-            <span className="text-sm text-muted-foreground">
-              Select an item to view details
-            </span>
-          </div>
-        )}
       </div>
     </div>
   )

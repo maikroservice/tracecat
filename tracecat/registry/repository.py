@@ -97,6 +97,28 @@ def ensure_custom_registry_path() -> None:
         logger.debug("Added custom registry path via site.addsitedir", path=target_str)
 
 
+DEFAULT_EXCLUDE_DIRNAMES: set[str] = {
+    "cli",
+    "_internal",
+    ".git",
+    "__pycache__",
+    "node_modules",
+    ".venv",
+    "venv",
+    "env",
+    ".direnv",
+    "build",
+    "dist",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    "eggs",
+    ".eggs",
+    "tests",
+}
+
+
 def iter_valid_files(
     base_path: Path | str,
     file_extensions: tuple[str, ...] = (".py",),
@@ -115,26 +137,7 @@ def iter_valid_files(
         Path objects for valid files
     """
     if exclude_dirnames is None:
-        exclude_dirnames = {
-            "cli",
-            "_internal",
-            ".git",
-            "__pycache__",
-            "node_modules",
-            ".venv",
-            "venv",
-            "env",
-            ".direnv",
-            "build",
-            "dist",
-            ".mypy_cache",
-            ".pytest_cache",
-            ".ruff_cache",
-            ".tox",
-            "eggs",
-            ".eggs",
-            "tests",
-        }
+        exclude_dirnames = set(DEFAULT_EXCLUDE_DIRNAMES)
 
     pkg_path = Path(base_path)
 
@@ -197,6 +200,7 @@ class RegisterKwargs(BaseModel):
     # Options
     include_in_schema: bool = True
     requires_approval: bool = False
+    required_entitlements: list[str] | None = None
 
 
 class Repository:
@@ -294,6 +298,7 @@ class Repository:
         deprecated: str | None,
         include_in_schema: bool,
         requires_approval: bool = False,
+        required_entitlements: list[str] | None = None,
         template_action: TemplateAction | None = None,
         origin: str = DEFAULT_REGISTRY_ORIGIN,
     ):
@@ -317,6 +322,7 @@ class Repository:
             template_action=template_action,
             include_in_schema=include_in_schema,
             requires_approval=requires_approval,
+            required_entitlements=required_entitlements,
         )
 
         logger.debug(f"Registering action {reg_action.action=}")
@@ -637,6 +643,7 @@ class Repository:
             display_group=validated_kwargs.display_group,
             include_in_schema=validated_kwargs.include_in_schema,
             requires_approval=validated_kwargs.requires_approval,
+            required_entitlements=validated_kwargs.required_entitlements,
             args_cls=args_cls,
             args_docs=args_docs,
             rtype=rtype,
@@ -671,25 +678,39 @@ class Repository:
         origin: str = DEFAULT_REGISTRY_ORIGIN,
     ) -> None:
         start_time = default_timer()
-        base_path = module.__path__[0]
+        base_path = Path(module.__path__[0])
         base_package = module.__name__
         num_udfs = 0
 
+        # Avoid reloading SDK modules to prevent sentinel/class mismatch
+        exclude_dirnames = None
+        search_paths = [base_path]
+        if module.__name__ == DEFAULT_REGISTRY_ORIGIN:
+            exclude_dirnames = DEFAULT_EXCLUDE_DIRNAMES | {"sdk"}
+            search_paths = [
+                base_path / "core",
+                base_path / "integrations",
+            ]
+
         # Use the new free function to iterate over Python files
-        for file_path in iter_valid_files(
-            base_path,
-            file_extensions=(".py",),
-            exclude_filenames=("__init__", "__main__"),
-        ):
-            logger.info(f"Loading UDFs from {file_path!s}")
+        for search_path in search_paths:
+            if not search_path.exists():
+                continue
+            for file_path in iter_valid_files(
+                search_path,
+                file_extensions=(".py",),
+                exclude_filenames=("__init__", "__main__"),
+                exclude_dirnames=exclude_dirnames,
+            ):
+                logger.info(f"Loading UDFs from {file_path!s}")
 
-            # Convert path to module name
-            relative_path = file_path.relative_to(base_path)
-            parts = (*relative_path.parent.parts, relative_path.stem)
-            udf_module_name = f"{base_package}.{'.'.join(parts)}"
+                # Convert path to module name
+                relative_path = file_path.relative_to(base_path)
+                parts = (*relative_path.parent.parts, relative_path.stem)
+                udf_module_name = f"{base_package}.{'.'.join(parts)}"
 
-            mod = import_and_reload(udf_module_name)
-            num_udfs += self._register_udfs_from_module(mod, origin=origin)
+                mod = import_and_reload(udf_module_name)
+                num_udfs += self._register_udfs_from_module(mod, origin=origin)
         time_elapsed = default_timer() - start_time
         logger.info(
             f"✅ Registered {num_udfs} UDFs in {time_elapsed:.2f}s",
@@ -783,9 +804,19 @@ class Repository:
                 continue
 
             logger.info(f"Loading template actions from {file_path!s}")
-            template_action = self.load_template_action_from_file(
-                file_path, origin, overwrite=overwrite
-            )
+            try:
+                template_action = self.load_template_action_from_file(
+                    file_path, origin, overwrite=overwrite
+                )
+            except Exception as exc:
+                logger.error(
+                    "Failed to load template action",
+                    path=file_path,
+                    error=str(exc),
+                )
+                raise RegistryError(
+                    f"Failed to load template action from {file_path}: {exc}"
+                ) from exc
             if template_action is None:
                 continue
 
@@ -918,9 +949,9 @@ def generate_model_from_function(
                     # Only set the component if no default UI is provided
                     case Component():
                         manually_set_components.append(meta)
-                    # `tracecat_registry` (and sandboxed `registry-client` mode) provides
-                    # lightweight dataclass component definitions that are not instances
-                    # of `tracecat.registry.fields.Component`. These still need to
+                    # `tracecat_registry` provides lightweight dataclass component
+                    # definitions that are not instances of
+                    # `tracecat.registry.fields.Component`. These still need to
                     # propagate to JSONSchema via `x-tracecat-component` so the frontend
                     # can render specialized editors (code, textarea, etc).
                     case _ if isinstance(getattr(meta, "component_id", None), str):

@@ -1,7 +1,7 @@
 """SDK-only case task UDFs.
 
 These UDFs are always registered but route to internal endpoints that are
-gated by feature flags on the server side. If the feature is not enabled,
+gated by entitlements on the server side. If the entitlement is not enabled,
 the server will return 404.
 """
 
@@ -9,8 +9,7 @@ from typing import Annotated, Any
 
 from typing_extensions import Doc
 
-from tracecat_registry import registry, types
-from tracecat_registry.context import get_context
+from tracecat_registry import ctx, registry, types
 
 
 @registry.register(
@@ -18,6 +17,7 @@ from tracecat_registry.context import get_context
     display_group="Cases",
     description="Create a new task for a case.",
     namespace="core.cases",
+    required_entitlements=["case_addons"],
 )
 async def create_task(
     case_id: Annotated[
@@ -59,7 +59,7 @@ async def create_task(
             "workflow_id is required when default_trigger_values is provided"
         )
 
-    return await get_context().cases.create_task(
+    return await ctx.cases.aio.create_task(
         case_id=case_id,
         title=title,
         description=description,
@@ -76,6 +76,7 @@ async def create_task(
     display_group="Cases",
     description="Get details of a specific case task by ID.",
     namespace="core.cases",
+    required_entitlements=["case_addons"],
 )
 async def get_task(
     task_id: Annotated[
@@ -84,7 +85,7 @@ async def get_task(
     ],
 ) -> types.CaseTaskRead:
     """Get a specific case task by ID."""
-    return await get_context().cases.get_task(task_id)
+    return await ctx.cases.aio.get_task(task_id)
 
 
 @registry.register(
@@ -92,6 +93,7 @@ async def get_task(
     display_group="Cases",
     description="List all tasks for a specific case.",
     namespace="core.cases",
+    required_entitlements=["case_addons"],
 )
 async def list_tasks(
     case_id: Annotated[
@@ -100,7 +102,7 @@ async def list_tasks(
     ],
 ) -> list[types.CaseTaskRead]:
     """List all tasks for a case."""
-    return await get_context().cases.list_tasks(case_id)
+    return await ctx.cases.aio.list_tasks(case_id)
 
 
 @registry.register(
@@ -108,6 +110,7 @@ async def list_tasks(
     display_group="Cases",
     description="Update an existing case task.",
     namespace="core.cases",
+    required_entitlements=["case_addons"],
 )
 async def update_task(
     task_id: Annotated[
@@ -145,7 +148,7 @@ async def update_task(
 ) -> types.CaseTaskRead:
     """Update an existing case task."""
     if default_trigger_values and workflow_id is None:
-        existing_task = await get_context().cases.get_task(task_id)
+        existing_task = await ctx.cases.aio.get_task(task_id)
         effective_workflow_id = existing_task.get("workflow_id")
         if not effective_workflow_id:
             raise ValueError(
@@ -169,7 +172,7 @@ async def update_task(
     if default_trigger_values is not None:
         update_params["default_trigger_values"] = default_trigger_values
 
-    return await get_context().cases.update_task(task_id=task_id, **update_params)
+    return await ctx.cases.aio.update_task(task_id=task_id, **update_params)
 
 
 @registry.register(
@@ -177,6 +180,7 @@ async def update_task(
     display_group="Cases",
     description="Delete a case task.",
     namespace="core.cases",
+    required_entitlements=["case_addons"],
 )
 async def delete_task(
     task_id: Annotated[
@@ -185,4 +189,4 @@ async def delete_task(
     ],
 ) -> None:
     """Delete a case task."""
-    await get_context().cases.delete_task(task_id)
+    await ctx.cases.aio.delete_task(task_id)

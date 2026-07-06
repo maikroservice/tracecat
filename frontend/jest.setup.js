@@ -15,6 +15,9 @@ global.TransformStream = TransformStream
 global.ReadableStream = ReadableStream
 global.WritableStream = WritableStream
 
+// jsdom does not implement scrollIntoView (used by cmdk selection)
+Element.prototype.scrollIntoView = jest.fn()
+
 // Mock next-runtime-env
 jest.mock("next-runtime-env", () => ({
   env: jest.fn((key) => process.env[key] || ""),
@@ -48,6 +51,18 @@ jest.mock("react-markdown", () => ({
 jest.mock("streamdown", () => ({
   Streamdown: ({ children }) => children,
 }))
+
+// Mock rehype-katex and rehype-sanitize (ESM-only) for Jest
+jest.mock("rehype-katex", () => {
+  const plugin = () => (tree) => tree
+  return plugin
+})
+jest.mock("rehype-sanitize", () => {
+  const plugin = () => (tree) => tree
+  plugin.default = plugin
+  plugin.defaultSchema = { attributes: {} }
+  return plugin
+})
 
 // Mock react-syntax-highlighter
 jest.mock("react-syntax-highlighter", () => ({

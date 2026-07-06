@@ -5,22 +5,34 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tracecat import config
 from tracecat.auth.enums import AuthType
 from tracecat.auth.types import Role
 from tracecat.contexts import ctx_role
+from tracecat.db.models import OrganizationDomain
+from tracecat.organization.domains import normalize_domain
 from tracecat.settings.constants import SENSITIVE_SETTINGS_KEYS
-from tracecat.settings.router import check_other_auth_enabled
+from tracecat.settings.router import (
+    check_other_auth_enabled,
+    check_saml_domain_prerequisites,
+)
 from tracecat.settings.schemas import (
+    AppSettingsRead,
+    AppSettingsUpdate,
     AuditSettingsUpdate,
-    AuthSettingsUpdate,
     GitSettingsUpdate,
-    OAuthSettingsUpdate,
     SAMLSettingsUpdate,
     SettingCreate,
     SettingUpdate,
     ValueType,
+    VersionedResourceResolutionStrategy,
 )
-from tracecat.settings.service import SettingsService, get_setting, get_setting_override
+from tracecat.settings.service import (
+    SettingsService,
+    get_setting,
+    get_setting_override,
+    get_versioned_resource_resolution_strategy,
+)
 
 pytestmark = pytest.mark.usefixtures("db")
 
@@ -244,6 +256,78 @@ async def test_update_audit_settings_can_clear(
 
 
 @pytest.mark.anyio
+async def test_update_audit_custom_headers_encrypted_at_rest(
+    settings_service_with_defaults: SettingsService,
+) -> None:
+    """Ensure custom headers are stored encrypted and round-trip correctly."""
+    service = settings_service_with_defaults
+    custom_headers = {
+        "Authorization": "Bearer super-secret-token",
+        "X-Tracecat-Source": "audit",
+    }
+    await service.update_audit_settings(
+        AuditSettingsUpdate(audit_webhook_custom_headers=custom_headers)
+    )
+
+    setting = await service.get_org_setting("audit_webhook_custom_headers")
+    assert setting is not None
+    assert setting.is_encrypted is True
+    assert service.get_value(setting) == custom_headers
+    assert setting.value != orjson.dumps(custom_headers, option=orjson.OPT_SORT_KEYS)
+
+
+@pytest.mark.anyio
+async def test_update_audit_custom_payload_encrypted_at_rest(
+    settings_service_with_defaults: SettingsService,
+) -> None:
+    """Ensure custom payload is stored encrypted and round-trip correctly."""
+    service = settings_service_with_defaults
+    custom_payload = {
+        "event_type": "tracecat.audit",
+        "metadata": {"env": "staging"},
+    }
+    await service.update_audit_settings(
+        AuditSettingsUpdate(audit_webhook_custom_payload=custom_payload)
+    )
+
+    setting = await service.get_org_setting("audit_webhook_custom_payload")
+    assert setting is not None
+    assert setting.is_encrypted is True
+    assert service.get_value(setting) == custom_payload
+    assert setting.value != orjson.dumps(custom_payload, option=orjson.OPT_SORT_KEYS)
+
+
+@pytest.mark.anyio
+async def test_update_audit_verify_ssl_setting(
+    settings_service_with_defaults: SettingsService,
+) -> None:
+    """Ensure SSL verification toggle is persisted for audit webhook delivery."""
+    service = settings_service_with_defaults
+    await service.update_audit_settings(
+        AuditSettingsUpdate(audit_webhook_verify_ssl=False)
+    )
+
+    settings = await service.list_org_settings(keys={"audit_webhook_verify_ssl"})
+    settings_dict = {setting.key: service.get_value(setting) for setting in settings}
+    assert settings_dict["audit_webhook_verify_ssl"] is False
+
+
+@pytest.mark.anyio
+async def test_update_audit_payload_attribute_setting(
+    settings_service_with_defaults: SettingsService,
+) -> None:
+    """Ensure payload wrapper attribute is persisted for audit webhook delivery."""
+    service = settings_service_with_defaults
+    await service.update_audit_settings(
+        AuditSettingsUpdate(audit_webhook_payload_attribute="event")
+    )
+
+    settings = await service.list_org_settings(keys={"audit_webhook_payload_attribute"})
+    settings_dict = {setting.key: service.get_value(setting) for setting in settings}
+    assert settings_dict["audit_webhook_payload_attribute"] == "event"
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     "valid_url",
     [
@@ -251,8 +335,10 @@ async def test_update_audit_settings_can_clear(
         "git+ssh://git@gitlab.example.com:2222/org/repo.git",
         "git+ssh://git@gitlab.com/org/team/subteam/repo.git",
         "git+ssh://git@github.com/org/repo.git@main",
+        "git+ssh://git@github.com/org/repo.git@feature/custom-branch",
         "git+ssh://git@github.com/org/repo",  # Without .git suffix
         "git+ssh://git@example.com/very/deep/nested/org/repo.git",
+        "git+ssh://someuser@git.example.com/very/deep/nested/org/repo.git",
     ],
 )
 async def test_git_settings_valid_ssh_urls(
@@ -279,7 +365,7 @@ async def test_git_settings_valid_ssh_urls(
     "invalid_url",
     [
         "https://github.com/org/repo.git",  # Wrong protocol
-        "git+ssh://user@github.com/org/repo.git",  # Wrong user
+        "git+ssh://github.com/org/repo.git",  # Missing SSH user
         "git+ssh://git@github.com/",  # No path
         "git+ssh://git@/org/repo.git",  # No host
         "git://git@github.com/org/repo.git",  # Missing +ssh
@@ -347,47 +433,36 @@ async def test_update_saml_settings(
 
 
 @pytest.mark.anyio
-async def test_update_auth_settings(
+@pytest.mark.parametrize(
+    "setting_key",
+    [
+        "saml_idp_metadata_url",
+        "audit_webhook_url",
+        "audit_webhook_custom_headers",
+        "audit_webhook_custom_payload",
+    ],
+)
+async def test_get_values_with_decryption_fallback_for_invalid_encrypted_settings(
     settings_service_with_defaults: SettingsService,
+    setting_key: str,
 ) -> None:
-    """Test updating authentication settings."""
+    """Invalid encrypted values should not crash grouped settings reads."""
     service = settings_service_with_defaults
 
-    test_params = AuthSettingsUpdate(
-        auth_basic_enabled=True,
-        auth_require_email_verification=True,
-        auth_allowed_email_domains=["test.com"],
-        auth_min_password_length=16,
-        auth_session_expire_time_seconds=3600,
+    setting = await service.get_org_setting(setting_key)
+    assert setting is not None
+    assert setting.is_encrypted is True
+    setting.value = b"invalid-ciphertext"
+    service.session.add(setting)
+    await service.session.commit()
+
+    settings = await service.list_org_settings(keys={setting_key})
+    settings_dict, decryption_failed_keys = service.get_values_with_decryption_fallback(
+        settings
     )
-    await service.update_auth_settings(test_params)
 
-    auth_settings = await service.list_org_settings(keys=AuthSettingsUpdate.keys())
-    settings_dict = {
-        setting.key: service.get_value(setting) for setting in auth_settings
-    }
-    assert settings_dict["auth_basic_enabled"] is True
-    assert settings_dict["auth_require_email_verification"] is True
-    assert settings_dict["auth_allowed_email_domains"] == ["test.com"]  # Returns a list
-    assert settings_dict["auth_min_password_length"] == 16
-    assert settings_dict["auth_session_expire_time_seconds"] == 3600
-
-
-@pytest.mark.anyio
-async def test_update_oauth_settings(
-    settings_service_with_defaults: SettingsService,
-) -> None:
-    """Test updating OAuth settings."""
-    service = settings_service_with_defaults
-
-    test_params = OAuthSettingsUpdate(oauth_google_enabled=True)
-    await service.update_oauth_settings(test_params)
-
-    oauth_settings = await service.list_org_settings(keys=OAuthSettingsUpdate.keys())
-    settings_dict = {
-        setting.key: service.get_value(setting) for setting in oauth_settings
-    }
-    assert settings_dict["oauth_google_enabled"] is True
+    assert settings_dict[setting_key] is None
+    assert decryption_failed_keys == [setting_key]
 
 
 @pytest.mark.anyio
@@ -432,23 +507,61 @@ async def test_get_setting_shorthand(
         )
         assert nonexistent_no_default is None
     finally:
-        ctx_role.set(token)  # type: ignore
+        ctx_role.reset(token)  # type: ignore
+
+
+def test_app_settings_read_defaults_versioned_resource_strategy() -> None:
+    settings = AppSettingsRead(
+        app_registry_validation_enabled=False,
+        app_executions_query_limit=100,
+        app_interactions_enabled=False,
+        app_workflow_export_enabled=True,
+        app_create_workspace_on_register=False,
+        app_action_form_mode_enabled=True,
+    )
+
+    assert (
+        settings.app_versioned_resource_resolution_strategy
+        is VersionedResourceResolutionStrategy.LATEST
+    )
+
+
+@pytest.mark.anyio
+async def test_get_versioned_resource_resolution_strategy(
+    settings_service_with_defaults: SettingsService,
+    svc_admin_role: Role,
+) -> None:
+    service = settings_service_with_defaults
+
+    strategy = await get_versioned_resource_resolution_strategy(
+        role=svc_admin_role,
+        session=service.session,
+    )
+    assert strategy is VersionedResourceResolutionStrategy.LATEST
+
+    await service.update_app_settings(
+        AppSettingsUpdate(
+            app_versioned_resource_resolution_strategy=(
+                VersionedResourceResolutionStrategy.PINNED
+            )
+        )
+    )
+
+    strategy = await get_versioned_resource_resolution_strategy(
+        role=svc_admin_role,
+        session=service.session,
+    )
+    assert strategy is VersionedResourceResolutionStrategy.PINNED
 
 
 @pytest.mark.anyio
 async def test_check_other_auth_enabled_success(
     settings_service_with_defaults: SettingsService,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Test check_other_auth_enabled when another auth type is enabled."""
     service = settings_service_with_defaults
-
-    # Enable both SAML and Basic auth
-    await service.update_saml_settings(SAMLSettingsUpdate(saml_enabled=True))
-    await service.update_auth_settings(AuthSettingsUpdate(auth_basic_enabled=True))
-
-    # Should not raise an exception when checking SAML (since Basic is enabled)
-    from tracecat.auth.enums import AuthType
-    from tracecat.settings.router import check_other_auth_enabled
+    monkeypatch.setattr(config, "TRACECAT__AUTH_TYPES", {AuthType.SAML, AuthType.BASIC})
 
     await check_other_auth_enabled(service, AuthType.SAML)
 
@@ -456,21 +569,93 @@ async def test_check_other_auth_enabled_success(
 @pytest.mark.anyio
 async def test_check_other_auth_enabled_failure(
     settings_service_with_defaults: SettingsService,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Test check_other_auth_enabled when no other auth type is enabled."""
     service = settings_service_with_defaults
-
-    # Disable all auth types except Basic
-    await service.update_saml_settings(SAMLSettingsUpdate(saml_enabled=False))
-    await service.update_oauth_settings(OAuthSettingsUpdate(oauth_google_enabled=False))
-    await service.update_auth_settings(AuthSettingsUpdate(auth_basic_enabled=True))
+    monkeypatch.setattr(config, "TRACECAT__AUTH_TYPES", {AuthType.SAML})
 
     # Should raise HTTPException when trying to disable the last enabled auth type
     with pytest.raises(HTTPException) as exc_info:
-        await check_other_auth_enabled(service, AuthType.BASIC)
+        await check_other_auth_enabled(service, AuthType.SAML)
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail == "At least one other auth type must be enabled"
+
+
+@pytest.mark.anyio
+async def test_check_saml_domain_prerequisites_raises_without_domains(
+    settings_service_with_defaults: SettingsService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = settings_service_with_defaults
+    monkeypatch.setattr(config, "TRACECAT__EE_MULTI_TENANT", True)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await check_saml_domain_prerequisites(
+            session=service.session,
+            role=service.role,
+            params=SAMLSettingsUpdate(saml_enabled=True),
+        )
+
+    assert exc_info.value.status_code == 400
+    assert "active organization domain" in str(exc_info.value.detail)
+
+
+@pytest.mark.anyio
+async def test_check_saml_domain_prerequisites_passes_with_active_domain(
+    settings_service_with_defaults: SettingsService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = settings_service_with_defaults
+    monkeypatch.setattr(config, "TRACECAT__EE_MULTI_TENANT", True)
+    normalized = normalize_domain("acme.example")
+    service.session.add(
+        OrganizationDomain(
+            organization_id=service.organization_id,
+            domain=normalized.domain,
+            normalized_domain=normalized.normalized_domain,
+            is_primary=True,
+            is_active=True,
+        )
+    )
+    await service.session.commit()
+
+    await check_saml_domain_prerequisites(
+        session=service.session,
+        role=service.role,
+        params=SAMLSettingsUpdate(saml_enabled=True),
+    )
+
+
+@pytest.mark.anyio
+async def test_check_saml_domain_prerequisites_ignores_non_enabling_updates(
+    settings_service_with_defaults: SettingsService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = settings_service_with_defaults
+    monkeypatch.setattr(config, "TRACECAT__EE_MULTI_TENANT", True)
+
+    await check_saml_domain_prerequisites(
+        session=service.session,
+        role=service.role,
+        params=SAMLSettingsUpdate(saml_idp_metadata_url="https://idp.example.com"),
+    )
+
+
+@pytest.mark.anyio
+async def test_check_saml_domain_prerequisites_skips_single_tenant_without_domains(
+    settings_service_with_defaults: SettingsService,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = settings_service_with_defaults
+    monkeypatch.setattr(config, "TRACECAT__EE_MULTI_TENANT", False)
+
+    await check_saml_domain_prerequisites(
+        session=service.session,
+        role=service.role,
+        params=SAMLSettingsUpdate(saml_enabled=True),
+    )
 
 
 @pytest.mark.anyio
@@ -510,8 +695,6 @@ async def test_init_default_settings(
     "key,env_value,expected",
     [
         ("saml_enabled", "true", "true"),
-        ("auth_basic_enabled", "false", "false"),
-        ("oauth_google_enabled", "1", "1"),
         ("unauthorized_setting", "true", None),
     ],
 )
@@ -530,8 +713,6 @@ def test_get_setting_override(
     "key,env_value,expected",
     [
         ("saml_enabled", "true", True),
-        ("auth_basic_enabled", "false", False),
-        ("oauth_google_enabled", "1", True),
         ("unauthorized_setting", "true", None),
         ("saml_enabled", "some_string", "some_string"),
     ],
@@ -545,7 +726,7 @@ async def test_setting_with_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Test get_setting with environment overrides."""
-    if key in {"saml_enabled", "auth_basic_enabled", "oauth_google_enabled"}:
+    if key == "saml_enabled":
         monkeypatch.setenv(f"TRACECAT__SETTING_OVERRIDE_{key.upper()}", env_value)
 
     # Test with both session and role

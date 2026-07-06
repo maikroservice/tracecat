@@ -16,8 +16,11 @@ from tracecat_registry.sdk.exceptions import (
 )
 
 if TYPE_CHECKING:
+    from tracecat_registry.sdk.agents import AgentsClient
     from tracecat_registry.sdk.cases import CasesClient
+    from tracecat_registry.sdk.deduplicate import DeduplicateClient
     from tracecat_registry.sdk.tables import TablesClient
+    from tracecat_registry.sdk.variables import VariablesClient
     from tracecat_registry.sdk.workflows import WorkflowsClient
 
 
@@ -37,6 +40,7 @@ class TracecatClient:
         self,
         *,
         api_url: str | None = None,
+        action_gateway_socket: str | None = None,
         token: str | None = None,
         workspace_id: str | None = None,
         timeout: float = 120.0,
@@ -45,15 +49,20 @@ class TracecatClient:
 
         Args:
             api_url: Base URL of the Tracecat API. Defaults to TRACECAT__API_URL env var.
+            action_gateway_socket: Compatibility override for the executor-local
+                gateway socket. Defaults to TRACECAT__ACTION_GATEWAY_SOCKET.
             token: JWT token for authentication. Defaults to TRACECAT__EXECUTOR_TOKEN env var.
             workspace_id: Workspace ID. Defaults to TRACECAT__WORKSPACE_ID env var.
             timeout: Request timeout in seconds.
         """
-        base_url = api_url or os.environ.get("TRACECAT__API_URL", "http://api:8000")
-        # Ensure /internal suffix is present
-        if not base_url.endswith("/internal"):
-            base_url = base_url.rstrip("/") + "/internal"
-        self._api_url = base_url
+        self._api_url = self._normalize_internal_url(
+            api_url or os.environ.get("TRACECAT__API_URL", "http://api:8000")
+        )
+        self._action_gateway_socket = action_gateway_socket or os.environ.get(
+            "TRACECAT__ACTION_GATEWAY_SOCKET"
+        )
+        if not self._action_gateway_socket:
+            self._action_gateway_socket = None
 
         self._token = token or os.environ.get("TRACECAT__EXECUTOR_TOKEN", "")
         self._workspace_id = workspace_id or os.environ.get(
@@ -62,19 +71,50 @@ class TracecatClient:
         self._timeout = timeout
 
         # Lazily initialized sub-clients
+        self._agents: AgentsClient | None = None
         self._cases: CasesClient | None = None
+        self._deduplicate: DeduplicateClient | None = None
         self._tables: TablesClient | None = None
+        self._variables: VariablesClient | None = None
         self._workflows: WorkflowsClient | None = None
+
+    @staticmethod
+    def _normalize_internal_url(base_url: str) -> str:
+        """Normalize a base URL so SDK paths resolve under /internal."""
+        if base_url.endswith("/internal"):
+            return base_url
+        return base_url.rstrip("/") + "/internal"
 
     @property
     def api_url(self) -> str:
         """Base URL of the Tracecat API."""
         return self._api_url
 
+    def _request_url_and_transport(
+        self,
+        path: str,
+    ) -> tuple[str, httpx.AsyncHTTPTransport | None]:
+        """Return the target URL and transport for an internal SDK request."""
+        if self._action_gateway_socket is None:
+            return f"{self._api_url}{path}", None
+        return (
+            f"http://tracecat-action-gateway/internal{path}",
+            httpx.AsyncHTTPTransport(uds=self._action_gateway_socket),
+        )
+
     @property
     def workspace_id(self) -> str:
         """Current workspace ID."""
         return self._workspace_id
+
+    @property
+    def deduplicate(self) -> DeduplicateClient:
+        """Deduplicate API client."""
+        if self._deduplicate is None:
+            from tracecat_registry.sdk.deduplicate import DeduplicateClient
+
+            self._deduplicate = DeduplicateClient(self)
+        return self._deduplicate
 
     @property
     def cases(self) -> CasesClient:
@@ -86,6 +126,15 @@ class TracecatClient:
         return self._cases
 
     @property
+    def agents(self) -> AgentsClient:
+        """Agents API client."""
+        if self._agents is None:
+            from tracecat_registry.sdk.agents import AgentsClient
+
+            self._agents = AgentsClient(self)
+        return self._agents
+
+    @property
     def tables(self) -> TablesClient:
         """Tables API client."""
         if self._tables is None:
@@ -93,6 +142,15 @@ class TracecatClient:
 
             self._tables = TablesClient(self)
         return self._tables
+
+    @property
+    def variables(self) -> VariablesClient:
+        """Variables API client."""
+        if self._variables is None:
+            from tracecat_registry.sdk.variables import VariablesClient
+
+            self._variables = VariablesClient(self)
+        return self._variables
 
     @property
     def workflows(self) -> WorkflowsClient:
@@ -112,25 +170,32 @@ class TracecatClient:
             headers["Authorization"] = f"Bearer {self._token}"
         return headers
 
+    def _extract_error_detail(self, response: httpx.Response) -> Any | None:
+        try:
+            data = response.json()
+        except Exception:
+            return response.text or None
+
+        if isinstance(data, dict):
+            detail = data.get("detail")
+            if detail is not None:
+                return detail
+            if "message" in data:
+                return data["message"]
+            return None if "detail" in data else data
+        return data
+
     def _handle_error_response(self, response: httpx.Response) -> None:
         """Convert HTTP error responses to SDK exceptions."""
         status_code = response.status_code
-
-        # Try to extract detail from JSON response
-        detail: str | None = None
-        try:
-            data = response.json()
-            if isinstance(data, dict):
-                detail = data.get("detail")
-        except Exception:
-            detail = response.text or None
+        detail = self._extract_error_detail(response)
 
         if status_code == 401:
             raise TracecatAuthError(detail=detail, status_code=401)
         elif status_code == 403:
             raise TracecatAuthError(detail=detail, status_code=403)
         elif status_code == 404:
-            raise TracecatNotFoundError(resource="Resource", identifier=detail)
+            raise TracecatNotFoundError(detail=detail)
         elif status_code == 409:
             raise TracecatConflictError(detail=detail)
         elif status_code in (400, 422):
@@ -169,12 +234,15 @@ class TracecatClient:
             TracecatValidationError: For 400/422 responses
             TracecatAPIError: For other error responses
         """
-        url = f"{self._api_url}{path}"
+        url, transport = self._request_url_and_transport(path)
         request_headers = self._get_headers()
         if headers:
             request_headers.update(headers)
 
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
+        async with httpx.AsyncClient(
+            transport=transport,
+            timeout=self._timeout,
+        ) as client:
             response = await client.request(
                 method,
                 url,

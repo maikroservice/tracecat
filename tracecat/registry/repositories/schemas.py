@@ -66,7 +66,7 @@ class RegistryRepositoryCreate(BaseModel):
         # Delegate to shared regex to ensure consistency across validators
         if not GIT_SSH_URL_REGEX.match(v):
             raise TracecatValidationError(
-                "Must be a valid Git SSH URL (e.g., git+ssh://git@github.com/org/repo.git)"
+                "Must be a valid Git SSH URL (e.g., git+ssh://<user>@github.com/org/repo.git)"
             )
         return v
 
@@ -99,7 +99,6 @@ class GitCommitInfo(BaseModel):
     message: str = Field(
         ...,
         description="The commit message",
-        max_length=1000,
     )
     author: str = Field(
         ...,
@@ -119,6 +118,21 @@ class GitCommitInfo(BaseModel):
     tags: list[str] = Field(
         default_factory=list,
         description="List of tags associated with this commit",
+    )
+
+
+class GitBranchInfo(BaseModel):
+    """Git branch information for repository management."""
+
+    name: str = Field(
+        ...,
+        description="Branch name",
+        min_length=1,
+        max_length=255,
+    )
+    is_default: bool = Field(
+        default=False,
+        description="Whether this branch is the repository default branch",
     )
 
 

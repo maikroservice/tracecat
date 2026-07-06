@@ -14,13 +14,12 @@ from __future__ import annotations
 
 import base64
 import uuid
-from datetime import UTC
-from unittest.mock import patch
+from typing import Any, cast, get_args
 
 import pytest
 import respx
 import sqlalchemy as sa
-from httpx import Response
+from httpx import ASGITransport
 from pydantic import TypeAdapter
 from sqlalchemy.ext.asyncio import AsyncSession
 from tracecat_registry import types
@@ -37,16 +36,18 @@ from tracecat_registry.core.cases import (
     get_attachment,
     get_attachment_download_url,
     get_case,
+    get_comment_thread,
     list_attachments,
     list_case_events,
     list_cases,
+    list_comment_threads,
     list_comments,
     remove_case_tag,
+    reply_to_comment,
     search_cases,
     update_case,
     update_comment,
     upload_attachment,
-    upload_attachment_from_url,
 )
 from tracecat_registry.core.ee.durations import get_case_metrics
 from tracecat_registry.core.ee.tasks import create_task, list_tasks
@@ -59,7 +60,16 @@ from tracecat_registry.sdk.exceptions import (
 
 from tracecat import config
 from tracecat.api.app import app
-from tracecat.auth.types import AccessLevel, Role
+from tracecat.auth.dependencies import (
+    ExecutorWorkspaceRole,
+    OrgUserRole,
+    ServiceRole,
+    WorkspaceActorRouteRole,
+    WorkspaceUserRole,
+)
+from tracecat.auth.executor_tokens import mint_executor_token
+from tracecat.auth.types import Role
+from tracecat.authz.scopes import SERVICE_PRINCIPAL_SCOPES
 from tracecat.cases.durations.schemas import (
     CaseDurationDefinitionCreate,
     CaseDurationEventAnchor,
@@ -68,6 +78,7 @@ from tracecat.cases.durations.service import CaseDurationDefinitionService
 from tracecat.cases.enums import CaseEventType
 from tracecat.cases.service import CaseFieldsService
 from tracecat.contexts import ctx_role
+from tracecat.db.dependencies import get_async_session
 from tracecat.db.models import User, Workspace
 
 # Advisory lock ID for serializing case_fields schema creation in tests.
@@ -76,29 +87,32 @@ from tracecat.db.models import User, Workspace
 _CASE_FIELDS_SCHEMA_LOCK_ID = 0x7472616365636174  # "tracecat" in hex
 
 
+def _case_items(
+    result: list[types.CaseReadMinimal] | types.CaseListResponse,
+) -> list[types.CaseReadMinimal]:
+    """Normalize list/search case UDF outputs to case items."""
+    if isinstance(result, list):
+        return result
+    return result["items"]
+
+
 @pytest.fixture
 async def cases_test_role(svc_workspace: Workspace) -> Role:
     """Create a service role for case UDF tests."""
     return Role(
         type="service",
-        access_level=AccessLevel.ADMIN,
         workspace_id=svc_workspace.id,
+        organization_id=svc_workspace.organization_id,
         user_id=uuid.uuid4(),
         service_id="tracecat-runner",
+        scopes=SERVICE_PRINCIPAL_SCOPES["tracecat-runner"],
     )
-
-
-@pytest.fixture(params=[False, True], ids=["registry_client_off", "registry_client_on"])
-def registry_client_enabled(request) -> bool:
-    """Toggle the REGISTRY_CLIENT feature flag."""
-    return request.param
 
 
 @pytest.fixture
 async def cases_ctx(
     cases_test_role: Role,
     session: AsyncSession,
-    registry_client_enabled: bool,
 ):
     """Set up the ctx_role and registry context for case UDF tests.
 
@@ -106,6 +120,8 @@ async def cases_ctx(
     to prevent deadlocks when multiple tests run concurrently. The deadlock occurs
     because CREATE TABLE with FK constraints acquires ShareRowExclusiveLock on
     the referenced table, and concurrent schema creations can deadlock.
+
+    Uses SDK path with respx mock to route HTTP calls to the FastAPI app.
     """
     # Acquire advisory lock to serialize schema creation across concurrent tests
     await session.execute(
@@ -118,75 +134,64 @@ async def cases_ctx(
     await session.commit()
 
     # Set up registry context for SDK access within UDFs
+    workflow_id = "test-workflow-id"
+    wf_exec_id = "test-wf-exec-id"
+    assert cases_test_role.workspace_id is not None
+    executor_token = mint_executor_token(
+        workspace_id=cases_test_role.workspace_id,
+        user_id=cases_test_role.user_id,
+        wf_id=workflow_id,
+        wf_exec_id=wf_exec_id,
+    )
     registry_ctx = RegistryContext(
         workspace_id=str(cases_test_role.workspace_id),
-        workflow_id="test-workflow-id",
+        workflow_id=workflow_id,
         run_id="test-run-id",
+        wf_exec_id=wf_exec_id,
         environment="default",
         api_url=config.TRACECAT__API_URL,
+        token=executor_token,
     )
     set_context(registry_ctx)
 
-    respx_mock = None
-    # Patch the module-level constant in core.cases
-    with patch(
-        "tracecat_registry.config.flags.registry_client", registry_client_enabled
-    ):
-        if registry_client_enabled:
-            from typing import get_args
+    # Set up respx mock to route SDK HTTP calls to the FastAPI app
+    respx_mock = respx.mock(assert_all_mocked=False, assert_all_called=False)
+    respx_mock.start()
+    respx_mock.route(url__startswith=config.TRACECAT__API_URL).mock(
+        side_effect=ASGITransport(app).handle_async_request
+    )
 
-            from httpx import ASGITransport
+    # Override role dependencies to use our test role
+    def override_role():
+        return cases_test_role
 
-            from tracecat.auth.dependencies import (
-                ExecutorWorkspaceRole,
-                OrgAdminUser,
-                ServiceRole,
-                WorkspaceUserRole,
-            )
-            from tracecat.cases.router import WorkspaceAdminUser, WorkspaceUser
-            from tracecat.db.dependencies import get_async_session
+    role_dependencies = [
+        ExecutorWorkspaceRole,
+        WorkspaceUserRole,
+        WorkspaceActorRouteRole,
+        ServiceRole,
+        OrgUserRole,
+    ]
+    for annotated_type in role_dependencies:
+        metadata = get_args(annotated_type)
+        # metadata[0] is Role, metadata[1] is the Depends(...) object
+        if len(metadata) > 1 and hasattr(metadata[1], "dependency"):
+            app.dependency_overrides[metadata[1].dependency] = override_role
 
-            # Mock the API URL to point to the app
-            respx_mock = respx.mock(assert_all_mocked=False, assert_all_called=False)
-            respx_mock.start()
-            respx_mock.route(url__startswith=config.TRACECAT__API_URL).mock(
-                side_effect=ASGITransport(app).handle_async_request
-            )
+    # Also need to override the DB session to use the test session
+    async def override_get_async_session():
+        yield session
 
-            # Override role dependencies to use our test role
-            def override_role():
-                return cases_test_role
+    app.dependency_overrides[get_async_session] = override_get_async_session
 
-            role_dependencies = [
-                ExecutorWorkspaceRole,
-                WorkspaceUserRole,
-                WorkspaceUser,
-                WorkspaceAdminUser,
-                ServiceRole,
-                OrgAdminUser,
-            ]
-            for annotated_type in role_dependencies:
-                metadata = get_args(annotated_type)
-                # metadata[0] is Role, metadata[1] is the Depends(...) object
-                if len(metadata) > 1 and hasattr(metadata[1], "dependency"):
-                    app.dependency_overrides[metadata[1].dependency] = override_role
-
-            # Also need to override the DB session to use the test session
-            async def override_get_async_session():
-                yield session
-
-            app.dependency_overrides[get_async_session] = override_get_async_session
-
-        token = ctx_role.set(cases_test_role)
-        try:
-            yield cases_test_role
-        finally:
-            ctx_role.reset(token)
-            clear_context()
-            if respx_mock is not None:
-                respx_mock.stop()
-            if registry_client_enabled:
-                app.dependency_overrides.clear()
+    token = ctx_role.set(cases_test_role)
+    try:
+        yield cases_test_role
+    finally:
+        ctx_role.reset(token)
+        clear_context()
+        respx_mock.stop()
+        app.dependency_overrides.clear()
 
 
 @pytest.fixture
@@ -198,8 +203,8 @@ def blob_storage_config(monkeypatch: pytest.MonkeyPatch):
     """
     # Set environment variables for blob storage
     monkeypatch.setenv("TRACECAT__BLOB_STORAGE_ENDPOINT", "http://localhost:9000")
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "minioadmin")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "minioadmin")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "minio")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "password")
 
     # Also update the config module's values directly since they're already loaded
     monkeypatch.setattr(
@@ -211,61 +216,32 @@ def blob_storage_config(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.fixture
 async def test_user(
-    db,
+    db,  # noqa: ARG001
     session: AsyncSession,
-    svc_workspace: Workspace,
-    cases_ctx: Role,
-    registry_client_enabled: bool,
+    svc_workspace: Workspace,  # noqa: ARG001
+    cases_ctx: Role,  # noqa: ARG001
 ) -> User:
     """Create a test user for assign_user tests.
 
-    This fixture handles both registry_client modes:
-    - registry_client_off: Uses a separate session with commit so the user is visible
-      to CasesService which creates its own session.
-    - registry_client_on: Uses the test session (which is injected into the app via
-      dependency override) so the user is visible to API calls.
+    Uses the test session which is shared with the API via dependency override.
 
     IMPORTANT: This fixture must depend on cases_ctx to ensure the session override
-    is in place before the user is created (for registry_client_on mode).
+    is in place before the user is created.
     """
     user_id = uuid.uuid4()
     user_email = f"test-user-{uuid.uuid4().hex[:8]}@example.com"
 
-    if registry_client_enabled:
-        # For SDK client mode, use the test session which is shared with the API
-        user = User(
-            id=user_id,
-            email=user_email,
-            hashed_password="hashed",
-            first_name="Test",
-            last_name="User",
-        )
-        session.add(user)
-        await session.flush()
-        return user
-    else:
-        # For direct service mode, use a separate session with commit
-        from tracecat.db.engine import get_async_session_context_manager
-
-        async with get_async_session_context_manager() as user_session:
-            user = User(
-                id=user_id,
-                email=user_email,
-                hashed_password="hashed",
-                first_name="Test",
-                last_name="User",
-            )
-            user_session.add(user)
-            await user_session.commit()
-
-        # Return a fresh reference to avoid detached instance issues
-        return User(
-            id=user_id,
-            email=user_email,
-            hashed_password="hashed",
-            first_name="Test",
-            last_name="User",
-        )
+    # Use the test session which is shared with the API
+    user = User(
+        id=user_id,
+        email=user_email,
+        hashed_password="hashed",
+        first_name="Test",
+        last_name="User",
+    )
+    session.add(user)
+    await session.flush()
+    return user
 
 
 # =============================================================================
@@ -343,6 +319,27 @@ class TestCreateCase:
 
         assert result["summary"] == "Case with Tags"
         assert "id" in result
+
+    async def test_create_case_with_tags_create_if_missing(
+        self, db, session: AsyncSession, cases_ctx: Role
+    ):
+        """Create a case with tags using create_missing_tags to auto-create tags."""
+        tag_name = f"auto-create-tag-{uuid.uuid4().hex[:8]}"
+
+        result = await create_case(
+            summary="Case with Auto Tags",
+            description="Test case with auto-created tags.",
+            tags=[tag_name],
+            create_missing_tags=True,
+        )
+
+        assert result["summary"] == "Case with Auto Tags"
+        assert "id" in result
+
+        # Verify the tag was created and attached
+        full_case = await get_case(case_id=str(result["id"]))
+        tag_refs = [t["ref"] for t in full_case["tags"]]
+        assert tag_name in tag_refs
 
 
 # =============================================================================
@@ -515,6 +512,30 @@ class TestUpdateCase:
 
         assert "id" in result
 
+    async def test_update_case_tags_create_if_missing(
+        self, db, session: AsyncSession, cases_ctx: Role
+    ):
+        """Update case tags using create_missing_tags to auto-create tags."""
+        created = await create_case(
+            summary="Test Case for Auto Tags",
+            description="Test description",
+        )
+
+        tag_name = f"auto-update-tag-{uuid.uuid4().hex[:8]}"
+
+        result = await update_case(
+            case_id=str(created["id"]),
+            tags=[tag_name],
+            create_missing_tags=True,
+        )
+
+        assert "id" in result
+
+        # Verify the tag was created and attached
+        full_case = await get_case(case_id=str(result["id"]))
+        tag_refs = [t["ref"] for t in full_case["tags"]]
+        assert tag_name in tag_refs
+
 
 # =============================================================================
 # list_cases characterization tests
@@ -532,10 +553,9 @@ class TestListCases:
         await create_case(summary="Case 1", description="Description 1")
         await create_case(summary="Case 2", description="Description 2")
 
-        result = await list_cases()
+        result = _case_items(await list_cases())
 
         TypeAdapter(list[types.CaseReadMinimal]).validate_python(result)
-        assert isinstance(result, list)
         assert len(result) >= 2
         summaries = [c["summary"] for c in result]
         assert "Case 1" in summaries
@@ -548,7 +568,7 @@ class TestListCases:
         for i in range(5):
             await create_case(summary=f"Case {i}", description=f"Description {i}")
 
-        result = await list_cases(limit=3)
+        result = _case_items(await list_cases(limit=3))
 
         assert len(result) == 3
 
@@ -560,9 +580,10 @@ class TestListCases:
         await create_case(summary="High Priority", description="High", priority="high")
 
         # Order by priority descending
-        result = await list_cases(order_by="priority", sort="desc", limit=10)
+        result = _case_items(
+            await list_cases(order_by="priority", sort="desc", limit=10)
+        )
 
-        assert isinstance(result, list)
         assert len(result) >= 2
 
     async def test_list_cases_order_by_created_at(
@@ -572,11 +593,12 @@ class TestListCases:
         await create_case(summary="First Case", description="First")
         await create_case(summary="Second Case", description="Second")
 
-        result_asc = await list_cases(order_by="created_at", sort="asc", limit=10)
-        result_desc = await list_cases(order_by="created_at", sort="desc", limit=10)
-
-        assert isinstance(result_asc, list)
-        assert isinstance(result_desc, list)
+        result_asc = _case_items(
+            await list_cases(order_by="created_at", sort="asc", limit=10)
+        )
+        result_desc = _case_items(
+            await list_cases(order_by="created_at", sort="desc", limit=10)
+        )
         # The order should be different
         if len(result_asc) >= 2 and len(result_desc) >= 2:
             assert result_asc[0]["id"] != result_desc[0]["id"]
@@ -589,131 +611,71 @@ class TestListCases:
 
 @pytest.mark.anyio
 class TestSearchCases:
-    """Characterization tests for search_cases UDF."""
+    """Characterization tests for search_cases UDF alias behavior."""
 
-    async def test_search_cases_by_text(
+    async def test_search_cases_matches_list_cases(
         self, db, session: AsyncSession, cases_ctx: Role
     ):
-        """Search cases finds cases matching search term."""
-        await create_case(summary="Security Alert", description="Suspicious activity")
-        await create_case(summary="System Update", description="Patch applied")
-        await create_case(summary="Security Patch", description="Critical fix")
+        """search_cases should return the same result as list_cases."""
+        await create_case(summary="Case A", description="A")
+        await create_case(summary="Case B", description="B")
 
-        result = await search_cases(search_term="Security")
-
-        # Note: search_cases returns Case (from to_dict), different shape than list_cases
-        TypeAdapter(list[types.CaseReadMinimal]).validate_python(result)
-
-        assert len(result) >= 2
-        summaries = [c["summary"] for c in result]
-        assert "Security Alert" in summaries
-        assert "Security Patch" in summaries
-
-    async def test_search_cases_by_status(
-        self, db, session: AsyncSession, cases_ctx: Role
-    ):
-        """Search cases filters by status."""
-        await create_case(
-            summary="Active Case", description="Active", status="in_progress"
+        listed = _case_items(
+            await list_cases(limit=10, order_by="created_at", sort="desc")
         )
-        await create_case(summary="Closed Case", description="Closed", status="closed")
-
-        result = await search_cases(status="in_progress")
-
-        assert len(result) >= 1
-        assert all(c["status"] == "in_progress" for c in result)
-
-    async def test_search_cases_by_priority(
-        self, db, session: AsyncSession, cases_ctx: Role
-    ):
-        """Search cases filters by priority."""
-        await create_case(
-            summary="Critical Case", description="Urgent", priority="critical"
-        )
-        await create_case(summary="Low Case", description="Not urgent", priority="low")
-
-        result = await search_cases(priority="critical")
-
-        assert len(result) >= 1
-        assert all(c["priority"] == "critical" for c in result)
-
-    async def test_search_cases_by_severity(
-        self, db, session: AsyncSession, cases_ctx: Role
-    ):
-        """Search cases filters by severity."""
-        await create_case(
-            summary="High Severity Case", description="Critical", severity="high"
-        )
-        await create_case(
-            summary="Low Severity Case", description="Minor", severity="low"
+        searched = _case_items(
+            await search_cases(limit=10, order_by="created_at", sort="desc")
         )
 
-        result = await search_cases(severity="high")
+        TypeAdapter(list[types.CaseReadMinimal]).validate_python(searched)
+        assert searched == listed
 
-        assert len(result) >= 1
-        assert all(c["severity"] == "high" for c in result)
-
-    async def test_search_cases_with_date_range(
+    async def test_search_cases_respects_limit(
         self, db, session: AsyncSession, cases_ctx: Role
     ):
-        """Search cases with date range filters."""
-        from datetime import datetime, timedelta
-
-        # Create a case
-        await create_case(
-            summary="Date Range Test Case",
-            description="Testing date filters",
-        )
-
-        # Search with start_time from yesterday
-        yesterday = datetime.now(UTC) - timedelta(days=1)
-        result = await search_cases(start_time=yesterday)
-
-        assert isinstance(result, list)
-        # Should include our recently created case
-        summaries = [c["summary"] for c in result]
-        assert "Date Range Test Case" in summaries
-
-    async def test_search_cases_with_order_and_limit(
-        self, db, session: AsyncSession, cases_ctx: Role
-    ):
-        """Search cases respects order_by, sort, and limit."""
+        """search_cases should apply the same limit semantics as list_cases."""
         for i in range(5):
-            await create_case(
-                summary=f"Ordered Case {i}",
-                description=f"Description {i}",
-                priority="medium",
-            )
+            await create_case(summary=f"Case {i}", description=f"Description {i}")
 
-        result = await search_cases(
-            priority="medium",
-            order_by="created_at",
-            sort="desc",
-            limit=3,
-        )
+        searched = _case_items(await search_cases(limit=3))
+        listed = _case_items(await list_cases(limit=3))
 
-        assert len(result) <= 3
+        assert len(searched) == 3
+        assert searched == listed
 
-    async def test_search_cases_by_tags(
+    async def test_search_cases_matches_list_cases_with_filters(
         self, db, session: AsyncSession, cases_ctx: Role
     ):
-        """Search cases filters by tags."""
-        case = await create_case(
-            summary="Tagged Search Case",
-            description="Case with tag for search",
+        """search_cases should preserve list_cases filtering behavior."""
+        await create_case(
+            summary="Investigate malware alert",
+            description="High confidence match",
+            status="new",
+            priority="high",
+            severity="critical",
         )
-        tag_name = f"search-tag-{uuid.uuid4().hex[:8]}"
-        await add_case_tag(
-            case_id=str(case["id"]),
-            tag=tag_name,
-            create_if_missing=True,
+        await create_case(
+            summary="Routine phishing triage",
+            description="Low confidence signal",
+            status="closed",
+            priority="low",
+            severity="low",
         )
 
-        result = await search_cases(tags=[tag_name])
+        listed = _case_items(await list_cases(limit=10))
+        searched = _case_items(
+            await search_cases(
+                search_term="malware",
+                status="new",
+                priority="high",
+                severity="critical",
+                limit=10,
+            )
+        )
 
-        assert len(result) >= 1
-        summaries = [c["summary"] for c in result]
-        assert "Tagged Search Case" in summaries
+        assert len(listed) >= len(searched)
+        assert len(searched) == 1
+        assert searched[0]["summary"] == "Investigate malware alert"
 
 
 # =============================================================================
@@ -817,6 +779,28 @@ class TestCreateComment:
         assert reply["content"] == "Reply to parent"
         assert str(reply["parent_id"]) == str(parent["id"])
 
+    async def test_reply_to_comment_helper(
+        self, db, session: AsyncSession, cases_ctx: Role
+    ):
+        """Convenience reply helper should create a reply comment."""
+        case = await create_case(
+            summary="Case with Reply Helper",
+            description="Test case",
+        )
+        parent = await create_comment(
+            case_id=str(case["id"]),
+            content="Parent comment",
+        )
+
+        reply = await reply_to_comment(
+            case_id=str(case["id"]),
+            parent_comment_id=str(parent["id"]),
+            content="Reply helper content",
+        )
+
+        assert reply["content"] == "Reply helper content"
+        assert str(reply["parent_id"]) == str(parent["id"])
+
 
 # =============================================================================
 # update_comment characterization tests
@@ -859,6 +843,15 @@ class TestUpdateComment:
                 content="Updated content",
             )
 
+    def test_update_comment_does_not_accept_parent_id(self):
+        """The UDF surface only supports content updates."""
+        with pytest.raises(TypeError):
+            cast(Any, update_comment)(
+                comment_id=str(uuid.uuid4()),
+                content="Updated content",
+                parent_id=str(uuid.uuid4()),
+            )
+
 
 # =============================================================================
 # list_comments characterization tests
@@ -899,6 +892,62 @@ class TestListComments:
 
         with pytest.raises(SDKNotFoundError):
             await list_comments(case_id=fake_id)
+
+
+@pytest.mark.anyio
+class TestListCommentThreads:
+    """Characterization tests for threaded comment reads."""
+
+    async def test_list_comment_threads_returns_grouped_threads(
+        self, db, session: AsyncSession, cases_ctx: Role
+    ):
+        case = await create_case(
+            summary="Case with comment threads",
+            description="Test case",
+        )
+        top_level = await create_comment(case_id=str(case["id"]), content="Top level")
+        await create_comment(
+            case_id=str(case["id"]),
+            content="Reply one",
+            parent_id=str(top_level["id"]),
+        )
+        await create_comment(case_id=str(case["id"]), content="Second thread")
+
+        result = await list_comment_threads(case_id=str(case["id"]))
+
+        TypeAdapter(list[types.CaseCommentThreadRead]).validate_python(result)
+
+        assert len(result) == 2
+        first_thread = result[0]
+        assert first_thread["comment"]["content"] == "Top level"
+        assert first_thread["reply_count"] == 1
+        assert len(first_thread["replies"]) == 1
+        assert first_thread["replies"][0]["content"] == "Reply one"
+
+    async def test_get_comment_thread_by_reply_id(
+        self, db, session: AsyncSession, cases_ctx: Role
+    ):
+        case = await create_case(
+            summary="Case with reply lookup",
+            description="Test case",
+        )
+        parent = await create_comment(
+            case_id=str(case["id"]),
+            content="Parent comment",
+        )
+        reply = await create_comment(
+            case_id=str(case["id"]),
+            content="Reply comment",
+            parent_id=str(parent["id"]),
+        )
+
+        result = await get_comment_thread(comment_id=str(reply["id"]))
+
+        TypeAdapter(types.CaseCommentThreadRead).validate_python(result)
+
+        assert str(result["comment"]["id"]) == str(parent["id"])
+        assert len(result["replies"]) == 1
+        assert str(result["replies"][0]["id"]) == str(reply["id"])
 
 
 # =============================================================================
@@ -1040,16 +1089,8 @@ class TestListCaseEvents:
 
 @pytest.mark.anyio
 class TestCaseTasks:
-    """Characterization tests for case task UDFs.
+    """Characterization tests for case task UDFs."""
 
-    NOTE: These tests are only run with registry_client_on because task UDFs are
-    SDK-only (no direct service fallback). They require the HTTP API mock to be
-    set up by the cases_ctx fixture.
-    """
-
-    @pytest.mark.parametrize(
-        "registry_client_enabled", [True], ids=["registry_client_on"], indirect=True
-    )
     async def test_create_task_returns_task(
         self, db, session: AsyncSession, cases_ctx: Role
     ):
@@ -1074,9 +1115,6 @@ class TestCaseTasks:
         assert result["status"] == "todo"
         assert str(result["case_id"]) == str(case["id"])
 
-    @pytest.mark.parametrize(
-        "registry_client_enabled", [True], ids=["registry_client_on"], indirect=True
-    )
     async def test_list_tasks_returns_tasks(
         self, db, session: AsyncSession, cases_ctx: Role
     ):
@@ -1111,16 +1149,8 @@ class TestCaseTasks:
 
 @pytest.mark.anyio
 class TestCaseDurationMetrics:
-    """Characterization tests for case duration metrics UDF.
+    """Characterization tests for case duration metrics UDF."""
 
-    NOTE: These tests are only run with registry_client_on because duration UDFs
-    are SDK-only (no direct service fallback). They require the HTTP API mock to
-    be set up by the cases_ctx fixture.
-    """
-
-    @pytest.mark.parametrize(
-        "registry_client_enabled", [True], ids=["registry_client_on"], indirect=True
-    )
     async def test_get_case_metrics_returns_metrics(
         self,
         db,
@@ -1139,7 +1169,7 @@ class TestCaseDurationMetrics:
             ),
         )
 
-        # Use the test session since we're always in registry_client_on mode
+        # Use the test session (SDK path)
         definition_service = CaseDurationDefinitionService(
             session=session, role=cases_ctx
         )
@@ -1498,144 +1528,6 @@ class TestAssignUserByEmail:
                 case_id=str(case["id"]),
                 assignee_email="nonexistent@example.com",
             )
-
-
-# =============================================================================
-# upload_attachment_from_url characterization tests
-# =============================================================================
-
-
-@pytest.mark.anyio
-class TestUploadAttachmentFromUrl:
-    """Characterization tests for upload_attachment_from_url UDF.
-
-    NOTE: These tests are only run with registry_client_off because:
-    1. The upload_attachment_from_url function fetches content from an external URL
-       using httpx.AsyncClient() which needs respx mocking
-    2. When registry_client_on, there's already a respx mock active from cases_ctx
-       that intercepts localhost requests, and nested respx mocks don't work correctly
-    3. The registry_client_on path is tested by other attachment tests that don't
-       require external URL mocking
-    """
-
-    @pytest.mark.parametrize(
-        "registry_client_enabled", [False], ids=["registry_client_off"], indirect=True
-    )
-    async def test_upload_attachment_from_url_uploads_content(
-        self, db, session: AsyncSession, cases_ctx: Role, blob_storage_config
-    ):
-        """Upload attachment from URL downloads and uploads content."""
-        case = await create_case(
-            summary="Case for URL Upload",
-            description="Test case",
-        )
-
-        test_content = b"Content downloaded from URL"
-        with respx.mock(assert_all_mocked=False, assert_all_called=False) as mock:
-            mock.get("https://example.com/test-file.txt").mock(
-                return_value=Response(
-                    200,
-                    content=test_content,
-                    headers={"Content-Type": "text/plain"},
-                )
-            )
-
-            result = await upload_attachment_from_url(
-                case_id=str(case["id"]),
-                url="https://example.com/test-file.txt",
-            )
-
-        assert "id" in result
-        assert result["file_name"] == "test-file.txt"
-        assert result["content_type"] == "text/plain"
-        assert result["size"] == len(test_content)
-
-    @pytest.mark.parametrize(
-        "registry_client_enabled", [False], ids=["registry_client_off"], indirect=True
-    )
-    async def test_upload_attachment_from_url_with_custom_filename(
-        self, db, session: AsyncSession, cases_ctx: Role, blob_storage_config
-    ):
-        """Upload attachment from URL uses custom filename when provided."""
-        case = await create_case(
-            summary="Case for Custom Filename",
-            description="Test case",
-        )
-
-        test_content = b"Custom filename content"
-        with respx.mock(assert_all_mocked=False, assert_all_called=False) as mock:
-            mock.get("https://example.com/some/path").mock(
-                return_value=Response(
-                    200,
-                    content=test_content,
-                    headers={"Content-Type": "text/plain"},
-                )
-            )
-
-            result = await upload_attachment_from_url(
-                case_id=str(case["id"]),
-                url="https://example.com/some/path",
-                file_name="custom-name.txt",
-            )
-
-        assert result["file_name"] == "custom-name.txt"
-
-    @pytest.mark.parametrize(
-        "registry_client_enabled", [False], ids=["registry_client_off"], indirect=True
-    )
-    async def test_upload_attachment_from_url_http_error_raises(
-        self, db, session: AsyncSession, cases_ctx: Role, blob_storage_config
-    ):
-        """Upload attachment from URL with HTTP error raises exception."""
-        import httpx
-
-        case = await create_case(
-            summary="Case for URL Error",
-            description="Test case",
-        )
-
-        # Mock a 404 response
-        with respx.mock(assert_all_mocked=False, assert_all_called=False) as mock:
-            mock.get("https://example.com/not-found.txt").mock(
-                return_value=Response(404, content=b"Not Found")
-            )
-
-            with pytest.raises(httpx.HTTPStatusError):
-                await upload_attachment_from_url(
-                    case_id=str(case["id"]),
-                    url="https://example.com/not-found.txt",
-                )
-
-    @pytest.mark.parametrize(
-        "registry_client_enabled", [False], ids=["registry_client_off"], indirect=True
-    )
-    async def test_upload_attachment_from_url_with_headers(
-        self, db, session: AsyncSession, cases_ctx: Role, blob_storage_config
-    ):
-        """Upload attachment from URL passes custom headers."""
-        case = await create_case(
-            summary="Case for Headers Test",
-            description="Test case",
-        )
-
-        test_content = b"Authenticated content"
-        with respx.mock(assert_all_mocked=False, assert_all_called=False) as mock:
-            mock.get("https://example.com/protected-file.txt").mock(
-                return_value=Response(
-                    200,
-                    content=test_content,
-                    headers={"Content-Type": "text/plain"},
-                )
-            )
-
-            result = await upload_attachment_from_url(
-                case_id=str(case["id"]),
-                url="https://example.com/protected-file.txt",
-                headers={"Authorization": "Bearer token123"},
-            )
-
-        assert "id" in result
-        assert result["file_name"] == "protected-file.txt"
 
 
 # =============================================================================

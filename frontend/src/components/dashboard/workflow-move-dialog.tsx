@@ -40,7 +40,9 @@ export function WorkflowMoveDialog({
   setSelectedWorkflow,
 }: WorkflowMoveDialogProps) {
   const workspaceId = useWorkspaceId()
-  const { moveWorkflow } = useWorkflowManager()
+  const { moveWorkflow } = useWorkflowManager(undefined, {
+    listEnabled: false,
+  })
   const { folders } = useFolders(workspaceId, { enabled: open })
   const [isLoading, setIsLoading] = useState(false)
   const [selectedFolder, setSelectedFolder] = useState<string | null>(null)
@@ -96,7 +98,7 @@ export function WorkflowMoveDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
-          <DialogTitle>Move Workflow</DialogTitle>
+          <DialogTitle>Move workflow</DialogTitle>
           <DialogDescription>
             Choose a folder to move{" "}
             <span className="font-medium">{selectedWorkflow?.title}</span> to

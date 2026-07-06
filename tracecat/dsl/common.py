@@ -72,12 +72,28 @@ from tracecat.interactions.schemas import ActionInteractionValidator
 from tracecat.logger import logger
 from tracecat.registry.lock.types import RegistryLock
 from tracecat.storage.object import CollectionObject, InlineObject, StoredObject
+from tracecat.temporal.codec import decode_payloads
 from tracecat.workflow.actions.schemas import ActionControlFlow
 from tracecat.workflow.executions.enums import (
     ExecutionType,
     TemporalSearchAttr,
     TriggerType,
 )
+
+
+def _load_action_inputs_yaml(inputs: str) -> Any:
+    """Parse persisted action inputs without coercing date-like strings."""
+    yaml_timestamp_tag = "tag:yaml.org,2002:timestamp"
+
+    class ActionInputsSafeLoader(yaml.SafeLoader):
+        """Safe YAML loader that keeps date-like action input scalars as strings."""
+
+    ActionInputsSafeLoader.yaml_implicit_resolvers = {
+        char: [resolver for resolver in resolvers if resolver[0] != yaml_timestamp_tag]
+        for char, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+    return yaml.load(inputs, Loader=ActionInputsSafeLoader)
+
 
 _memo_payload_converter = PydanticPayloadConverter()
 
@@ -117,6 +133,26 @@ class DSLEntrypoint(BaseModel):
 
 def key2loc(key: str) -> str:
     return "inputs" if key == "args" else key
+
+
+SCOPE_OPENER_ACTIONS: frozenset[str] = frozenset(
+    (
+        PlatformAction.TRANSFORM_SCATTER,
+        PlatformAction.LOOP_START,
+    )
+)
+
+SCOPE_CLOSER_ACTIONS: frozenset[str] = frozenset(
+    (
+        PlatformAction.TRANSFORM_GATHER,
+        PlatformAction.LOOP_END,
+    )
+)
+
+CLOSER_TO_OPENER_ACTION: dict[str, str] = {
+    PlatformAction.TRANSFORM_GATHER: PlatformAction.TRANSFORM_SCATTER,
+    PlatformAction.LOOP_END: PlatformAction.LOOP_START,
+}
 
 
 class DSLInput(BaseModel):
@@ -202,7 +238,7 @@ class DSLInput(BaseModel):
                         )
 
     def _validate_scatter_gather_scopes(self) -> None:
-        """Validate scatter-gather scope boundaries.
+        """Validate control-flow scope boundaries.
 
         Logic
         -----
@@ -212,34 +248,73 @@ class DSLInput(BaseModel):
         - We need to validate that no actions outside the scope reference actions inside the scope.
         - We need to validate that no actions outside the scope reference actions inside the scope.
         """
-        # Find scatter and gather actions
+        # Find scope open and close actions
         scatter_actions = []
         gather_actions = []
+        loop_start_actions = []
+        loop_end_actions = []
         for action in self.actions:
             if action.action == PlatformAction.TRANSFORM_SCATTER:
                 scatter_actions.append(action.ref)
             elif action.action == PlatformAction.TRANSFORM_GATHER:
                 gather_actions.append(action.ref)
+            elif action.action == PlatformAction.LOOP_START:
+                loop_start_actions.append(action.ref)
+            elif action.action == PlatformAction.LOOP_END:
+                loop_end_actions.append(action.ref)
 
         if len(gather_actions) > len(scatter_actions):
             raise TracecatDSLError(
                 "There are more gather actions than scatter actions."
             )
+        if len(loop_end_actions) != len(loop_start_actions):
+            raise TracecatDSLError(
+                "Loop scopes must be balanced: "
+                f"found {len(loop_start_actions)} loop start action(s) and "
+                f"{len(loop_end_actions)} loop end action(s)."
+            )
 
-        if not scatter_actions:
-            return  # No scatter actions, no scope validation needed
+        if not scatter_actions and not loop_start_actions:
+            return  # No scope actions, no scope validation needed
 
         # Build adjacency list for graph traversal
         adj = self._to_adjacency()
 
         # Assign scope IDs to all actions
-        scopes, scope_hierarchy = self._assign_action_scopes(adj)
-        self._validate_scope_dependencies(scopes, scope_hierarchy)
+        scopes, scope_hierarchy, scope_openers = self._assign_action_scopes(adj)
+        self._validate_scope_dependencies(scopes, scope_hierarchy, scope_openers)
+        self._validate_loop_scope_synchronization(
+            action_scopes=scopes,
+            scope_hierarchy=scope_hierarchy,
+            scope_openers=scope_openers,
+        )
 
     def _validate_scope_dependencies(
-        self, action_scopes: dict[str, str], scope_hierarchy: dict[str, str | None]
+        self,
+        action_scopes: dict[str, str],
+        scope_hierarchy: dict[str, str | None],
+        scope_openers: dict[str, str],
     ) -> None:
         """Validate that actions don't reference actions in inner scopes."""
+        # Pre-compute loop-end closure metadata once so downstream checks can be
+        # strict and O(1) per reference.
+        loop_end_scope_by_ref: dict[str, str] = {}
+        loop_end_condition_refs_by_ref: dict[str, set[str]] = {}
+        for action in self.actions:
+            if action.action != PlatformAction.LOOP_END:
+                continue
+            loop_end_scope_by_ref[action.ref] = self._resolve_closed_loop_scope(
+                loop_end_stmt=action,
+                action_scopes=action_scopes,
+                scope_hierarchy=scope_hierarchy,
+                scope_openers=scope_openers,
+            )
+            condition_value = action.args.get("condition")
+            condition_expr_ctxs = extract_expressions({"condition": condition_value})
+            loop_end_condition_refs_by_ref[action.ref] = set(
+                condition_expr_ctxs[ExprContext.ACTIONS]
+            )
+
         for action in self.actions:
             # Logic:
             # Scatter - must depend on an action in a parent scope
@@ -251,17 +326,50 @@ class DSLInput(BaseModel):
             for dep in action.depends_on:
                 dep_ref, _ = edge_components_from_dep(dep)
                 dep_scope = action_scopes[dep_ref]
-                if action.action == PlatformAction.TRANSFORM_SCATTER:
+                if action.action in SCOPE_OPENER_ACTIONS:
                     if dep_scope != scope_hierarchy[action_scope]:
+                        if action.action == PlatformAction.TRANSFORM_SCATTER:
+                            msg = (
+                                f"Scatter action '{action.ref}' has an edge from '{dep}',"
+                                " which isn't the parent scope"
+                            )
+                        else:
+                            msg = (
+                                f"Loop start action '{action.ref}' has an edge from"
+                                f" '{dep}', which isn't the parent scope"
+                            )
+                        raise TracecatDSLError(msg)
+                elif action.action == PlatformAction.LOOP_END:
+                    # loop_end must only depend on actions from the loop scope
+                    # it closes; otherwise it can accidentally close a sibling scope.
+                    closed_loop_scope = loop_end_scope_by_ref[action.ref]
+                    if dep_scope != closed_loop_scope:
                         raise TracecatDSLError(
-                            f"Scatter action '{action.ref}' has an edge from '{dep}', which isn't the parent scope"
+                            f"Loop end action '{action.ref}' has an edge from '{dep}', "
+                            f"which isn't the closed loop scope '{closed_loop_scope}'"
                         )
-                elif action.action == PlatformAction.TRANSFORM_GATHER:
+                elif action.action in SCOPE_CLOSER_ACTIONS:
                     # Here, action_scope is the parent scope
                     if action_scope != scope_hierarchy[dep_scope]:
-                        raise TracecatDSLError(
-                            f"Gather action '{action.ref}' has an edge from '{dep}', which isn't the child scope"
-                        )
+                        opener = scope_openers.get(dep_scope)
+                        if (
+                            action.action in CLOSER_TO_OPENER_ACTION
+                            and opener != CLOSER_TO_OPENER_ACTION[action.action]
+                        ):
+                            raise TracecatDSLError(
+                                f"Action '{action.ref}' closes the wrong scope type for edge '{dep}'"
+                            )
+                        if action.action == PlatformAction.TRANSFORM_GATHER:
+                            msg = (
+                                f"Gather action '{action.ref}' has an edge from '{dep}',"
+                                " which isn't the child scope"
+                            )
+                        else:
+                            msg = (
+                                f"Loop end action '{action.ref}' has an edge from"
+                                f" '{dep}', which isn't the child scope"
+                            )
+                        raise TracecatDSLError(msg)
                 else:
                     if dep_scope != action_scope:
                         raise TracecatDSLError(
@@ -274,34 +382,280 @@ class DSLInput(BaseModel):
                 dep_refs = expr_ctxs[ExprContext.ACTIONS]
                 for dep in dep_refs:
                     dep_scope = action_scopes[dep]
-                    if action.action == PlatformAction.TRANSFORM_SCATTER:
+                    if action.action in SCOPE_OPENER_ACTIONS:
                         if dep_scope != scope_hierarchy[action_scope]:
-                            raise TracecatDSLError(
-                                f"Scatter action '{action.ref}' has an expression in field '{key2loc(key)}' that references '{dep}', which isn't the parent scope"
+                            if action.action == PlatformAction.TRANSFORM_SCATTER:
+                                msg = (
+                                    f"Scatter action '{action.ref}' has an expression in field '{key2loc(key)}' "
+                                    f"that references '{dep}', which isn't the parent scope"
+                                )
+                            else:
+                                msg = (
+                                    f"Loop start action '{action.ref}' has an expression in field '{key2loc(key)}' "
+                                    f"that references '{dep}', which isn't the parent scope"
+                                )
+                            raise TracecatDSLError(msg)
+                    elif action.action == PlatformAction.LOOP_END:
+                        closed_loop_scope = loop_end_scope_by_ref[action.ref]
+                        condition_refs = loop_end_condition_refs_by_ref[action.ref]
+                        # Enforce strict scope rules only for loop-end condition refs.
+                        # This is the decision point that controls iteration continuation.
+                        if key == "args" and dep in condition_refs:
+                            if dep_scope != closed_loop_scope:
+                                raise TracecatDSLError(
+                                    f"Loop end action '{action.ref}' has an expression "
+                                    f"in field '{key2loc(key)}.condition' that "
+                                    f"references '{dep}', but condition refs must be "
+                                    f"in loop scope '{closed_loop_scope}'."
+                                )
+                        # Keep existing closer semantics for non-condition expression refs.
+                        if action_scope != scope_hierarchy[dep_scope]:
+                            opener = scope_openers.get(dep_scope)
+                            if (
+                                action.action in CLOSER_TO_OPENER_ACTION
+                                and opener != CLOSER_TO_OPENER_ACTION[action.action]
+                            ):
+                                raise TracecatDSLError(
+                                    f"Action '{action.ref}' closes the wrong scope type for expression dependency '{dep}'"
+                                )
+                            msg = (
+                                f"Loop end action '{action.ref}' has an expression in field '{key2loc(key)}' "
+                                f"that references '{dep}', which isn't the child scope"
                             )
-                    elif action.action == PlatformAction.TRANSFORM_GATHER:
+                            raise TracecatDSLError(msg)
+                    elif action.action in SCOPE_CLOSER_ACTIONS:
                         # Here, action_scope is the parent scope
                         if action_scope != scope_hierarchy[dep_scope]:
-                            raise TracecatDSLError(
-                                f"Gather action '{action.ref}' has an expression in field '{key2loc(key)}' that references '{dep}', which isn't the child scope"
-                            )
+                            opener = scope_openers.get(dep_scope)
+                            if (
+                                action.action in CLOSER_TO_OPENER_ACTION
+                                and opener != CLOSER_TO_OPENER_ACTION[action.action]
+                            ):
+                                raise TracecatDSLError(
+                                    f"Action '{action.ref}' closes the wrong scope type for expression dependency '{dep}'"
+                                )
+                            if action.action == PlatformAction.TRANSFORM_GATHER:
+                                msg = (
+                                    f"Gather action '{action.ref}' has an expression in field '{key2loc(key)}' "
+                                    f"that references '{dep}', which isn't the child scope"
+                                )
+                            else:
+                                msg = (
+                                    f"Loop end action '{action.ref}' has an expression in field '{key2loc(key)}' "
+                                    f"that references '{dep}', which isn't the child scope"
+                                )
+                            raise TracecatDSLError(msg)
                     else:
                         # Dep scope must be the same as action_scope or an ancestor (parent, grandparent, etc.)
-                        curr_scope = action_scope
-                        is_ancestor = False
-                        while curr_scope is not None:
-                            if dep_scope == curr_scope:
-                                is_ancestor = True
-                                break
-                            curr_scope = scope_hierarchy.get(curr_scope)
-                        if not is_ancestor:
+                        is_ancestor = self._is_same_or_ancestor_scope(
+                            dep_scope=dep_scope,
+                            action_scope=action_scope,
+                            scope_hierarchy=scope_hierarchy,
+                        )
+                        is_loop_descendant = self._is_loop_descendant_scope(
+                            dep_scope=dep_scope,
+                            action_scope=action_scope,
+                            scope_hierarchy=scope_hierarchy,
+                            scope_openers=scope_openers,
+                        )
+                        if not is_ancestor and not is_loop_descendant:
                             raise TracecatDSLError(
                                 f"Action '{action.ref}' has an expression in field '{key2loc(key)}' that references '{dep}' which cannot be referenced from this scope"
                             )
 
+    def _resolve_closed_loop_scope(
+        self,
+        *,
+        loop_end_stmt: ActionStatement,
+        action_scopes: dict[str, str],
+        scope_hierarchy: dict[str, str | None],
+        scope_openers: dict[str, str],
+    ) -> str:
+        """Resolve and validate the loop scope closed by a `core.loop.end` action.
+
+        A valid `core.loop.end` must:
+        - depend on actions from exactly one scope
+        - close a direct child scope of its own scope
+        - close a scope opened by `core.loop.start`
+        """
+        action_scope = action_scopes[loop_end_stmt.ref]
+        # Convert depends_on refs into scopes and validate the closer targets a
+        # single region.
+        dep_scopes = {
+            action_scopes[edge_components_from_dep(dep_ref)[0]]
+            for dep_ref in loop_end_stmt.depends_on
+        }
+        if len(dep_scopes) != 1:
+            raise TracecatDSLError(
+                f"Loop end action '{loop_end_stmt.ref}' must depend on actions "
+                "from exactly one loop scope"
+            )
+
+        loop_scope = next(iter(dep_scopes))
+        # A closer in parent scope can only close one of its direct children.
+        if scope_hierarchy.get(loop_scope) != action_scope:
+            raise TracecatDSLError(
+                f"Loop end action '{loop_end_stmt.ref}' must depend on actions "
+                "from its child loop scope"
+            )
+        if scope_openers.get(loop_scope) != PlatformAction.LOOP_START:
+            raise TracecatDSLError(
+                f"Loop end action '{loop_end_stmt.ref}' must close a loop.start scope"
+            )
+        return loop_scope
+
+    def _validate_loop_scope_synchronization(
+        self,
+        *,
+        action_scopes: dict[str, str],
+        scope_hierarchy: dict[str, str | None],
+        scope_openers: dict[str, str],
+    ) -> None:
+        """Validate that every do-while loop region synchronizes at `core.loop.end`.
+
+        Invariant
+        ---------
+        For each loop scope opened by `core.loop.start`, every action inside that
+        scope (including nested descendant scopes) must have a SUCCESS-path to the
+        matching `core.loop.end`.
+
+        Why this exists
+        ---------------
+        Loop continuation resets in-loop scheduler state and queues the next
+        iteration. If any in-loop branch can still execute after loop_end decides
+        to continue, iterations can interleave and race on `ACTIONS` writes.
+        Enforcing a single synchronization barrier at loop_end prevents that.
+
+        Algorithm
+        ---------
+        1. Collect loop scopes from `scope_openers`.
+        2. Resolve exactly one `loop_end` per loop scope from dependency scopes.
+        3. Build a reverse adjacency graph over SUCCESS edges only.
+        4. For each loop scope, reverse-traverse from `loop_end` to compute all
+           actions that can reach it.
+        5. Fail if any action in the loop scope/descendants is missing from this
+           reachable set.
+        """
+        loop_scopes = {
+            scope_ref
+            for scope_ref, opener in scope_openers.items()
+            if opener == PlatformAction.LOOP_START
+        }
+        if not loop_scopes:
+            return
+
+        loop_end_by_scope: dict[str, str] = {}
+        for stmt in self.actions:
+            if stmt.action != PlatformAction.LOOP_END:
+                continue
+            loop_scope = self._resolve_closed_loop_scope(
+                loop_end_stmt=stmt,
+                action_scopes=action_scopes,
+                scope_hierarchy=scope_hierarchy,
+                scope_openers=scope_openers,
+            )
+            if existing := loop_end_by_scope.get(loop_scope):
+                raise TracecatDSLError(
+                    f"Loop start action '{loop_scope}' has multiple loop end actions: "
+                    f"'{existing}' and '{stmt.ref}'"
+                )
+            loop_end_by_scope[loop_scope] = stmt.ref
+
+        missing_end_scopes = sorted(loop_scopes - set(loop_end_by_scope))
+        if missing_end_scopes:
+            missing_scope = missing_end_scopes[0]
+            raise TracecatDSLError(
+                f"Loop start action '{missing_scope}' has no matching loop end action"
+            )
+
+        reverse_success_adj: dict[str, set[str]] = {
+            action.ref: set() for action in self.actions
+        }
+        for src_ref, outgoing in self._to_typed_adjacency().items():
+            for dst_ref, edge_type in outgoing:
+                if edge_type == EdgeType.SUCCESS:
+                    reverse_success_adj[dst_ref].add(src_ref)
+
+        # We've validated that every loop scope has a loop end action, so we can now
+        # check that every action in the loop region can reach the loop end action.
+        for loop_scope, loop_end_ref in loop_end_by_scope.items():
+            can_reach_loop_end: set[str] = set()
+            stack = [loop_end_ref]
+            while stack:
+                curr_ref = stack.pop()
+                if curr_ref in can_reach_loop_end:
+                    continue
+                can_reach_loop_end.add(curr_ref)
+                stack.extend(reverse_success_adj.get(curr_ref, ()))
+
+            unsynchronized_actions = sorted(
+                action_ref
+                for action_ref, scope in action_scopes.items()
+                if self._is_same_or_descendant_scope(
+                    scope=scope,
+                    ancestor_scope=loop_scope,
+                    scope_hierarchy=scope_hierarchy,
+                )
+                and action_ref not in can_reach_loop_end
+            )
+            if unsynchronized_actions:
+                raise TracecatDSLError(
+                    f"Loop scope opened by '{loop_scope}' must synchronize at "
+                    f"'{loop_end_ref}'. Every action in the loop region needs a success path "
+                    "to loop_end so iterations cannot interleave and overwrite each other. "
+                    f"Unsynchronized actions: {unsynchronized_actions}"
+                )
+
+    @staticmethod
+    def _is_same_or_ancestor_scope(
+        dep_scope: str,
+        action_scope: str,
+        scope_hierarchy: dict[str, str | None],
+    ) -> bool:
+        curr_scope: str | None = action_scope
+        while curr_scope is not None:
+            if dep_scope == curr_scope:
+                return True
+            curr_scope = scope_hierarchy.get(curr_scope)
+        return False
+
+    @staticmethod
+    def _is_same_or_descendant_scope(
+        scope: str,
+        ancestor_scope: str,
+        scope_hierarchy: dict[str, str | None],
+    ) -> bool:
+        """Return True if scope equals ancestor_scope or descends from it."""
+        curr_scope: str | None = scope
+        while curr_scope is not None:
+            if curr_scope == ancestor_scope:
+                return True
+            curr_scope = scope_hierarchy.get(curr_scope)
+        return False
+
+    @staticmethod
+    def _is_loop_descendant_scope(
+        dep_scope: str,
+        action_scope: str,
+        scope_hierarchy: dict[str, str | None],
+        scope_openers: dict[str, str],
+    ) -> bool:
+        """Return True when dep_scope is a descendant via only loop scopes."""
+        if dep_scope == action_scope:
+            return False
+
+        curr_scope: str | None = dep_scope
+        while curr_scope is not None and curr_scope != action_scope:
+            opener = scope_openers.get(curr_scope)
+            if opener != PlatformAction.LOOP_START:
+                return False
+            curr_scope = scope_hierarchy.get(curr_scope)
+
+        return curr_scope == action_scope
+
     def _assign_action_scopes(
         self, adj: dict[str, list[str]]
-    ) -> tuple[dict[str, str], dict[str, str | None]]:
+    ) -> tuple[dict[str, str], dict[str, str | None], dict[str, str]]:
         """Assign scope IDs to actions using topological sort.
 
         Returns a mapping of action ref -> scope ID.
@@ -310,6 +664,7 @@ class DSLInput(BaseModel):
 
         stmts = {a.ref: a for a in self.actions}
         scopes: dict[str, str] = {}
+        scope_openers: dict[str, str] = {}
 
         ROOT_SCOPE = "<root>"
         scope_hierarchy: dict[str, str | None] = {ROOT_SCOPE: None}
@@ -348,17 +703,28 @@ class DSLInput(BaseModel):
             # Otherwise, if we somehow end up in a different scope, raise an error.
             # Handle scope transitions
             stmt = stmts[ref]
-            if stmt.action == PlatformAction.TRANSFORM_SCATTER:
-                # Scatter actions create a new scope
+            if stmt.action in SCOPE_OPENER_ACTIONS:
+                # Opener actions create a new scope
                 next_scope = ref
                 assign_scope(ref, next_scope)
                 scope_hierarchy[next_scope] = curr_scope
-            elif stmt.action == PlatformAction.TRANSFORM_GATHER:
-                # Gather actions close the current scope
+                scope_openers[next_scope] = stmt.action
+            elif stmt.action in SCOPE_CLOSER_ACTIONS:
+                # Closer actions close the current scope
                 next_scope = scope_hierarchy.get(curr_scope)
                 if next_scope is None:
+                    action_name = (
+                        "gather"
+                        if stmt.action == PlatformAction.TRANSFORM_GATHER
+                        else "loop.end"
+                    )
                     raise TracecatDSLError(
-                        f"You cannot use a gather action {ref!r} in the root scope"
+                        f"You cannot use a {action_name} action {ref!r} in the root scope"
+                    )
+                expected_opener = CLOSER_TO_OPENER_ACTION[stmt.action]
+                if scope_openers.get(curr_scope) != expected_opener:
+                    raise TracecatDSLError(
+                        f"Action {ref!r} closes the wrong scope type"
                     )
                 assign_scope(ref, next_scope)
             else:
@@ -374,9 +740,9 @@ class DSLInput(BaseModel):
 
         # Check if we have cycles
         if n_visited != len(self.actions):
-            raise TracecatDSLError("Cycle detected in scatter-gather workflow")
+            raise TracecatDSLError("Cycle detected in control-flow workflow")
 
-        return scopes, scope_hierarchy
+        return scopes, scope_hierarchy, scope_openers
 
     def _to_adjacency(self) -> dict[str, list[str]]:
         """Convert the DSLInput to an adjacency list."""
@@ -387,6 +753,17 @@ class DSLInput(BaseModel):
             for dep in action.depends_on:
                 src_ref, _ = edge_components_from_dep(dep)
                 adj[src_ref].append(action.ref)
+        return adj
+
+    def _to_typed_adjacency(self) -> dict[str, list[tuple[str, EdgeType]]]:
+        """Convert the DSLInput to adjacency with edge types."""
+        adj: dict[str, list[tuple[str, EdgeType]]] = {}
+        for action in self.actions:
+            adj[action.ref] = []
+        for action in self.actions:
+            for dep in action.depends_on:
+                src_ref, edge_type = edge_components_from_dep(dep)
+                adj[src_ref].append((action.ref, edge_type))
         return adj
 
     @staticmethod
@@ -714,19 +1091,29 @@ class AgentActionMemo(BaseModel):
         default=ROOT_STREAM,
         description="The execution stream ID where the agent workflow was spawned.",
     )
+    mask_output: bool = Field(
+        default=False,
+        description="Whether to redact the child workflow result in execution APIs.",
+    )
 
     @classmethod
-    def from_temporal(cls, memo: temporalio.api.common.v1.Memo) -> AgentActionMemo:
+    async def from_temporal(
+        cls, memo: temporalio.api.common.v1.Memo
+    ) -> AgentActionMemo:
         data: dict[str, Any] = {}
         for key, value in memo.fields.items():
             try:
-                data[key] = _memo_payload_converter.from_payload(value)
+                decoded_value = (await decode_payloads([value]))[0]
+                data[key] = _memo_payload_converter.from_payload(decoded_value)
             except Exception as e:
                 logger.warning(
                     "Error parsing agent action memo field",
                     error=e,
                     key=key,
-                    value=value,
+                    encoding=value.metadata.get("encoding", b"").decode(
+                        "utf-8", errors="replace"
+                    ),
+                    payload_size_bytes=len(value.data),
                 )
         if not data.get("action_ref"):
             data["action_ref"] = "unknown_agent_action"
@@ -751,35 +1138,68 @@ class ChildWorkflowMemo(BaseModel):
         default=ROOT_STREAM,
         description="The stream ID of the child workflow.",
     )
+    mask_output: bool = Field(
+        default=False,
+        description="Whether to redact the child workflow result in execution APIs.",
+    )
 
     @staticmethod
-    def from_temporal(memo: temporalio.api.common.v1.Memo) -> ChildWorkflowMemo:
+    async def from_temporal(memo: temporalio.api.common.v1.Memo) -> ChildWorkflowMemo:
+        decoded_fields: dict[str, temporalio.api.common.v1.Payload] = {}
+        for key, value in memo.fields.items():
+            try:
+                decoded_fields[key] = (await decode_payloads([value]))[0]
+            except Exception as e:
+                logger.warning(
+                    "Error decoding child workflow memo field",
+                    error=e,
+                    key=key,
+                    encoding=value.metadata.get("encoding", b"").decode(
+                        "utf-8", errors="replace"
+                    ),
+                    payload_size_bytes=len(value.data),
+                )
         try:
-            action_ref = orjson.loads(memo.fields["action_ref"].data)
+            action_ref = orjson.loads(decoded_fields["action_ref"].data)
         except Exception as e:
             logger.warning("Error parsing child workflow memo action ref", error=e)
             action_ref = "Unknown Child Workflow"
-        if loop_index_data := memo.fields["loop_index"].data:
-            loop_index = orjson.loads(loop_index_data)
-        else:
+        try:
+            if loop_index_data := decoded_fields["loop_index"].data:
+                loop_index = orjson.loads(loop_index_data)
+            else:
+                loop_index = None
+        except Exception as e:
+            logger.warning("Error parsing child workflow memo loop index", error=e)
             loop_index = None
         try:
             wait_strategy = WaitStrategy(
-                orjson.loads(memo.fields["wait_strategy"].data)
+                orjson.loads(decoded_fields["wait_strategy"].data)
             )
         except Exception as e:
             logger.warning("Error parsing child workflow memo wait strategy", error=e)
             wait_strategy = WaitStrategy.WAIT
         try:
-            stream_id = StreamID(orjson.loads(memo.fields["stream_id"].data))
+            stream_id = StreamID(orjson.loads(decoded_fields["stream_id"].data))
         except Exception as e:
             logger.warning("Error parsing child workflow memo stream id", error=e)
             stream_id = ROOT_STREAM
+        try:
+            mask_output_payload = decoded_fields.get("mask_output")
+            mask_output = (
+                bool(orjson.loads(mask_output_payload.data))
+                if mask_output_payload is not None and mask_output_payload.data
+                else False
+            )
+        except Exception as e:
+            logger.warning("Error parsing child workflow memo mask output", error=e)
+            mask_output = False
         return ChildWorkflowMemo(
             action_ref=action_ref,
             loop_index=loop_index,
             wait_strategy=wait_strategy,
             stream_id=stream_id,
+            mask_output=mask_output,
         )
 
 
@@ -812,11 +1232,68 @@ def build_action_statements_from_actions(
 
     This function uses Action.upstream_edges directly as the source of truth
     for dependencies, eliminating the need for a separate RFGraph object.
+
+    Only actions reachable from trigger-connected roots are converted.
+    This prevents disconnected action islands from being executable.
+
+    Legacy fallback: if a workflow has no trigger edges at all, keep previous
+    behavior and include all actions.
     """
+
+    def get_reachable_action_ids(actions: list[Action]) -> set[ActionID]:
+        id2action = {action.id: action for action in actions}
+        trigger_roots: set[ActionID] = set()
+        adjacency: dict[ActionID, set[ActionID]] = {}
+
+        for action in actions:
+            for edge_data in action.upstream_edges:
+                edge = UpstreamEdgeDataValidator.validate_python(edge_data)
+                source_type = edge.get("source_type")
+                source_id_str = edge.get("source_id")
+                if not source_id_str:
+                    continue
+
+                # Legacy edge format omitted source_type for trigger roots.
+                if source_type == "trigger" or (
+                    source_type is None and source_id_str.startswith("trigger-")
+                ):
+                    trigger_roots.add(action.id)
+                    continue
+                if source_type is None:
+                    source_type = "udf"
+                if source_type != "udf":
+                    continue
+
+                try:
+                    source_id = ActionID(source_id_str)
+                except ValueError:
+                    continue
+
+                if source_id in id2action:
+                    adjacency.setdefault(source_id, set()).add(action.id)
+
+        if not trigger_roots:
+            return set(id2action)
+
+        reachable: set[ActionID] = set(trigger_roots)
+        queue = deque(trigger_roots)
+        while queue:
+            source_id = queue.popleft()
+            for target_id in adjacency.get(source_id, set()):
+                if target_id in reachable:
+                    continue
+                reachable.add(target_id)
+                queue.append(target_id)
+        return reachable
+
     id2action = {action.id: action for action in actions}
+    reachable_action_ids = get_reachable_action_ids(actions)
 
     statements = []
     for action in actions:
+        if action.id not in reachable_action_ids:
+            continue
+
         dependencies: list[str] = []
 
         # Build dependencies from upstream_edges
@@ -835,7 +1312,7 @@ def build_action_statements_from_actions(
             else:
                 continue
 
-            if source_id in id2action:
+            if source_id in id2action and source_id in reachable_action_ids:
                 source_action = id2action[source_id]
                 base_ref = source_action.ref
 
@@ -848,7 +1325,7 @@ def build_action_statements_from_actions(
         dependencies = sorted(dependencies)
 
         control_flow = ActionControlFlow.model_validate(action.control_flow)
-        args = yaml.safe_load(action.inputs) or {}
+        args = _load_action_inputs_yaml(action.inputs) or {}
         interaction = (
             ActionInteractionValidator.validate_python(action.interaction)
             if action.is_interactive and action.interaction
@@ -868,6 +1345,7 @@ def build_action_statements_from_actions(
             join_strategy=control_flow.join_strategy,
             interaction=interaction,
             environment=control_flow.environment,
+            mask_output=control_flow.mask_output,
         )
         statements.append(action_stmt)
     return statements

@@ -1,28 +1,16 @@
 "use client"
 
 import { zodResolver } from "@hookform/resolvers/zod"
-import { File as FileIcon, Info, Save, Upload, X } from "lucide-react"
-import {
-  type ChangeEvent,
-  type DragEvent,
-  useCallback,
-  useMemo,
-  useRef,
-  useState,
-} from "react"
-import {
-  type ControllerRenderProps,
-  type UseFormReturn,
-  useForm,
-  useWatch,
-} from "react-hook-form"
+import { Info, Save } from "lucide-react"
+import { useCallback, useMemo } from "react"
+import { useForm, useWatch } from "react-hook-form"
 import { z } from "zod"
 import type { IntegrationUpdate, ProviderRead } from "@/client"
+import { ServiceAccountJsonUploader } from "@/components/service-account-json-uploader"
 import { MultiTagCommandInput } from "@/components/tags-input"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import {
   Form,
   FormControl,
@@ -35,7 +23,6 @@ import {
 import { Input } from "@/components/ui/input"
 import { useIntegrationProvider } from "@/lib/hooks"
 import { isMCPProvider } from "@/lib/providers"
-import { cn } from "@/lib/utils"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
 type EndpointHelp = ProviderRead["authorization_endpoint_help"]
@@ -113,12 +100,22 @@ interface ProviderConfigFormProps {
   provider: ProviderRead
   onSuccess?: () => void
   additionalButtons?: React.ReactNode
+  formId?: string
+  formRef?: React.Ref<HTMLFormElement>
+  hideActions?: boolean
+  submitLabel?: string
+  submitIcon?: React.ReactNode
 }
 
 export function ProviderConfigForm({
   provider,
   onSuccess,
   additionalButtons,
+  formId,
+  formRef,
+  hideActions = false,
+  submitLabel,
+  submitIcon,
 }: ProviderConfigFormProps) {
   const workspaceId = useWorkspaceId()
   const isMCP = isMCPProvider(provider)
@@ -132,7 +129,8 @@ export function ProviderConfigForm({
     token_endpoint_help: providerTokenHelp,
   } = provider
 
-  const isServiceAccountProvider = id === "google"
+  const serviceAccountProviders = ["google", "google_sheets", "google_docs"]
+  const isServiceAccountProvider = serviceAccountProviders.includes(id)
   const clientSecretMaxLength = isServiceAccountProvider ? 16384 : 512
   const validationSchema = useMemo(
     () => createOAuthSchema(clientSecretMaxLength),
@@ -187,7 +185,6 @@ export function ProviderConfigForm({
   const hasAuthHelp = hasHelpContent(providerAuthHelp)
   const hasTokenHelp = hasHelpContent(providerTokenHelp)
 
-  const currentScopes = integration?.requested_scopes ?? []
   const defaultScopesList = useMemo(
     () => (defaultScopes ?? []).filter((scope) => scope.trim().length > 0),
     [defaultScopes]
@@ -305,69 +302,16 @@ export function ProviderConfigForm({
 
   return (
     <div className="flex flex-col gap-6">
-      {integration && (
-        <Card className="bg-muted/40">
-          <CardHeader>
-            <CardTitle>Current configuration</CardTitle>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-4 text-sm">
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-              <InfoRow label="Client ID">
-                {integration.client_id ? (
-                  <span className="font-mono">
-                    {integration.client_id.slice(0, 6)}****
-                    {integration.client_id.length > 10
-                      ? integration.client_id.slice(-4)
-                      : ""}
-                  </span>
-                ) : (
-                  <span className="text-muted-foreground">Not configured</span>
-                )}
-              </InfoRow>
-              <InfoRow label="Client secret">
-                {integration.status !== "not_configured"
-                  ? "Configured"
-                  : "Not configured"}
-              </InfoRow>
-              <InfoRow label="Authorization endpoint">
-                {integration.authorization_endpoint ?? "Not configured"}
-              </InfoRow>
-              <InfoRow label="Token endpoint">
-                {integration.token_endpoint ?? "Not configured"}
-              </InfoRow>
-            </div>
-            <div className="flex flex-col gap-2">
-              <span className="font-medium text-muted-foreground">
-                Requested scopes
-              </span>
-              {currentScopes.length ? (
-                <div className="flex flex-wrap gap-1">
-                  {currentScopes.map((scope) => (
-                    <Badge key={scope} variant="outline" className="text-xs">
-                      {scope}
-                    </Badge>
-                  ))}
-                </div>
-              ) : (
-                <span className="text-xs text-muted-foreground">
-                  No scopes configured
-                </span>
-              )}
-            </div>
-          </CardContent>
-        </Card>
-      )}
-
       <Form {...form}>
         <form
+          id={formId}
+          ref={formRef}
           onSubmit={form.handleSubmit(onSubmit)}
           className="flex flex-col gap-6"
         >
-          <Card>
-            <CardHeader>
-              <CardTitle>Client credentials</CardTitle>
-            </CardHeader>
-            <CardContent className="flex flex-col gap-4">
+          <div className="space-y-4">
+            <h3 className="font-medium">Client credentials</h3>
+            <div className="flex flex-col gap-4">
               <FormField
                 control={form.control}
                 name="client_id"
@@ -398,10 +342,37 @@ export function ProviderConfigForm({
                     <FormControl>
                       {isServiceAccountProvider ? (
                         <ServiceAccountJsonUploader
-                          field={field}
-                          form={form}
+                          value={field.value ?? ""}
+                          onChange={field.onChange}
+                          onError={(message) => {
+                            form.setError("client_secret", {
+                              type: "manual",
+                              message,
+                            })
+                          }}
+                          onClearError={() => {
+                            form.clearErrors("client_secret")
+                          }}
+                          onDetectedEmail={(email) => {
+                            const currentClientId = form
+                              .getValues("client_id")
+                              ?.trim()
+                            if (
+                              (!currentClientId ||
+                                currentClientId.length === 0) &&
+                              email
+                            ) {
+                              form.setValue("client_id", email, {
+                                shouldDirty: true,
+                                shouldTouch: true,
+                              })
+                            }
+                          }}
                           placeholder={clientSecretPlaceholder}
                           existingConfigured={hasExistingSecret}
+                          hasError={Boolean(
+                            form.formState.errors.client_secret
+                          )}
                         />
                       ) : (
                         <Input
@@ -419,31 +390,29 @@ export function ProviderConfigForm({
                   </FormItem>
                 )}
               />
-            </CardContent>
-          </Card>
+            </div>
+          </div>
 
-          <Card>
-            <CardHeader>
-              <div className="flex items-center justify-between gap-2">
-                <CardTitle>Endpoints</CardTitle>
-                {(defaultAuthEndpoint.length > 0 ||
-                  defaultTokenEndpoint.length > 0 ||
-                  authEndpointValue.length > 0 ||
-                  tokenEndpointValue.length > 0) && (
-                  <Button
-                    type="button"
-                    variant="link"
-                    size="sm"
-                    className="px-0"
-                    onClick={handleResetEndpoints}
-                    disabled={isAtDefaultEndpoints}
-                  >
-                    Reset endpoints
-                  </Button>
-                )}
-              </div>
-            </CardHeader>
-            <CardContent className="flex flex-col gap-4">
+          <div className="space-y-4">
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="font-medium">Endpoints</h3>
+              {(defaultAuthEndpoint.length > 0 ||
+                defaultTokenEndpoint.length > 0 ||
+                authEndpointValue.length > 0 ||
+                tokenEndpointValue.length > 0) && (
+                <Button
+                  type="button"
+                  variant="link"
+                  size="sm"
+                  className="px-0"
+                  onClick={handleResetEndpoints}
+                  disabled={isAtDefaultEndpoints}
+                >
+                  Reset endpoints
+                </Button>
+              )}
+            </div>
+            <div className="flex flex-col gap-4">
               {!isMCP && (hasAuthHelp || hasTokenHelp) && (
                 <Alert>
                   <Info className="h-4 w-4" />
@@ -509,14 +478,12 @@ export function ProviderConfigForm({
                   </FormItem>
                 )}
               />
-            </CardContent>
-          </Card>
+            </div>
+          </div>
 
-          <Card>
-            <CardHeader>
-              <CardTitle>Scopes</CardTitle>
-            </CardHeader>
-            <CardContent className="flex flex-col gap-4">
+          <div className="space-y-4">
+            <h3 className="font-medium">Scopes</h3>
+            <div className="flex flex-col gap-4">
               <div className="flex flex-col gap-2">
                 <div className="flex items-center gap-2">
                   <span className="text-sm font-medium text-muted-foreground">
@@ -580,262 +547,34 @@ export function ProviderConfigForm({
                   </FormItem>
                 )}
               />
-            </CardContent>
-          </Card>
-          <div className="flex flex-wrap items-center gap-3">
-            <Button
-              type="submit"
-              variant={
-                integration?.status === "configured" ? "outline" : "default"
-              }
-              className="gap-2"
-              disabled={updateIntegrationIsPending}
-            >
-              <Save className="h-4 w-4" />
-              Save configuration
-            </Button>
-            {additionalButtons}
+            </div>
           </div>
+          {!hideActions && (
+            <div className="flex flex-wrap items-center gap-3">
+              <Button
+                type="submit"
+                variant={
+                  integration?.status === "configured" ? "outline" : "default"
+                }
+                className="gap-2"
+                disabled={updateIntegrationIsPending}
+              >
+                {submitIcon ?? <Save className="h-4 w-4" />}
+                {submitLabel ?? "Save configuration"}
+              </Button>
+              {additionalButtons}
+            </div>
+          )}
         </form>
       </Form>
     </div>
   )
 }
 
-interface ServiceAccountJsonUploaderProps {
-  field: ControllerRenderProps<OAuthSchema, "client_secret">
-  form: UseFormReturn<OAuthSchema>
-  placeholder: string
-  existingConfigured: boolean
-}
-
-function ServiceAccountJsonUploader({
-  field,
-  form,
-  placeholder,
-  existingConfigured,
-}: ServiceAccountJsonUploaderProps) {
-  const fileInputRef = useRef<HTMLInputElement | null>(null)
-  const [fileName, setFileName] = useState<string | null>(null)
-  const [detectedEmail, setDetectedEmail] = useState<string | null>(null)
-
-  const hasError = Boolean(form.formState.errors.client_secret)
-
-  const resetInput = useCallback(() => {
-    if (fileInputRef.current) {
-      fileInputRef.current.value = ""
-    }
-  }, [])
-
-  const clearSelection = useCallback(() => {
-    setFileName(null)
-    setDetectedEmail(null)
-    field.onChange("")
-    form.clearErrors("client_secret")
-    resetInput()
-  }, [field, form, resetInput])
-
-  const handleFile = useCallback(
-    (file: File | undefined) => {
-      if (!file) {
-        return
-      }
-
-      if (!file.name.toLowerCase().endsWith(".json")) {
-        field.onChange("")
-        setFileName(null)
-        setDetectedEmail(null)
-        form.setError("client_secret", {
-          type: "manual",
-          message: "Upload a .json file exported from Google Cloud.",
-        })
-        resetInput()
-        return
-      }
-
-      const reader = new FileReader()
-      reader.onload = () => {
-        const text = typeof reader.result === "string" ? reader.result : ""
-
-        try {
-          const parsed = JSON.parse(text)
-          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-            throw new Error("Uploaded key must be a JSON object.")
-          }
-          if (parsed.type !== "service_account") {
-            throw new Error('JSON key must include "type": "service_account".')
-          }
-          if (
-            typeof parsed.private_key !== "string" ||
-            parsed.private_key.trim().length === 0
-          ) {
-            throw new Error("JSON key is missing a private_key.")
-          }
-
-          const normalized = JSON.stringify(parsed)
-          field.onChange(normalized)
-          setFileName(file.name)
-
-          const email =
-            typeof parsed.client_email === "string"
-              ? parsed.client_email.trim()
-              : ""
-          setDetectedEmail(email || null)
-
-          const currentClientId = form.getValues("client_id")?.trim()
-          if ((!currentClientId || currentClientId.length === 0) && email) {
-            form.setValue("client_id", email, {
-              shouldDirty: true,
-              shouldTouch: true,
-            })
-          }
-
-          form.clearErrors("client_secret")
-        } catch (error) {
-          field.onChange("")
-          setFileName(null)
-          setDetectedEmail(null)
-          const message =
-            error instanceof Error
-              ? error.message
-              : "Failed to parse service account JSON key."
-          form.setError("client_secret", {
-            type: "manual",
-            message,
-          })
-        } finally {
-          resetInput()
-        }
-      }
-      reader.onerror = () => {
-        field.onChange("")
-        setFileName(null)
-        setDetectedEmail(null)
-        form.setError("client_secret", {
-          type: "manual",
-          message: "Failed to read the uploaded file.",
-        })
-        resetInput()
-      }
-
-      reader.readAsText(file)
-    },
-    [field, form, resetInput]
-  )
-
-  const handleInputChange = useCallback(
-    (event: ChangeEvent<HTMLInputElement>) => {
-      const file = event.target.files?.[0]
-      handleFile(file)
-    },
-    [handleFile]
-  )
-
-  const handleDrop = useCallback(
-    (event: DragEvent<HTMLDivElement>) => {
-      event.preventDefault()
-      const file = event.dataTransfer.files?.[0]
-      handleFile(file)
-      event.dataTransfer.clearData()
-    },
-    [handleFile]
-  )
-
-  const handleDragOver = useCallback((event: DragEvent<HTMLDivElement>) => {
-    event.preventDefault()
-    event.dataTransfer.dropEffect = "copy"
-  }, [])
-
-  return (
-    <>
-      <input
-        ref={fileInputRef}
-        type="file"
-        accept=".json,application/json"
-        className="hidden"
-        onChange={handleInputChange}
-      />
-      <div
-        onDrop={handleDrop}
-        onDragOver={handleDragOver}
-        className={cn(
-          "flex flex-col gap-3 rounded-md border border-dashed p-4 transition-colors",
-          hasError
-            ? "border-destructive/80 bg-destructive/5"
-            : "border-muted-foreground/30 bg-muted/40 hover:border-muted-foreground/50"
-        )}
-      >
-        <div className="flex flex-col gap-2">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <p className="text-xs text-muted-foreground">
-              {fileName ? (
-                <span className="inline-flex items-center gap-1 text-sm font-medium text-foreground">
-                  <FileIcon className="h-4 w-4" />
-                  {fileName}
-                </span>
-              ) : (
-                placeholder
-              )}
-            </p>
-            <div className="flex items-center gap-2">
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                onClick={() => fileInputRef.current?.click()}
-              >
-                <Upload className="mr-2 h-4 w-4" />
-                {fileName ? "Replace file" : "Choose JSON"}
-              </Button>
-              {fileName && (
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  onClick={clearSelection}
-                >
-                  <X className="mr-1 h-4 w-4" />
-                  Remove
-                </Button>
-              )}
-            </div>
-          </div>
-          {existingConfigured && !fileName && (
-            <p className="text-xs text-muted-foreground">
-              Existing key remains active until you provide a new file.
-            </p>
-          )}
-          {detectedEmail && (
-            <p className="text-xs text-muted-foreground">
-              Detected service account:{" "}
-              <span className="font-medium">{detectedEmail}</span>
-            </p>
-          )}
-        </div>
-      </div>
-    </>
-  )
-}
-
-function InfoRow({
-  label,
-  children,
-}: {
-  label: string
-  children: React.ReactNode
-}) {
-  return (
-    <div className="flex flex-col gap-1">
-      <span className="font-medium text-muted-foreground">{label}</span>
-      <span className="text-xs text-foreground break-all">{children}</span>
-    </div>
-  )
-}
-
 export function ProviderConfigFormSkeleton() {
   return (
-    <Card className="animate-pulse">
-      <CardContent className="flex flex-col gap-4 p-6">
+    <div className="animate-pulse rounded-lg border bg-card text-card-foreground shadow-sm">
+      <div className="flex flex-col gap-4 p-6">
         <div className="h-7 w-40 rounded-md bg-muted" />
         <div className="h-8 w-full rounded-md bg-muted" />
         <div className="h-8 w-full rounded-md bg-muted" />
@@ -844,7 +583,7 @@ export function ProviderConfigFormSkeleton() {
           <div className="h-10 w-32 rounded-md bg-muted" />
           <div className="h-10 w-24 rounded-md bg-muted" />
         </div>
-      </CardContent>
-    </Card>
+      </div>
+    </div>
   )
 }

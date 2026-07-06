@@ -14,10 +14,11 @@ from temporalio.exceptions import ApplicationError
 
 from tests.shared import to_data
 from tracecat.auth.types import Role
+from tracecat.authz.scopes import SERVICE_PRINCIPAL_SCOPES
 from tracecat.dsl.common import create_default_execution_context
 from tracecat.dsl.schemas import ActionStatement, RunActionInput, RunContext
 from tracecat.dsl.types import ActionErrorInfo
-from tracecat.exceptions import ExecutionError, LoopExecutionError
+from tracecat.exceptions import EntitlementRequired, ExecutionError, LoopExecutionError
 from tracecat.executor.activities import ExecutorActivities
 from tracecat.executor.schemas import ExecutorActionErrorInfo
 from tracecat.identifiers.workflow import WorkflowUUID
@@ -31,7 +32,9 @@ def mock_role() -> Role:
         type="service",
         service_id="tracecat-executor",
         workspace_id=uuid.uuid4(),
+        organization_id=uuid.uuid4(),
         user_id=uuid.uuid4(),
+        scopes=SERVICE_PRINCIPAL_SCOPES["tracecat-executor"],
     )
 
 
@@ -109,6 +112,7 @@ class TestExecuteActionActivity:
             ) as mock_materialize,
         ):
             mock_activity.info.return_value = MagicMock(attempt=1)
+            mock_activity.heartbeat = MagicMock()
             mock_backend.return_value = MagicMock()
             mock_dispatch.return_value = expected_result
             # Return the same exec_context to preserve the input
@@ -123,6 +127,8 @@ class TestExecuteActionActivity:
             mock_dispatch.assert_called_once_with(
                 backend=mock_backend.return_value, input=mock_run_action_input
             )
+            # Heartbeats sent at start and after completion
+            assert mock_activity.heartbeat.call_count >= 2
 
     @pytest.mark.anyio
     async def test_execution_error_raises_application_error(
@@ -222,6 +228,36 @@ class TestExecuteActionActivity:
             app_error = exc_info.value
             assert app_error.type == "RuntimeError"
             assert app_error.non_retryable is True
+
+    @pytest.mark.anyio
+    async def test_entitlement_error_raises_non_retryable_application_error(
+        self, mock_run_action_input, mock_role
+    ):
+        """Test that EntitlementRequired is converted to non-retryable ApplicationError."""
+        with (
+            patch("tracecat.executor.activities.activity") as mock_activity,
+            patch("tracecat.executor.activities.get_executor_backend") as mock_backend,
+            patch(
+                "tracecat.executor.activities.dispatch_action",
+                new_callable=AsyncMock,
+            ) as mock_dispatch,
+        ):
+            mock_activity.info.return_value = MagicMock(attempt=1)
+            mock_backend.return_value = MagicMock()
+            mock_dispatch.side_effect = EntitlementRequired("custom_registry")
+
+            with pytest.raises(ApplicationError) as exc_info:
+                await ExecutorActivities.execute_action_activity(
+                    mock_run_action_input, mock_role
+                )
+
+            app_error = exc_info.value
+            assert app_error.type == "EntitlementRequired"
+            assert app_error.non_retryable is True
+            assert len(app_error.details) > 0
+            detail = app_error.details[0]
+            assert isinstance(detail, ActionErrorInfo)
+            assert "custom_registry" in detail.message
 
     @pytest.mark.anyio
     async def test_application_error_passthrough(

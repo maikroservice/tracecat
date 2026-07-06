@@ -3,7 +3,7 @@
  *
  * Categories:
  * - `Icons`: general UI/brand glyphs.
- * - `UDFIcons`: action icons keyed by registry action (trigger/core/tools/llm/ai).
+ * - `UDFIcons`: action icons keyed by registry action (trigger/core/tools/ai).
  * - `providerIcons`: provider badges.
  * - `secretIcons`: credential type badges.
  *
@@ -15,6 +15,7 @@
  */
 import {
   Blend,
+  BlocksIcon,
   BoxIcon,
   Building2Icon,
   Code,
@@ -23,6 +24,7 @@ import {
   Globe,
   KeyRound,
   ListChecks,
+  LogInIcon,
   MailIcon,
   MergeIcon,
   MessageCircleMore,
@@ -40,6 +42,7 @@ import {
   ZapIcon,
 } from "lucide-react"
 
+import { mcpCatalogProviderIcons } from "@/components/mcp-catalog-icons"
 import { cn } from "@/lib/utils"
 
 type IconProps = React.HTMLAttributes<SVGElement>
@@ -192,6 +195,7 @@ export const Icons = {
     </svg>
   ),
   saml: (props: IconProps) => <Building2Icon {...props} />,
+  login: (props: IconProps) => <LogInIcon {...props} />,
 }
 
 export function getFlairSize(size: "sm" | "md" | "lg"): string {
@@ -254,6 +258,7 @@ function createIconRenderer(
     </div>
   )
 }
+
 export const UDFIcons: Record<string, (props: CustomIconProps) => JSX.Element> =
   {
     // Triggers namespace
@@ -298,6 +303,21 @@ export const UDFIcons: Record<string, (props: CustomIconProps) => JSX.Element> =
     "core.transform.gather": ({ className, ...rest }) => (
       <div className={cn(basicIconsCommon, "bg-fuchsia-200/70", className)}>
         {/* Rotate 180deg to appear upside down */}
+        <MergeIcon style={{ transform: "rotate(90deg)" }} {...rest} />
+      </div>
+    ),
+    "core.loop": ({ className, ...rest }) => (
+      <div className={cn(basicIconsCommon, "bg-orange-200/70", className)}>
+        <RefreshCcw {...rest} />
+      </div>
+    ),
+    "core.loop.start": ({ className, ...rest }) => (
+      <div className={cn(basicIconsCommon, "bg-orange-200/70", className)}>
+        <SplitIcon style={{ transform: "rotate(90deg)" }} {...rest} />
+      </div>
+    ),
+    "core.loop.end": ({ className, ...rest }) => (
+      <div className={cn(basicIconsCommon, "bg-orange-200/70", className)}>
         <MergeIcon style={{ transform: "rotate(90deg)" }} {...rest} />
       </div>
     ),
@@ -355,20 +375,26 @@ export const UDFIcons: Record<string, (props: CustomIconProps) => JSX.Element> =
       </div>
     ),
     "core.workflow": ({ className, ...rest }) => (
-      <div className={cn(basicIconsCommon, "bg-violet-200/70", className)}>
+      <div className={cn(basicIconsCommon, "bg-violet-100/80", className)}>
         <WorkflowIcon {...rest} />
       </div>
     ),
     "core.table": ({ className, ...rest }) => (
-      <div className={cn(basicIconsCommon, "bg-sky-200/50", className)}>
+      <div className={cn(basicIconsCommon, "bg-sky-100/80", className)}>
         <Table {...rest} />
       </div>
     ),
     "core.sql": ({ className, ...rest }) => (
-      <div className={cn(basicIconsCommon, "bg-sky-200/50", className)}>
+      <div className={cn(basicIconsCommon, "bg-teal-100/80", className)}>
         <DatabaseIcon {...rest} />
       </div>
     ),
+    "core.duckdb": ({ className, ...rest }) => (
+      <div className={cn(basicIconsCommon, "bg-teal-100/80", className)}>
+        <DatabaseIcon {...rest} />
+      </div>
+    ),
+    tools: createIconRenderer((props: IconProps) => <BlocksIcon {...props} />),
     "tools.datadog": createIconRenderer(DatadogIcon),
     // Emailrep namespace
     "tools.emailrep": createIconRenderer(EmailrepIcon, {
@@ -381,11 +407,12 @@ export const UDFIcons: Record<string, (props: CustomIconProps) => JSX.Element> =
     // URLScan namespace
     "tools.urlscan": createIconRenderer(UrlscanIcon),
     "tools.virustotal": createIconRenderer(VirusTotalIcon),
+    "tools.wiz": createIconRenderer(WizIcon),
     "tools.pagerduty": createIconRenderer(PagerDutyToolIcon, {
-      wrapperClassName: "rounded-xl bg-green-400/20",
+      wrapperClassName: "rounded-xl",
     }),
     "tools.gophish": createIconRenderer(GophishToolIcon, {
-      wrapperClassName: "rounded-full bg-blue-400/20",
+      wrapperClassName: "rounded-full",
       iconClassName: "h-full w-auto",
     }),
     "tools.servicenow": createIconRenderer(ServiceNowIcon),
@@ -404,11 +431,13 @@ export const UDFIcons: Record<string, (props: CustomIconProps) => JSX.Element> =
     "tools.google_sheets": createIconRenderer(GoogleSheetsIcon),
     "tools.google_docs": createIconRenderer(GoogleDocsIcon),
     "tools.google_drive": createIconRenderer(GoogleDriveIcon),
+    "tools.google_api": createIconRenderer(GoogleIcon),
     "tools.gmail": createIconRenderer(GmailIcon),
-    // AI / LLM namespace
-    "llm.openai": createIconRenderer(OpenAIIcon),
-    "llm.ollama": createIconRenderer(OllamaIcon),
-    "llm.anthropic": createIconRenderer(ClaudeIcon),
+    "tools.google_secops_detection": createIconRenderer(
+      GoogleSecOpsDetectionIcon
+    ),
+    "tools.google_secops_soar": createIconRenderer(GoogleSecOpsIcon),
+    // AI namespace
     "ai.slackbot": createIconRenderer(SlackIcon),
   }
 
@@ -474,6 +503,41 @@ export const providerIcons: Record<
       <GoogleIcon {...rest} />
     </div>
   ),
+  microsoft: ({ className, ...rest }) => (
+    <div className={className}>
+      <MicrosoftIcon {...rest} />
+    </div>
+  ),
+  openai: ({ className, ...rest }) => (
+    <div className={className}>
+      <OpenAIIcon {...rest} />
+    </div>
+  ),
+  anthropic: ({ className, ...rest }) => (
+    <div className={className}>
+      <ClaudeIcon {...rest} />
+    </div>
+  ),
+  "amazon-bedrock": ({ className, ...rest }) => (
+    <div className={className}>
+      <AwsIcon {...rest} />
+    </div>
+  ),
+  ollama: ({ className, ...rest }) => (
+    <div className={className}>
+      <OllamaIcon {...rest} />
+    </div>
+  ),
+  vllm: ({ className, ...rest }) => (
+    <div className={className}>
+      <VllmIcon {...rest} />
+    </div>
+  ),
+  "manual-custom-source": ({ className, ...rest }) => (
+    <div className={className}>
+      <Sparkles {...rest} />
+    </div>
+  ),
   google_docs: ({ className, ...rest }) => (
     <div className={className}>
       <GoogleDocsIcon {...rest} />
@@ -514,16 +578,48 @@ export const providerIcons: Record<
       <Plug2 {...rest} fill="black" />
     </div>
   ),
-  sentry_mcp: (props) => <SentryIcon {...props} />,
-  notion_mcp: (props) => <NotionIcon {...props} />,
-  linear_mcp: (props) => <LinearIcon {...props} />,
-  runreveal_mcp: (props) => <RunRevealIcon {...props} />,
-  secureannex_mcp: (props) => <SecureAnnexIcon {...props} />,
-  github_mcp: ({ className, ...rest }) => (
-    <div className={className}>
-      <GitHubIcon {...rest} />
-    </div>
-  ),
+  jira_mcp: (props) => <JiraIcon {...props} />,
+  ...mcpCatalogProviderIcons,
+}
+
+const mcpProviderIconAliases: Record<string, string> = {
+  "github-copilot": "github_mcp",
+  github: "github_mcp",
+  jira: "jira_mcp",
+  "secure-annex": "secureannex_mcp",
+  "secure-annex-mcp": "secureannex_mcp",
+  secureannex: "secureannex_mcp",
+  "secureannex-mcp": "secureannex_mcp",
+}
+
+export function getMcpProviderIconId(slug: string | null | undefined): string {
+  if (!slug) {
+    return "custom"
+  }
+
+  const normalized = slug.toLowerCase()
+  const underscored = normalized.replace(/-/g, "_")
+  const candidates = [
+    mcpProviderIconAliases[normalized],
+    normalized,
+    underscored,
+  ]
+
+  const mcpMatch = underscored.match(/^(.*?)(?:_?mcp)$/)
+  if (mcpMatch?.[1]) {
+    const base = mcpMatch[1]
+    candidates.push(`${base}_mcp`)
+    candidates.push(`${base.replace(/_/g, "")}_mcp`)
+  } else {
+    candidates.push(`${underscored}_mcp`)
+    candidates.push(`${underscored.replace(/_/g, "")}_mcp`)
+  }
+
+  return (
+    candidates.find((candidate): candidate is string =>
+      Boolean(candidate && providerIcons[candidate])
+    ) ?? "custom"
+  )
 }
 
 export function ProviderIcon({
@@ -715,6 +811,26 @@ export function ClaudeIcon({ className, ...rest }: IconProps) {
         fill="#D97757"
         d="m50.228 170.321 50.357-28.257.843-2.463-.843-1.361h-2.462l-8.426-.518-28.775-.778-24.952-1.037-24.175-1.296-6.092-1.297L0 125.796l.583-3.759 5.12-3.434 7.324.648 16.202 1.101 24.304 1.685 17.629 1.037 26.118 2.722h4.148l.583-1.685-1.426-1.037-1.101-1.037-25.147-17.045-27.22-18.017-14.258-10.37-7.713-5.25-3.888-4.925-1.685-10.758 7-7.713 9.397.649 2.398.648 9.527 7.323 20.35 15.75L94.817 91.9l3.889 3.24 1.555-1.102.195-.777-1.75-2.917-14.453-26.118-15.425-26.572-6.87-11.018-1.814-6.61c-.648-2.723-1.102-4.991-1.102-7.778l7.972-10.823L71.42 0 82.05 1.426l4.472 3.888 6.61 15.101 10.694 23.786 16.591 32.34 4.861 9.592 2.592 8.879.973 2.722h1.685v-1.556l1.36-18.211 2.528-22.36 2.463-28.776.843-8.1 4.018-9.722 7.971-5.25 6.222 2.981 5.12 7.324-.713 4.73-3.046 19.768-5.962 30.98-3.889 20.739h2.268l2.593-2.593 10.499-13.934 17.628-22.036 7.778-8.749 9.073-9.657 5.833-4.601h11.018l8.1 12.055-3.628 12.443-11.342 14.388-9.398 12.184-13.48 18.147-8.426 14.518.778 1.166 2.01-.194 30.46-6.481 16.462-2.982 19.637-3.37 8.88 4.148.971 4.213-3.5 8.62-20.998 5.184-24.628 4.926-36.682 8.685-.454.324.519.648 16.526 1.555 7.065.389h17.304l32.21 2.398 8.426 5.574 5.055 6.805-.843 5.184-12.962 6.611-17.498-4.148-40.83-9.721-14-3.5h-1.944v1.167l11.666 11.406 21.387 19.314 26.767 24.887 1.36 6.157-3.434 4.86-3.63-.518-23.526-17.693-9.073-7.972-20.545-17.304h-1.36v1.814l4.73 6.935 25.017 37.59 1.296 11.536-1.814 3.76-6.481 2.268-7.13-1.297-14.647-20.544-15.1-23.138-12.185-20.739-1.49.843-7.194 77.448-3.37 3.953-7.778 2.981-6.48-4.925-3.436-7.972 3.435-15.749 4.148-20.544 3.37-16.333 3.046-20.285 1.815-6.74-.13-.454-1.49.194-15.295 20.999-23.267 31.433-18.406 19.702-4.407 1.75-7.648-3.954.713-7.064 4.277-6.286 25.47-32.405 15.36-20.092 9.917-11.6-.065-1.686h-.583L44.07 198.125l-12.055 1.555-5.185-4.86.648-7.972 2.463-2.593 20.35-13.999-.064.065Z"
       />
+    </svg>
+  )
+}
+
+export function AwsIcon({ className, ...rest }: IconProps) {
+  return (
+    <svg
+      viewBox="0 0 40 40"
+      role="img"
+      className={className}
+      xmlns="http://www.w3.org/2000/svg"
+      {...rest}
+    >
+      <g fill="none" fillRule="evenodd">
+        <path fill="#242F3E" d="M0 0h40v40H0z" />
+        <path
+          fill="#FFF"
+          d="M32.6982 23.9008c.361.469-.4 2.399-.741 3.263-.104.262.118.365.35.168 1.513-1.284 1.905-3.975 1.594-4.363-.307-.386-2.951-.717-4.563.432-.249.177-.206.421.069.389.908-.112 2.931-.357 3.291.111Zm-.842 2.009c.518-.378.074-.941-.454-.72-3.513 1.464-7.327 2.173-10.8 2.173-5.143 0-10.127-1.389-14.156-3.695-.352-.202-.613.155-.319.414 3.733 3.316 8.669 5.309 14.147 5.309 3.91 0 8.451-1.208 11.582-3.481ZM29.7122 20.6948c-.498 0-.985-.053-1.459-.161-.476-.109-.84-.232-1.093-.373-.155-.084-.252-.172-.291-.258a.751.751 0 0 1-.058-.26v-.469c0-.194.073-.293.216-.293.055 0 .113.013.173.033.061.023.141.055.241.098.32.141.667.248 1.044.324.376.075.751.113 1.126.113.597 0 1.058-.102 1.384-.308.327-.204.489-.495.489-.873 0-.26-.085-.475-.257-.649-.171-.174-.489-.333-.952-.485l-1.375-.421c-.697-.216-1.202-.529-1.517-.938-.315-.412-.472-.859-.472-1.347 0-.387.085-.729.258-1.027.17-.297.395-.55.676-.761.285-.21.614-.368.989-.478.374-.107.772-.162 1.192-.162.21 0 .423.014.64.041.215.026.419.062.612.105.193.045.373.093.538.146.166.055.298.109.399.162.131.075.224.151.281.227.055.075.083.177.083.308v.436c0 .195-.072.291-.217.291-.077 0-.197-.036-.364-.112-.54-.239-1.15-.356-1.821-.356-.542 0-.963.086-1.261.258-.299.174-.448.449-.448.827 0 .258.094.477.283.655.188.178.535.348 1.044.511l1.342.422c.685.214 1.174.512 1.466.888.294.379.441.81.441 1.295 0 .401-.083.76-.25 1.078-.166.319-.395.59-.689.817-.292.227-.642.399-1.051.518-.41.12-.857.178-1.342.178ZM17.5472 20.4508c-.166 0-.287-.027-.365-.087-.078-.061-.144-.181-.199-.365l-2.222-7.157c-.053-.184-.082-.307-.082-.371 0-.151.078-.227.233-.227h.927c.177 0 .301.03.374.09.071.058.134.178.189.364l1.591 6.12 1.477-6.12c.044-.186.104-.306.181-.364.077-.06.204-.09.38-.09h.765c.175 0 .302.03.38.09.077.058.138.178.182.364l1.493 6.201 1.64-6.201c.055-.186.118-.306.19-.364.073-.06.196-.09.373-.09h.878c.156 0 .233.076.233.227 0 .041-.007.091-.016.144-.013.056-.033.131-.068.227l-2.286 7.157c-.055.184-.122.304-.2.365-.077.06-.199.087-.364.087h-.813c-.176 0-.303-.03-.38-.094-.077-.065-.138-.191-.182-.373l-1.476-5.96-1.457 5.96c-.044.182-.106.308-.183.373-.078.064-.204.094-.381.094h-.812ZM9.9392 19.4488c.311 0 .636-.057.979-.17.342-.114.64-.31.894-.592.156-.172.262-.369.324-.591.06-.22.089-.487.089-.801v-.388a9.414 9.414 0 0 0-.869-.154 8.957 8.957 0 0 0-.887-.057c-.629 0-1.1.124-1.408.373-.309.248-.465.603-.465 1.07 0 .431.117.756.349.978.232.222.564.332.994.332Zm3.846-1.408c0 .345.035.619.107.825.073.206.175.428.307.664.044.076.066.146.066.209 0 .099-.061.191-.182.276l-.597.39a.502.502 0 0 1-.248.081.407.407 0 0 1-.282-.129 2.954 2.954 0 0 1-.339-.43 5.95 5.95 0 0 1-.291-.544c-.741.853-1.668 1.28-2.784 1.28-.796 0-1.426-.22-1.891-.664-.463-.442-.695-1.036-.695-1.78 0-.787.287-1.423.863-1.903.573-.48 1.348-.721 2.319-.721.321 0 .655.025 1.003.073.347.048.71.117 1.084.203v-.679c0-.702-.147-1.196-.446-1.483-.298-.286-.811-.428-1.54-.428-.333 0-.673.039-1.021.12-.347.081-.688.186-1.019.315-.155.065-.266.106-.331.122a.977.977 0 0 1-.149.024c-.132 0-.2-.096-.2-.292v-.452c0-.152.024-.26.068-.323.044-.066.132-.131.265-.195.331-.163.729-.303 1.192-.421.465-.119.956-.179 1.476-.179 1.126 0 1.952.253 2.477.753.524.502.788 1.26.788 2.275v3.013Z"
+        />
+      </g>
     </svg>
   )
 }
@@ -1052,6 +1168,24 @@ export function OllamaIcon({ className, ...rest }: IconProps) {
         d="M478.153 364.982C469.755 367.25 462.276 373.502 458.291 381.717L455.717 386.989L455.778 394.345C455.778 401.211 455.901 402.069 457.862 406.911C460.56 413.777 463.257 418.007 468.222 422.85C476.743 431.309 486.367 433.516 499.241 430.145C506.658 428.183 514.075 421.93 517.631 414.635C520.696 408.444 521.431 403.969 520.451 396.919C518.183 380.797 508.742 369.089 494.704 364.982C490.597 363.756 482.628 363.756 478.153 364.982Z"
         fill="black"
       />
+    </svg>
+  )
+}
+
+export function VllmIcon({ className, ...rest }: IconProps) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      role="img"
+      className={className}
+      xmlns="http://www.w3.org/2000/svg"
+      {...rest}
+    >
+      <rect x="2" y="2" width="20" height="20" rx="5" fill="#111827" />
+      <path d="M5.5 7.5h2.3l2 6.3 2-6.3h2.2l-3.3 9h-1.8z" fill="#F8FAFC" />
+      <rect x="14.8" y="8" width="1.5" height="8" rx="0.75" fill="#60A5FA" />
+      <rect x="17.2" y="8" width="1.5" height="8" rx="0.75" fill="#34D399" />
+      <rect x="19.6" y="8" width="1.5" height="8" rx="0.75" fill="#FBBF24" />
     </svg>
   )
 }
@@ -1583,15 +1717,34 @@ export function SentryIcon({ className, ...rest }: IconProps) {
   return (
     <svg
       xmlns="http://www.w3.org/2000/svg"
-      viewBox="0 0 50 44"
+      viewBox="0 0 256 227"
+      preserveAspectRatio="xMidYMid"
       width="100%"
       height="100%"
       className={cn("origin-center scale-105", className)}
       {...rest}
     >
       <path
-        d="M29,2.26a4.67,4.67,0,0,0-8,0L14.42,13.53A32.21,32.21,0,0,1,32.17,40.19H27.55A27.68,27.68,0,0,0,12.09,17.47L6,28a15.92,15.92,0,0,1,9.23,12.17H4.62A.76.76,0,0,1,4,39.06l2.94-5a10.74,10.74,0,0,0-3.36-1.9l-2.91,5a4.54,4.54,0,0,0,1.69,6.24A4.66,4.66,0,0,0,4.62,44H19.15a19.4,19.4,0,0,0-8-17.31l2.31-4A23.87,23.87,0,0,1,23.76,44H36.07a35.88,35.88,0,0,0-16.41-31.8l4.67-8a.77.77,0,0,1,1.05-.27c.53.29,20.29,34.77,20.66,35.17a.76.76,0,0,1-.68,1.13H40.6q.09,1.91,0,3.81h4.78A4.59,4.59,0,0,0,50,39.43a4.49,4.49,0,0,0-.62-2.28Z"
-        fill="#362d59"
+        fill="#362D59"
+        d="M148.368 12.403a23.935 23.935 0 0 0-41.003 0L73.64 70.165c52.426 26.174 87.05 78.177 90.975 136.642h-23.679c-3.918-50.113-34.061-94.41-79.238-116.448l-31.213 53.97a81.595 81.595 0 0 1 47.307 62.375h-54.38a3.895 3.895 0 0 1-3.178-5.69l15.069-25.626a55.046 55.046 0 0 0-17.221-9.738L3.167 191.277a23.269 23.269 0 0 0 8.662 31.982 23.884 23.884 0 0 0 11.583 3.075h74.471a99.432 99.432 0 0 0-41.003-88.72l11.84-20.5c35.679 24.504 55.754 66.038 52.79 109.22h63.094c2.99-65.43-29.047-127.512-84.107-162.986l23.935-41.002a3.947 3.947 0 0 1 5.382-1.384c2.716 1.486 103.993 178.208 105.89 180.258a3.895 3.895 0 0 1-3.486 5.792h-24.396c.307 6.526.307 13.035 0 19.528h24.499A23.528 23.528 0 0 0 256 202.91a23.015 23.015 0 0 0-3.178-11.685L148.368 12.403Z"
+      />
+    </svg>
+  )
+}
+
+export function WizIcon({ className, ...rest }: IconProps) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 33 33"
+      width="100%"
+      height="100%"
+      className={className}
+      {...rest}
+    >
+      <path
+        fill="#0254EC"
+        d="M16.77.312c-.085-.416-.978-.416-1.063 0-.666 3.246-2.05 8.14-4.652 10.741-2.6 2.601-7.498 3.986-10.743 4.652-.416.085-.416.977 0 1.062 3.245.667 8.142 2.051 10.743 4.652 3.4 3.4 4.57 8.038 4.972 10.827.026.177.58.202.615.027.609-2.996 2-8.074 4.78-10.854 2.601-2.6 7.497-3.985 10.743-4.652.416-.085.416-.977 0-1.062-3.246-.666-8.142-2.05-10.744-4.652-2.6-2.6-3.985-7.495-4.651-10.741Z"
       />
     </svg>
   )
@@ -1713,6 +1866,113 @@ export function TerraformIcon({ className, ...rest }: IconProps) {
         d="M14.614 16.008l-5.928-3.453v6.903l5.926 3.452v-6.902z"
         fill="#5c4ee5"
       />
+    </svg>
+  )
+}
+
+export function ClickHouseIcon({ className, ...rest }: IconProps) {
+  return (
+    <svg role="img" viewBox="0 0 24 24" className={className} {...rest}>
+      <title>ClickHouse</title>
+      <path fill="#FFCC01" d="M21.333 10H24v4h-2.667Z" />
+      <path fill="#FFCC01" d="M16 1.335h2.667v21.33H16Z" />
+      <path fill="#FFCC01" d="M10.667 1.335h2.666v21.33h-2.666Z" />
+      <path fill="#FFCC01" d="M0 22.665V1.335h2.667v21.33Z" />
+      <path fill="#FFCC01" d="M5.333 1.335H8v21.33H5.333Z" />
+    </svg>
+  )
+}
+
+export function OktaIcon({ className, ...rest }: IconProps) {
+  return (
+    <svg role="img" viewBox="0 0 24 24" className={className} {...rest}>
+      <title>Okta</title>
+      <path
+        fill="#007DC1"
+        d="M12 0C5.389 0 0 5.35 0 12s5.35 12 12 12 12-5.35 12-12S18.611 0 12 0zm0 18c-3.325 0-6-2.675-6-6s2.675-6 6-6 6 2.675 6 6-2.675 6-6 6z"
+      />
+    </svg>
+  )
+}
+
+export function VaultIcon({ className, ...rest }: IconProps) {
+  return (
+    <svg role="img" viewBox="0 0 24 24" className={className} {...rest}>
+      <title>Vault</title>
+      <path
+        fill="#FFEC6E"
+        d="M0 0l11.955 24L24 0zm13.366 4.827h1.393v1.38h-1.393zm-2.77 5.569H9.22V8.993h1.389zm0-2.087H9.22V6.906h1.389zm0-2.086H9.22V4.819h1.389zm2.087 6.263h-1.377V11.08h1.388zm0-2.09h-1.377V8.993h1.388zm0-2.087h-1.377V6.906h1.388zm0-2.086h-1.377V4.819h1.388zm.683.683h1.393v1.389h-1.393zm0 3.475V8.993h1.389v1.388Z"
+      />
+    </svg>
+  )
+}
+
+export function PaloAltoIcon({ className, ...rest }: IconProps) {
+  return (
+    <svg role="img" viewBox="0 0 24 24" className={className} {...rest}>
+      <title>Palo Alto Networks</title>
+      <path
+        fill="#F04E23"
+        d="m10.278 15.443 1.705 1.705-3.426 3.426-3.427-3.426 8.592-8.591-1.705-1.705 3.426-3.426 3.427 3.426-8.592 8.591zM0 12.017l3.426 3.426 8.591-8.59-3.426-3.427L0 12.017zm11.983 5.13 3.426 3.427L24 11.983l-3.426-3.426-8.591 8.59z"
+      />
+    </svg>
+  )
+}
+
+export function AnsibleIcon({ className, ...rest }: IconProps) {
+  return (
+    <svg role="img" viewBox="0 0 24 24" className={className} {...rest}>
+      <title>Ansible</title>
+      <path
+        fill="#EE0000"
+        d="M10.617 11.473l4.686 3.695-3.102-7.662zM12 0C5.371 0 0 5.371 0 12s5.371 12 12 12 12-5.371 12-12S18.629 0 12 0zm5.797 17.305c-.011.471-.403.842-.875.83-.236 0-.416-.09-.664-.293l-6.19-5-2.079 5.203H6.191L11.438 5.44c.124-.314.427-.52.764-.506.326-.014.63.189.742.506l4.774 11.494c.045.111.08.234.08.348-.001.009-.001.009-.001.023z"
+      />
+    </svg>
+  )
+}
+
+export function GrafanaIcon({ className, ...rest }: IconProps) {
+  return (
+    <svg role="img" viewBox="0 0 24 24" className={className} {...rest}>
+      <title>Grafana</title>
+      <path
+        fill="#F46800"
+        d="M23.02 10.59a8.578 8.578 0 0 0-.862-3.034 8.911 8.911 0 0 0-1.789-2.445c.337-1.342-.413-2.505-.413-2.505-1.292-.08-2.113.4-2.416.62-.052-.02-.102-.044-.154-.064-.22-.089-.446-.172-.677-.247-.231-.073-.47-.14-.711-.197a9.867 9.867 0 0 0-.875-.161C14.557.753 12.94 0 12.94 0c-1.804 1.145-2.147 2.744-2.147 2.744l-.018.093c-.098.029-.2.057-.298.088-.138.042-.275.094-.413.143-.138.055-.275.107-.41.166a8.869 8.869 0 0 0-1.557.87l-.063-.029c-2.497-.955-4.716.195-4.716.195-.203 2.658.996 4.33 1.235 4.636a11.608 11.608 0 0 0-.607 2.635C1.636 12.677.953 15.014.953 15.014c1.926 2.214 4.171 2.351 4.171 2.351.003-.002.006-.002.006-.005.285.509.615.994.986 1.446.156.19.32.371.488.548-.704 2.009.099 3.68.099 3.68 2.144.08 3.553-.937 3.849-1.173a9.784 9.784 0 0 0 3.164.501h.08l.055-.003.107-.002.103-.005.003.002c1.01 1.44 2.788 1.646 2.788 1.646 1.264-1.332 1.337-2.653 1.337-2.94v-.058c0-.02-.003-.039-.003-.06.265-.187.52-.387.758-.6a7.875 7.875 0 0 0 1.415-1.7c1.43.083 2.437-.885 2.437-.885-.236-1.49-1.085-2.216-1.264-2.354l-.018-.013-.016-.013a.217.217 0 0 1-.031-.02c.008-.092.016-.18.02-.27.011-.162.016-.323.016-.48v-.253l-.005-.098-.008-.135a1.891 1.891 0 0 0-.01-.13c-.003-.042-.008-.083-.013-.125l-.016-.124-.018-.122a6.215 6.215 0 0 0-2.032-3.73 6.015 6.015 0 0 0-3.222-1.46 6.292 6.292 0 0 0-.85-.048l-.107.002h-.063l-.044.003-.104.008a4.777 4.777 0 0 0-3.335 1.695c-.332.4-.592.84-.768 1.297a4.594 4.594 0 0 0-.312 1.817l.003.091c.005.055.007.11.013.164a3.615 3.615 0 0 0 .698 1.82 3.53 3.53 0 0 0 1.827 1.282c.33.098.66.14.971.137.039 0 .078 0 .114-.002l.063-.003c.02 0 .041-.003.062-.003.034-.002.065-.007.099-.01.007 0 .018-.003.028-.003l.031-.005.06-.008a1.18 1.18 0 0 0 .112-.02c.036-.008.072-.013.109-.024a2.634 2.634 0 0 0 .914-.415c.028-.02.056-.041.085-.065a.248.248 0 0 0 .039-.35.244.244 0 0 0-.309-.06l-.078.042c-.09.044-.184.083-.283.116a2.476 2.476 0 0 1-.475.096c-.028.003-.054.006-.083.006l-.083.002c-.026 0-.054 0-.08-.002l-.102-.006h-.012l-.024.006c-.016-.003-.031-.003-.044-.006-.031-.002-.06-.007-.091-.01a2.59 2.59 0 0 1-.724-.213 2.557 2.557 0 0 1-.667-.438 2.52 2.52 0 0 1-.805-1.475 2.306 2.306 0 0 1-.029-.444l.006-.122v-.023l.002-.031c.003-.021.003-.04.005-.06a3.163 3.163 0 0 1 1.352-2.29 3.12 3.12 0 0 1 .937-.43 2.946 2.946 0 0 1 .776-.101h.06l.07.002.045.003h.026l.07.005a4.041 4.041 0 0 1 1.635.49 3.94 3.94 0 0 1 1.602 1.662 3.77 3.77 0 0 1 .397 1.414l.005.076.003.075c.002.026.002.05.002.075 0 .024.003.052 0 .07v.065l-.002.073-.008.174a6.195 6.195 0 0 1-.08.639 5.1 5.1 0 0 1-.267.927 5.31 5.31 0 0 1-.624 1.13 5.052 5.052 0 0 1-3.237 2.014 4.82 4.82 0 0 1-.649.066l-.039.003h-.287a6.607 6.607 0 0 1-1.716-.265 6.776 6.776 0 0 1-3.4-2.274 6.75 6.75 0 0 1-.746-1.15 6.616 6.616 0 0 1-.714-2.596l-.005-.083-.002-.02v-.056l-.003-.073v-.096l-.003-.104v-.07l.003-.163c.008-.22.026-.45.054-.678a8.707 8.707 0 0 1 .28-1.355c.128-.444.286-.872.473-1.277a7.04 7.04 0 0 1 1.456-2.1 5.925 5.925 0 0 1 .953-.763c.169-.111.343-.213.524-.306.089-.05.182-.091.273-.135.047-.02.093-.042.138-.062a7.177 7.177 0 0 1 .714-.267l.145-.045c.049-.015.098-.026.148-.041.098-.029.197-.052.296-.076.049-.013.1-.02.15-.033l.15-.032.151-.028.076-.013.075-.01.153-.024c.057-.01.114-.013.171-.023l.169-.021c.036-.003.073-.008.106-.01l.073-.008.036-.003.042-.002c.057-.003.114-.008.171-.01l.086-.006h.023l.037-.003.145-.007a7.999 7.999 0 0 1 1.708.125 7.917 7.917 0 0 1 2.048.68 8.253 8.253 0 0 1 1.672 1.09l.09.077.089.078c.06.052.114.107.171.159.057.052.112.106.166.16.052.055.107.107.159.164a8.671 8.671 0 0 1 1.41 1.978c.012.026.028.052.04.078l.04.078.075.156c.023.051.05.1.07.153l.065.15a8.848 8.848 0 0 1 .45 1.34.19.19 0 0 0 .201.142.186.186 0 0 0 .172-.184c.01-.246.002-.532-.024-.856z"
+      />
+    </svg>
+  )
+}
+
+export function GoogleSecOpsDetectionIcon({ className, ...rest }: IconProps) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 24 24"
+      className={className}
+      {...rest}
+    >
+      <path
+        fill="#4285F4"
+        d="M12 2L3 7v10l9 5 9-5V7l-9-5zm0 2.18l6.9 3.82L12 11.82 5.1 8 12 4.18zM5 9.82l6 3.33v6.03l-6-3.33V9.82zm8 9.36v-6.03l6-3.33v6.03l-6 3.33z"
+      />
+      <circle fill="#EA4335" cx="12" cy="12" r="3" />
+    </svg>
+  )
+}
+
+export function GoogleSecOpsIcon({ className, ...rest }: IconProps) {
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 24 24"
+      className={className}
+      {...rest}
+    >
+      <path
+        fill="#4285F4"
+        d="M12 2L3 7v10l9 5 9-5V7l-9-5zm0 2.18l6.9 3.82L12 11.82 5.1 8 12 4.18zM5 9.82l6 3.33v6.03l-6-3.33V9.82zm8 9.36v-6.03l6-3.33v6.03l-6 3.33z"
+      />
+      <path fill="#34A853" d="M12 2v9.82l6.9-3.82L12 4.18V2z" opacity="0.6" />
     </svg>
   )
 }

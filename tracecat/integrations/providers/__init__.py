@@ -10,6 +10,7 @@ from tracecat.integrations.providers.google import (
 )
 from tracecat.integrations.providers.google.drive import GoogleDriveACProvider
 from tracecat.integrations.providers.google.gmail import GoogleGmailACProvider
+from tracecat.integrations.providers.jira.mcp import JiraMCPProvider
 from tracecat.integrations.providers.linear.mcp import LinearMCPProvider
 from tracecat.integrations.providers.microsoft import (
     AzureLogAnalyticsACProvider,
@@ -35,6 +36,7 @@ from tracecat.integrations.providers.secureannex.mcp import SecureAnnexMCPProvid
 from tracecat.integrations.providers.sentry.mcp import SentryMCPProvider
 from tracecat.integrations.providers.servicenow.oauth import ServiceNowOAuthProvider
 from tracecat.integrations.providers.slack.oauth import SlackOAuthProvider
+from tracecat.integrations.providers.wiz.mcp import WizMCPProvider
 from tracecat.integrations.schemas import ProviderKey
 
 _PROVIDER_CLASSES: list[type[BaseOAuthProvider]] = [
@@ -45,11 +47,13 @@ _PROVIDER_CLASSES: list[type[BaseOAuthProvider]] = [
     GoogleGmailACProvider,
     GoogleServiceAccountOAuthProvider,
     GoogleSheetsOAuthProvider,
+    JiraMCPProvider,
     LinearMCPProvider,
     NotionMCPProvider,
     RunRevealMCPProvider,
     SecureAnnexMCPProvider,
     SentryMCPProvider,
+    WizMCPProvider,
     AzureManagementACProvider,
     AzureManagementCCProvider,
     MicrosoftSentinelACProvider,

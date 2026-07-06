@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from pydantic import SecretStr
+from cryptography.fernet import InvalidToken
+from pydantic import SecretStr, ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import MultipleResultsFound, NoResultFound
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tracecat import config
 from tracecat.audit.logger import audit_log
+from tracecat.auth.secrets import get_db_encryption_key
 from tracecat.auth.types import Role
+from tracecat.authz.controls import require_scope
 from tracecat.db.models import BaseSecret, OrganizationSecret, Secret
 from tracecat.exceptions import (
     TracecatAuthorizationError,
@@ -32,10 +34,10 @@ from tracecat.secrets.schemas import (
     validate_mtls_key_values,
     validate_ssh_key_values,
 )
-from tracecat.service import BaseService
+from tracecat.service import BaseOrgService
 
 
-class SecretsService(BaseService):
+class SecretsService(BaseOrgService):
     """Secrets manager service."""
 
     service_name = "secrets"
@@ -43,10 +45,7 @@ class SecretsService(BaseService):
 
     def __init__(self, session: AsyncSession, role: Role | None = None):
         super().__init__(session, role=role)
-        encryption_key = config.TRACECAT__DB_ENCRYPTION_KEY
-        if not encryption_key:
-            raise KeyError("TRACECAT__DB_ENCRYPTION_KEY is not set")
-        self._encryption_key = encryption_key
+        self._encryption_key = get_db_encryption_key()
 
     def _require_workspace_id(self) -> WorkspaceID:
         """Get workspace_id, raising if role or workspace_id is None."""
@@ -101,12 +100,41 @@ class SecretsService(BaseService):
                 "CA certificate secrets must be created with their key values. Delete and recreate the secret instead."
             )
         set_fields = params.model_dump(exclude_unset=True)
+        keys = set_fields.pop("keys", None)
+
+        if keys is None:
+            try:
+                self.decrypt_keys(secret.encrypted_keys)
+            except (InvalidToken, ValidationError, ValueError) as e:
+                if existing_type == SecretType.SSH_KEY:
+                    raise ValueError(
+                        "Stored SSH key value cannot be decrypted. Delete and recreate this secret to recover it."
+                    ) from e
+                raise ValueError(
+                    "Stored secret values cannot be decrypted. Re-enter all key names and values to recover this secret."
+                ) from e
+
         # Handle keys separately
-        if keys := set_fields.pop("keys", None):
-            # Decrypt existing keys to a dictionary for easy lookup
-            existing_keys = {
-                kv.key: kv.value for kv in self.decrypt_keys(secret.encrypted_keys)
-            }
+        if keys:
+            existing_keys: dict[str, SecretStr] = {}
+            try:
+                # Decrypt existing keys to a dictionary for easy lookup.
+                existing_keys = {
+                    kv.key: kv.value for kv in self.decrypt_keys(secret.encrypted_keys)
+                }
+            except (InvalidToken, ValidationError, ValueError) as e:
+                # Allow recovery from a corrupted encryption key by requiring callers
+                # to provide all key values, rather than preserving blanks.
+                if any(not kv["value"] for kv in keys):
+                    raise ValueError(
+                        "Stored secret values cannot be decrypted. Re-enter all key values to recover this secret."
+                    ) from e
+                self.logger.warning(
+                    "Failed to decrypt existing secret keys during update; proceeding with full key replacement",
+                    secret_id=str(secret.id),
+                    secret_name=secret.name,
+                    error=str(e),
+                )
 
             # Create new key-value pairs, preserving existing values when the new value is empty
             merged_keyvalues = []
@@ -154,6 +182,7 @@ class SecretsService(BaseService):
         result = await self.session.execute(statement)
         return result.scalars().all()
 
+    @require_scope("secret:read")
     async def get_secret(self, secret_id: SecretID) -> Secret:
         """Get a workspace secret by ID."""
         workspace_id = self._require_workspace_id()
@@ -183,6 +212,7 @@ class SecretsService(BaseService):
                 "Secret not found when searching by ID. Please check that the ID was correctly input."
             ) from e
 
+    @require_scope("secret:read")
     async def get_secret_by_name(
         self,
         secret_name: str,
@@ -221,6 +251,7 @@ class SecretsService(BaseService):
                 " Please double check that the name was correctly input."
             ) from e
 
+    @require_scope("secret:create")
     @audit_log(resource_type="secret", action="create")
     async def create_secret(self, params: SecretCreate) -> None:
         """Create a workspace secret."""
@@ -243,12 +274,14 @@ class SecretsService(BaseService):
         self.session.add(secret)
         await self.session.commit()
 
+    @require_scope("secret:update")
     @audit_log(resource_type="secret", action="update")
     async def update_secret(self, secret: Secret, params: SecretUpdate) -> None:
         """Update a workspace secret."""
 
         await self._update_secret(secret=secret, params=params)
 
+    @require_scope("secret:delete")
     @audit_log(resource_type="secret", action="delete")
     async def delete_secret(self, secret: Secret) -> None:
         """Delete a workspace secret."""
@@ -290,6 +323,7 @@ class SecretsService(BaseService):
         result = await self.session.execute(stmt)
         return result.scalars().all()
 
+    @require_scope("org:secret:read")
     async def get_org_secret(self, secret_id: SecretID) -> OrganizationSecret:
         """Get an organization secret by ID."""
 
@@ -300,7 +334,7 @@ class SecretsService(BaseService):
         result = await self.session.execute(statement)
         return result.scalar_one()
 
-    async def get_org_secret_by_name(
+    async def _get_org_secret_by_name(
         self,
         secret_name: str,
         environment: str | None = None,
@@ -326,9 +360,32 @@ class SecretsService(BaseService):
                 " Please double check that the name was correctly input."
             ) from e
 
-    @audit_log(resource_type="organization_secret", action="create")
+    @require_scope("org:secret:read")
+    async def get_org_secret_by_name(
+        self,
+        secret_name: str,
+        environment: str | None = None,
+    ) -> OrganizationSecret:
+        """Retrieve an organization-wide secret by its name."""
+        return await self._get_org_secret_by_name(secret_name, environment)
+
+    async def _get_github_app_org_secret(self) -> OrganizationSecret:
+        """Retrieve the GitHub App organization secret for workflow sync."""
+        return await self._get_org_secret_by_name("github-app-credentials")
+
+    @require_scope("workflow:sync", "workspace_sync:sync", require_all=False)
+    async def get_github_app_org_secret(self) -> OrganizationSecret:
+        """Retrieve the GitHub App organization secret for workflow sync."""
+        return await self._get_github_app_org_secret()
+
+    @require_scope("org:secret:create")
     async def create_org_secret(self, params: SecretCreate) -> None:
         """Create a new organization secret."""
+        await self._create_org_secret(params)
+
+    @audit_log(resource_type="organization_secret", action="create")
+    async def _create_org_secret(self, params: SecretCreate) -> None:
+        """Create an organization secret for callers with their own access gate."""
         if params.type == SecretType.SSH_KEY:
             validate_ssh_key_values(params.keys)
         elif params.type == SecretType.MTLS:
@@ -347,19 +404,32 @@ class SecretsService(BaseService):
         self.session.add(secret)
         await self.session.commit()
 
-    @audit_log(resource_type="organization_secret", action="update")
+    @require_scope("org:secret:update")
     async def update_org_secret(
         self, secret: OrganizationSecret, params: SecretUpdate
     ) -> None:
+        await self._update_org_secret(secret=secret, params=params)
+
+    @audit_log(resource_type="organization_secret", action="update")
+    async def _update_org_secret(
+        self, secret: OrganizationSecret, params: SecretUpdate
+    ) -> None:
+        """Update an organization secret for callers with their own access gate."""
         await self._update_secret(secret=secret, params=params)
+
+    @require_scope("org:secret:delete")
+    async def delete_org_secret(self, org_secret: OrganizationSecret) -> None:
+        await self._delete_org_secret(org_secret)
 
     @audit_log(
         resource_type="organization_secret",
         action="delete",
     )
-    async def delete_org_secret(self, org_secret: OrganizationSecret) -> None:
+    async def _delete_org_secret(self, org_secret: OrganizationSecret) -> None:
+        """Delete an organization secret for callers with their own access gate."""
         await self._delete_secret(org_secret)
 
+    @require_scope("org:secret:read")
     async def get_ssh_key(
         self,
         key_name: str | None = None,
@@ -372,6 +442,7 @@ class SecretsService(BaseService):
             case _:
                 raise ValueError(f"Invalid target: {target}")
 
+    @require_scope("org:secret:read")
     async def get_registry_ssh_key(
         self, key_name: str | None = None, environment: str | None = None
     ) -> SecretStr:

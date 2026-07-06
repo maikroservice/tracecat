@@ -23,7 +23,80 @@ import type {
 } from "@/components/builder/canvas/canvas"
 import type { EventsSidebarRef } from "@/components/builder/events/events-sidebar"
 import type { ActionPanelRef } from "@/components/builder/panel/action-panel"
+import {
+  DEFAULT_TRIGGER_PANEL_TAB,
+  type TriggerPanelTab,
+} from "@/components/builder/panel/trigger-panel-tabs"
+import { useAuth } from "@/hooks/use-auth"
+import {
+  DEFAULT_TRIGGER_PAYLOAD,
+  readPersistedTriggerPayload,
+  triggerPayloadStorageKey,
+  writePersistedTriggerPayload,
+} from "@/lib/workflow-trigger-payload"
 import { useWorkflow } from "@/providers/workflow"
+
+const SELECTED_NODE_STORAGE_PREFIX = "tracecat:builder:selected-node"
+
+function selectedNodeStorageKey({
+  workspaceId,
+  workflowId,
+}: {
+  workspaceId: string
+  workflowId: string | null
+}): string {
+  return `${SELECTED_NODE_STORAGE_PREFIX}:${workspaceId}:${workflowId}`
+}
+
+function readPersistedSelectedNode({
+  workspaceId,
+  workflowId,
+}: {
+  workspaceId: string
+  workflowId: string | null
+}): string | null {
+  if (!workflowId) {
+    return null
+  }
+  if (typeof window === "undefined") {
+    return null
+  }
+  try {
+    return sessionStorage.getItem(
+      selectedNodeStorageKey({ workspaceId, workflowId })
+    )
+  } catch {
+    return null
+  }
+}
+
+function writePersistedSelectedNode({
+  workspaceId,
+  workflowId,
+  selectedNodeId,
+}: {
+  workspaceId: string
+  workflowId: string | null
+  selectedNodeId: string | null
+}): void {
+  if (!workflowId) {
+    return
+  }
+  if (typeof window === "undefined") {
+    return
+  }
+
+  const key = selectedNodeStorageKey({ workspaceId, workflowId })
+  try {
+    if (selectedNodeId) {
+      sessionStorage.setItem(key, selectedNodeId)
+    } else {
+      sessionStorage.removeItem(key)
+    }
+  } catch {
+    // Ignore storage failures (e.g. blocked storage)
+  }
+}
 
 interface ReactFlowContextType {
   reactFlow: ReactFlowInstance
@@ -42,10 +115,14 @@ interface ReactFlowContextType {
   toggleSidebar: () => void
   toggleActionPanel: () => void
   expandSidebarAndFocusEvents: () => void
+  triggerPanelTab: TriggerPanelTab
+  setTriggerPanelTab: React.Dispatch<SetStateAction<TriggerPanelTab>>
   selectedActionEventRef?: string
   setSelectedActionEventRef: React.Dispatch<SetStateAction<string | undefined>>
   currentExecutionId: string | null
   setCurrentExecutionId: React.Dispatch<SetStateAction<string | null>>
+  triggerPayload: string
+  setTriggerPayload: React.Dispatch<SetStateAction<string>>
   actionDrafts: Record<string, unknown>
   setActionDraft: (actionId: string, draft: unknown) => void
   clearActionDraft: (actionId: string) => void
@@ -64,6 +141,8 @@ export const WorkflowBuilderProvider: React.FC<
 > = ({ children }) => {
   const reactFlowInstance = useReactFlow()
   const { workspaceId, workflowId, error } = useWorkflow()
+  const { user, userIsLoading } = useAuth()
+  const userId = user?.id ?? null
 
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
   const [selectedActionEventRef, setSelectedActionEventRef] = useState<
@@ -72,9 +151,16 @@ export const WorkflowBuilderProvider: React.FC<
   const [isSidebarCollapsed, setIsSidebarCollapsed] = React.useState(false)
   const [isActionPanelCollapsed, setIsActionPanelCollapsed] =
     React.useState(false)
+  const [triggerPanelTab, setTriggerPanelTab] = useState<TriggerPanelTab>(
+    DEFAULT_TRIGGER_PANEL_TAB
+  )
   const [currentExecutionId, setCurrentExecutionId] = useState<string | null>(
     null
   )
+  const [triggerPayloadState, setTriggerPayloadState] = useState<string>(
+    DEFAULT_TRIGGER_PAYLOAD
+  )
+  const triggerPayload = triggerPayloadState
   // In-memory map of actionId -> last edited form values.
   // This lets the action panel restore unsaved edits when the user
   // switches between nodes without touching the backend.
@@ -82,14 +168,162 @@ export const WorkflowBuilderProvider: React.FC<
   const canvasRef = useRef<WorkflowCanvasRef>(null)
   const sidebarRef = useRef<EventsSidebarRef>(null)
   const actionPanelRef = useRef<ActionPanelRef>(null)
+  const lastPersistedSelectionRef = useRef<{
+    key: string
+    value: string | null
+  } | null>(null)
+  const lastPersistedTriggerPayloadRef = useRef<{
+    key: string
+    value: string
+  } | null>(null)
+  const triggerPayloadDirtyRef = useRef(false)
+  const suppressNextTriggerPayloadPersistRef = useRef(false)
+
+  const setTriggerPayload = useCallback(
+    (value: SetStateAction<string>) => {
+      setTriggerPayloadState((current) => {
+        const nextValue =
+          typeof value === "function"
+            ? (value as (current: string) => string)(current)
+            : value
+        if (nextValue !== current) {
+          triggerPayloadDirtyRef.current = true
+        }
+        return nextValue
+      })
+    },
+    [setTriggerPayloadState]
+  )
 
   useEffect(() => {
-    // When the user switches workflows, clear selection, execution state,
-    // and any in-memory drafts so we don't leak state across workflows.
-    setSelectedNodeId(null)
+    // Restore the last selection for this workflow in the current browser
+    // session, then clear transient per-workflow UI state.
+    if (!workflowId) {
+      setSelectedNodeId(null)
+      setCurrentExecutionId(null)
+      setActionDrafts({})
+      setTriggerPayloadState(DEFAULT_TRIGGER_PAYLOAD)
+      setTriggerPanelTab(DEFAULT_TRIGGER_PANEL_TAB)
+      lastPersistedTriggerPayloadRef.current = null
+      triggerPayloadDirtyRef.current = false
+      suppressNextTriggerPayloadPersistRef.current = false
+      return
+    }
+    const restoredSelection = readPersistedSelectedNode({
+      workspaceId,
+      workflowId,
+    })
+    const key = selectedNodeStorageKey({ workspaceId, workflowId })
+    lastPersistedSelectionRef.current = {
+      key,
+      value: restoredSelection,
+    }
+    setSelectedNodeId(restoredSelection)
     setCurrentExecutionId(null)
     setActionDrafts({})
-  }, [workflowId])
+    setTriggerPayloadState(DEFAULT_TRIGGER_PAYLOAD)
+    lastPersistedTriggerPayloadRef.current = null
+    triggerPayloadDirtyRef.current = false
+    suppressNextTriggerPayloadPersistRef.current = false
+    setTriggerPanelTab(DEFAULT_TRIGGER_PANEL_TAB)
+  }, [workspaceId, workflowId])
+
+  useEffect(() => {
+    if (!workflowId || userIsLoading) {
+      return
+    }
+
+    const key = triggerPayloadStorageKey({ userId, workspaceId, workflowId })
+    const lastPersisted = lastPersistedTriggerPayloadRef.current
+    if (lastPersisted?.key === key) {
+      return
+    }
+
+    if (triggerPayloadDirtyRef.current) {
+      writePersistedTriggerPayload({
+        userId,
+        workspaceId,
+        workflowId,
+        triggerPayload: triggerPayloadState,
+      })
+      lastPersistedTriggerPayloadRef.current = {
+        key,
+        value: triggerPayloadState,
+      }
+      triggerPayloadDirtyRef.current = false
+      return
+    }
+
+    const restoredTriggerPayload = readPersistedTriggerPayload({
+      userId,
+      workspaceId,
+      workflowId,
+    })
+    lastPersistedTriggerPayloadRef.current = {
+      key,
+      value: restoredTriggerPayload,
+    }
+    triggerPayloadDirtyRef.current = false
+    suppressNextTriggerPayloadPersistRef.current = true
+    setTriggerPayloadState(restoredTriggerPayload)
+  }, [userIsLoading, userId, workspaceId, workflowId, triggerPayloadState])
+
+  useEffect(() => {
+    if (!workflowId) {
+      return
+    }
+    const key = selectedNodeStorageKey({ workspaceId, workflowId })
+    const lastPersisted = lastPersistedSelectionRef.current
+    if (
+      lastPersisted &&
+      lastPersisted.key === key &&
+      lastPersisted.value === selectedNodeId
+    ) {
+      return
+    }
+    writePersistedSelectedNode({ workspaceId, workflowId, selectedNodeId })
+    lastPersistedSelectionRef.current = {
+      key,
+      value: selectedNodeId,
+    }
+  }, [workspaceId, workflowId, selectedNodeId])
+
+  useEffect(() => {
+    if (!workflowId || userIsLoading) {
+      return
+    }
+    if (suppressNextTriggerPayloadPersistRef.current) {
+      suppressNextTriggerPayloadPersistRef.current = false
+      return
+    }
+    const key = triggerPayloadStorageKey({ userId, workspaceId, workflowId })
+    const lastPersisted = lastPersistedTriggerPayloadRef.current
+    if (
+      lastPersisted &&
+      lastPersisted.key === key &&
+      lastPersisted.value === triggerPayloadState
+    ) {
+      return
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      writePersistedTriggerPayload({
+        userId,
+        workspaceId,
+        workflowId,
+        triggerPayload: triggerPayloadState,
+      })
+      lastPersistedTriggerPayloadRef.current = {
+        key,
+        value: triggerPayloadState,
+      }
+      triggerPayloadDirtyRef.current = false
+    }, 250)
+
+    return () => {
+      window.clearTimeout(timeoutId)
+    }
+  }, [userIsLoading, userId, workspaceId, workflowId, triggerPayloadState])
 
   const setReactFlowNodes = useCallback(
     (nodes: Node[] | ((nodes: Node[]) => Node[])) => {
@@ -125,7 +359,18 @@ export const WorkflowBuilderProvider: React.FC<
       if (nodeSelected?.type === "selector") {
         return
       }
-      setSelectedNodeId(nodeSelected?.id ?? null)
+      if (nodeSelected) {
+        setSelectedNodeId(nodeSelected.id)
+        return
+      }
+
+      // Keep selection when the canvas unmounts (e.g. switching to runs).
+      // The node list is empty in that state and we should not clear the
+      // persisted "last selected node" for this workflow.
+      if (reactFlowInstance.getNodes().length === 0) {
+        return
+      }
+      setSelectedNodeId(null)
     },
   })
 
@@ -186,11 +431,15 @@ export const WorkflowBuilderProvider: React.FC<
       isSidebarCollapsed,
       toggleSidebar,
       expandSidebarAndFocusEvents,
+      triggerPanelTab,
+      setTriggerPanelTab,
       actionPanelRef,
       isActionPanelCollapsed,
       toggleActionPanel,
       currentExecutionId,
       setCurrentExecutionId,
+      triggerPayload,
+      setTriggerPayload,
       actionDrafts,
       setActionDraft,
       clearActionDraft,
@@ -210,11 +459,15 @@ export const WorkflowBuilderProvider: React.FC<
       isSidebarCollapsed,
       toggleSidebar,
       expandSidebarAndFocusEvents,
+      triggerPanelTab,
+      setTriggerPanelTab,
       actionPanelRef,
       isActionPanelCollapsed,
       toggleActionPanel,
       currentExecutionId,
       setCurrentExecutionId,
+      triggerPayload,
+      setTriggerPayload,
       actionDrafts,
       setActionDraft,
       clearActionDraft,

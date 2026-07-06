@@ -8,7 +8,7 @@ from tracecat_registry.fields import Code
 
 @registry.register(
     default_title="Run Python script",
-    description="Execute a Python script in a secure nsjail sandbox with pip package support.",
+    description="Execute a Python script.",
     display_group="Run script",
     namespace="core.script",
 )
@@ -45,7 +45,8 @@ async def run_python(
         bool,
         Doc(
             "Whether to allow network access during script execution. "
-            "Default is False. Note: package installation always has network access."
+            "Default is False. Tracecat SDK API calls require network access. "
+            "Note: package installation always has network access."
         ),
     ] = False,
     env_vars: Annotated[
@@ -56,13 +57,14 @@ async def run_python(
         ),
     ] = None,
 ) -> Any:
-    """Execute a Python script in a secure nsjail sandbox.
+    """Execute a Python script.
 
     The code is executed in an isolated Linux namespace with:
     - Configurable network access (disabled by default)
     - Resource limits (memory, CPU, file size)
     - Read-only rootfs with minimal Python 3.12 + uv environment
     - Full subprocess.run support for running external commands
+    - Tracecat registry SDK imports and execution context preconfigured
 
     The script must contain at least one function. If multiple functions are defined,
     one must be named 'main', which will be called. If only one function is defined,
@@ -70,6 +72,18 @@ async def run_python(
 
     The input 'inputs' dictionary's items are passed as function arguments to the main function.
     The function's return value is the output of this operation.
+
+    Tracecat SDK clients are available synchronously through:
+        from tracecat_registry import ctx
+
+    For example:
+        ctx.cases.list_cases(limit=10)
+
+    Async scripts can use the typed async client namespace:
+        await ctx.cases.aio.list_cases(limit=10)
+
+    SDK API calls still use the sandbox network setting. Set allow_network=True
+    when the script needs to call Tracecat API endpoints.
 
     Args:
         script: The Python script content with at least one function definition.

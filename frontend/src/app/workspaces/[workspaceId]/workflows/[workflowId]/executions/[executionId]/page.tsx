@@ -1,7 +1,6 @@
 "use client"
 
 import React from "react"
-import type { WorkflowExecutionEvent } from "@/client"
 
 import {
   ResizableHandle,
@@ -11,14 +10,17 @@ import {
 
 import "react18-json-view/src/style.css"
 
-import { History } from "lucide-react"
+import { CalendarSearchIcon } from "lucide-react"
 import { useParams } from "next/navigation"
 import { WorkflowExecutionEventDetailView } from "@/components/executions/event-details"
 import { WorkflowExecutionEventHistory } from "@/components/executions/event-history"
 import { SectionHead } from "@/components/executions/section"
-import { formatExecutionId } from "@/lib/event-history"
+import {
+  formatExecutionId,
+  type WorkflowExecutionEventCompact,
+} from "@/lib/event-history"
 
-const defaultLayout = [15, 15, 70]
+const defaultLayout = [15, 24, 61]
 
 export default function ExecutionPage() {
   const params = useParams<{
@@ -42,7 +44,7 @@ export default function ExecutionPage() {
   const { workflowId, executionId } = params
 
   const [selectedEvent, setSelectedEvent] = React.useState<
-    WorkflowExecutionEvent | undefined
+    WorkflowExecutionEventCompact | undefined
   >()
 
   const fullExecutionId = formatExecutionId(workflowId, executionId)
@@ -56,16 +58,14 @@ export default function ExecutionPage() {
         )}`
       }}
     >
-      {/* Panel 2: Event History */}
-      <ResizablePanel defaultSize={defaultLayout[1]} minSize={15}>
-        <div className="flex h-full flex-col overflow-hidden p-2">
-          <div className="flex-none">
-            <SectionHead
-              text="Event History"
-              icon={<History className="mr-2 size-4" strokeWidth={2} />}
-            />
-          </div>
-          <div className="flex-1 overflow-auto">
+      {/* Panel 2: Events */}
+      <ResizablePanel defaultSize={defaultLayout[1]} minSize={18}>
+        <div className="flex h-full min-h-0 flex-col overflow-hidden">
+          <SectionHead
+            text="Events"
+            icon={<CalendarSearchIcon className="size-4" strokeWidth={2} />}
+          />
+          <div className="min-h-0 flex-1 overflow-auto">
             {fullExecutionId ? (
               <WorkflowExecutionEventHistory
                 executionId={fullExecutionId}
@@ -74,7 +74,7 @@ export default function ExecutionPage() {
               />
             ) : (
               <span className="flex justify-center p-4 text-center text-xs text-muted-foreground">
-                Select a Workflow Execution.
+                Select a workflow execution.
               </span>
             )}
           </div>
@@ -87,17 +87,20 @@ export default function ExecutionPage() {
         minSize={25}
         className="grow"
       >
-        <div className="flex h-full flex-col overflow-hidden">
-          <div className="flex-1 overflow-auto">
+        <div className="flex h-full min-h-0 flex-col overflow-hidden">
+          <div className="min-h-0 flex-1 overflow-auto">
             {selectedEvent ? (
-              <WorkflowExecutionEventDetailView event={selectedEvent} />
+              <WorkflowExecutionEventDetailView
+                event={selectedEvent}
+                executionId={fullExecutionId}
+              />
             ) : (
               <main className="container flex size-full max-w-[400px] flex-col items-center justify-center space-y-4">
                 <h1 className="text-lg font-semibold tracking-tight">
                   Select an event
                 </h1>
                 <span className="text-center text-sm text-muted-foreground">
-                  Click on an event in the event history to view details.
+                  Click on an event in events to view details.
                 </span>
               </main>
             )}

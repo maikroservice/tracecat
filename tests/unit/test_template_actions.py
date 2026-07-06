@@ -33,7 +33,7 @@ from tracecat.exceptions import (
     TracecatValidationError,
 )
 from tracecat.executor import service
-from tracecat.executor.backends.direct import DirectBackend
+from tracecat.executor.backends.test import TestBackend
 from tracecat.expressions.expectations import ExpectedField
 from tracecat.registry.actions.bound import BoundRegistryAction
 from tracecat.registry.actions.schemas import (
@@ -59,11 +59,14 @@ async def create_manifest_for_actions(
     session: AsyncSession,
     repo_id: UUID,
     actions: list[BoundRegistryAction],
+    organization_id: UUID | None,
 ) -> RegistryLock:
     """Create a RegistryVersion with manifest for the given actions.
 
     Returns a RegistryLock that can be used in RunActionInput.
     """
+    assert organization_id is not None, "organization_id must be provided"
+
     # Query the repository to get the origin
     result = await session.execute(
         select(RegistryRepository).where(RegistryRepository.id == repo_id)
@@ -108,7 +111,7 @@ async def create_manifest_for_actions(
 
     # Create RegistryVersion
     rv = RegistryVersion(
-        organization_id=config.TRACECAT__DEFAULT_ORG_ID,
+        organization_id=organization_id,
         repository_id=repo_id,
         version=TEST_VERSION,
         manifest=manifest,
@@ -131,9 +134,12 @@ async def run_action_test(input: RunActionInput, role: Role) -> Any:
     """Test helper: execute action using production code path."""
     from tracecat.contexts import ctx_role
 
-    ctx_role.set(role)
-    backend = DirectBackend()
-    return await service.dispatch_action(backend, input)
+    token = ctx_role.set(role)
+    try:
+        backend = TestBackend()
+        return await service.dispatch_action(backend, input)
+    finally:
+        ctx_role.reset(token)
 
 
 @pytest.fixture
@@ -370,7 +376,7 @@ async def test_template_action_fetches_nested_secrets(
     # The create_manifest_for_actions helper will properly set up the database
     # with manifest entries and return a RegistryLock that maps actions to origins
     registry_lock = await create_manifest_for_actions(
-        session, db_repo_id, actions_to_register
+        session, db_repo_id, actions_to_register, test_role.organization_id
     )
 
     # Add secrets to the db
@@ -664,7 +670,7 @@ async def test_template_action_runs(
 
     # Create manifest for the test action (enables production code path)
     registry_lock = await create_manifest_for_actions(
-        session, db_repo_id, [bound_action]
+        session, db_repo_id, [bound_action], test_role.organization_id
     )
 
     # Run the action using production code path
@@ -784,7 +790,7 @@ async def test_template_action_with_enums(
 
     # Create manifest for the test action (enables production code path)
     registry_lock = await create_manifest_for_actions(
-        session, db_repo_id, [bound_action]
+        session, db_repo_id, [bound_action], test_role.organization_id
     )
 
     # Run the action using production code path
@@ -927,7 +933,7 @@ async def test_template_action_with_vars_expressions(
 
     # Create manifest for the test actions
     registry_lock = await create_manifest_for_actions(
-        session, db_repo_id, [bound_action]
+        session, db_repo_id, [bound_action], test_role.organization_id
     )
 
     # Test case 1: Without inputs, should use VARS defaults
@@ -1077,7 +1083,7 @@ async def test_template_action_with_multi_level_fallback_chain(
 
     # Create manifest for the test actions
     registry_lock = await create_manifest_for_actions(
-        session, db_repo_id, [bound_action]
+        session, db_repo_id, [bound_action], test_role.organization_id
     )
 
     # Test case 1: inputs.url provided -> should use inputs.url (first in chain)

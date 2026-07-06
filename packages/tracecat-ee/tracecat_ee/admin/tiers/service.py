@@ -9,14 +9,20 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
+from tracecat.audit.logger import audit_log
 from tracecat.db.models import Organization, OrganizationTier, Tier
-from tracecat.service import BaseService
+from tracecat.logger import logger
+from tracecat.service import BasePlatformService
 from tracecat.tiers.exceptions import (
     CannotDeleteDefaultTierError,
     DefaultTierNotConfiguredError,
     OrganizationNotFoundError,
     TierInUseError,
     TierNotFoundError,
+)
+from tracecat.tiers.limits_cache import (
+    invalidate_effective_limits_cache,
+    invalidate_effective_limits_cache_many,
 )
 from tracecat.tiers.schemas import (
     OrganizationTierRead,
@@ -27,7 +33,7 @@ from tracecat.tiers.schemas import (
 )
 
 
-class AdminTierService(BaseService):
+class AdminTierService(BasePlatformService):
     """Platform-level tier management."""
 
     service_name = "admin_tier"
@@ -51,6 +57,7 @@ class AdminTierService(BaseService):
             raise TierNotFoundError(f"Tier {tier_id} not found")
         return TierRead.model_validate(tier)
 
+    @audit_log(resource_type="tier", action="create", resource_id_attr="id")
     async def create_tier(self, params: TierCreate) -> TierRead:
         """Create a new tier."""
         # If this tier is set as default, unset other defaults
@@ -79,6 +86,7 @@ class AdminTierService(BaseService):
         await self.session.refresh(tier)
         return TierRead.model_validate(tier)
 
+    @audit_log(resource_type="tier", action="update")
     async def update_tier(self, tier_id: uuid.UUID, params: TierUpdate) -> TierRead:
         """Update a tier."""
         stmt = select(Tier).where(Tier.id == tier_id)
@@ -97,8 +105,28 @@ class AdminTierService(BaseService):
 
         await self.session.commit()
         await self.session.refresh(tier)
+        org_ids = list(
+            (
+                await self.session.scalars(
+                    select(OrganizationTier.organization_id).where(
+                        OrganizationTier.tier_id == tier_id
+                    )
+                )
+            ).all()
+        )
+        if org_ids:
+            try:
+                await invalidate_effective_limits_cache_many(org_ids)
+            except Exception as e:
+                logger.warning(
+                    "Failed to invalidate effective limits cache for tier update",
+                    tier_id=tier_id,
+                    org_count=len(org_ids),
+                    error=e,
+                )
         return TierRead.model_validate(tier)
 
+    @audit_log(resource_type="tier", action="delete")
     async def delete_tier(self, tier_id: uuid.UUID) -> None:
         """Delete a tier (only if no orgs are assigned to it)."""
         # Check if tier exists
@@ -131,6 +159,41 @@ class AdminTierService(BaseService):
             tier.is_default = False
 
     # Organization tier operations
+
+    async def list_org_tiers(
+        self, org_ids: Sequence[uuid.UUID] | None = None
+    ) -> Sequence[OrganizationTierRead]:
+        """List tier assignments for organizations."""
+        if org_ids is not None and len(org_ids) == 0:
+            return []
+
+        stmt = select(OrganizationTier).options(selectinload(OrganizationTier.tier))
+        if org_ids:
+            stmt = stmt.where(OrganizationTier.organization_id.in_(org_ids))
+
+        result = await self.session.execute(stmt)
+        org_tiers = result.scalars().all()
+
+        return [
+            OrganizationTierRead(
+                id=org_tier.id,
+                organization_id=org_tier.organization_id,
+                tier_id=org_tier.tier_id,
+                max_concurrent_workflows=org_tier.max_concurrent_workflows,
+                max_action_executions_per_workflow=org_tier.max_action_executions_per_workflow,
+                max_concurrent_actions=org_tier.max_concurrent_actions,
+                api_rate_limit=org_tier.api_rate_limit,
+                api_burst_capacity=org_tier.api_burst_capacity,
+                entitlement_overrides=org_tier.entitlement_overrides,
+                stripe_customer_id=org_tier.stripe_customer_id,
+                stripe_subscription_id=org_tier.stripe_subscription_id,
+                expires_at=org_tier.expires_at,
+                created_at=org_tier.created_at,
+                updated_at=org_tier.updated_at,
+                tier=TierRead.model_validate(org_tier.tier) if org_tier.tier else None,
+            )
+            for org_tier in org_tiers
+        ]
 
     async def get_org_tier(self, org_id: uuid.UUID) -> OrganizationTierRead:
         """Get tier assignment for an organization."""
@@ -169,6 +232,7 @@ class AdminTierService(BaseService):
             tier=tier_read,
         )
 
+    @audit_log(resource_type="organization_tier", action="update")
     async def update_org_tier(
         self, org_id: uuid.UUID, params: OrganizationTierUpdate
     ) -> OrganizationTierRead:
@@ -202,6 +266,14 @@ class AdminTierService(BaseService):
             setattr(org_tier, field, value)
 
         await self.session.commit()
+        try:
+            await invalidate_effective_limits_cache(org_id)
+        except Exception as e:
+            logger.warning(
+                "Failed to invalidate effective limits cache for organization tier update",
+                org_id=org_id,
+                error=e,
+            )
 
         # Refresh with tier loaded
         stmt = (

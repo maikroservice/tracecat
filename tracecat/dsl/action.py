@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import weakref
 from collections.abc import Callable, Coroutine, Mapping
 from typing import Any, cast
 
@@ -12,6 +13,8 @@ from temporalio.exceptions import ApplicationError
 from tracecat_ee.agent.schemas import AgentActionArgs, PresetAgentActionArgs
 
 from tracecat import config
+from tracecat.agent.common.types import MCPServerConfig
+from tracecat.agent.preset.service import AgentPresetService
 from tracecat.auth.types import Role
 from tracecat.common import is_iterable
 from tracecat.dsl.common import (
@@ -35,15 +38,19 @@ from tracecat.dsl.schemas import (
 )
 from tracecat.dsl.types import ActionErrorInfo, ActionErrorInfoAdapter
 from tracecat.dsl.validation import normalize_trigger_inputs
-from tracecat.exceptions import TracecatExpressionError
+from tracecat.exceptions import TracecatExpressionError, TracecatValidationError
+from tracecat.executor.service import get_workspace_variables
 from tracecat.expressions.common import ExprContext
 from tracecat.expressions.core import TemplateExpression
 from tracecat.expressions.eval import (
+    collect_expressions,
     eval_templated_object,
     get_iterables_from_expression,
+    is_template_only,
 )
 from tracecat.expressions.schemas import ExpectedField
 from tracecat.identifiers.workflow import WorkflowUUID
+from tracecat.integrations.mcp_validation import MCPValidationError
 from tracecat.logger import logger
 from tracecat.registry.lock.types import RegistryLock
 from tracecat.storage.collection import (
@@ -56,11 +63,85 @@ from tracecat.storage.object import (
     InlineObject,
     StoredObject,
     StoredObjectValidator,
+    collection_item_key,
     get_object_storage,
+    retrieve_stored_object,
 )
+from tracecat.storage.utils import is_retryable_storage_transport_error
+from tracecat.temporal.exceptions import UserError
 from tracecat.validation.schemas import ValidationDetail
 
 _thread_local = threading.local()
+
+
+def _close_asyncio_runner(runner: asyncio.Runner) -> None:
+    try:
+        runner.close()
+    except Exception as e:
+        logger.warning(
+            "Failed to close thread-local asyncio runner",
+            error=e,
+        )
+
+
+# ThreadPoolExecutor clears thread locals when worker threads exit; closing the
+# runner there lets storage loop-close hooks drain clients without per-call churn.
+class _ThreadLocalRunner:
+    def __init__(self) -> None:
+        runner = asyncio.Runner()
+        runner.__enter__()  # create & keep loop
+        self._runner = runner
+        self._finalizer = weakref.finalize(self, _close_asyncio_runner, runner)
+        self._finalizer.atexit = False
+
+    def run[T: Any](self, coro: Coroutine[Any, Any, T]) -> T:
+        return self._runner.run(coro)
+
+    def close(self) -> None:
+        if self._finalizer.alive:
+            self._finalizer()
+
+
+async def _resolve_mcp_integrations(
+    mcp_integration_ids: list[str], *, role: Role
+) -> list[MCPServerConfig]:
+    try:
+        async with AgentPresetService.with_session(role=role) as svc:
+            await svc.validate_mcp_integrations(mcp_integration_ids)
+            servers = await svc.resolve_mcp_integration_refs(mcp_integration_ids)
+    except (MCPValidationError, TracecatValidationError) as e:
+        raise ApplicationError(str(e), non_retryable=True) from e
+    return servers or []
+
+
+def _strip_string_values(args: dict[str, Any]) -> dict[str, Any]:
+    """Strip leading/trailing whitespace from string values in args.
+
+    This ensures expressions like ``  ${{ VARS.x }}  `` are recognized as
+    template-only (rather than inline interpolation) so the resolved value
+    is returned without surrounding spaces.
+    """
+    return {k: v.strip() if isinstance(v, str) else v for k, v in args.items()}
+
+
+def _resolve_environment(
+    task_environment: str | None,
+    default_environment: str,
+    materialized: MaterializedExecutionContext,
+) -> str:
+    """Resolve effective environment for an agent action.
+
+    Precedence: task_environment > default_environment.
+    If task_environment is a template expression it is evaluated against the
+    materialized operand.
+    """
+    if task_environment is None:
+        return default_environment
+    env = task_environment.strip()
+    if is_template_only(env):
+        expr = TemplateExpression(env, operand=materialized)
+        return expr.result()
+    return env
 
 
 class ScatterActionInput(BaseModel):
@@ -118,11 +199,17 @@ class FinalizeGatherActivityResult(BaseModel):
 class BuildAgentArgsActivityInput(BaseModel):
     args: dict[str, Any]
     operand: ExecutionContext
+    role: Role
+    task_environment: str | None
+    default_environment: str
 
 
 class BuildPresetAgentArgsActivityInput(BaseModel):
     args: dict[str, Any]
     operand: ExecutionContext
+    role: Role
+    task_environment: str | None
+    default_environment: str
 
 
 class EvaluateTemplatedObjectActivityInput(BaseModel):
@@ -187,17 +274,27 @@ def run_sync[T: Any](coro: Coroutine[Any, Any, T]) -> T:
     """Run a coroutine in the current thread."""
     runner = getattr(_thread_local, "runner", None)
     if runner is None:
-        runner = asyncio.Runner()
-        runner.__enter__()  # create & keep loop
+        runner = _ThreadLocalRunner()
         _thread_local.runner = runner
     return runner.run(coro)
+
+
+async def _store_collection_as_refs(prefix: str, items: list[Any]) -> CollectionObject:
+    """Store collection items as StoredObject handles and persist refs in chunks."""
+    storage = get_object_storage()
+    refs: list[dict[str, Any]] = []
+    for i, item in enumerate(items):
+        stored = await storage.store(collection_item_key(prefix, i), item)
+        refs.append(stored.model_dump())
+    return await store_collection(prefix, refs, element_kind="stored_object")
 
 
 async def _materialize_task_result(task_result: TaskResult) -> MaterializedTaskResult:
     """Materialize a TaskResult's StoredObject result to raw value.
 
-    Handles collection_index for scatter items - when set, the stored result
-    is a collection and we extract the item at that index.
+    Handles collection_index for scatter items. When set:
+    - CollectionObject retrieval resolves a single item via CollectionObject.at(index).
+    - InlineObject(list) retrieval resolves the indexed list item directly.
 
     Args:
         task_result: A TaskResult
@@ -209,21 +306,25 @@ async def _materialize_task_result(task_result: TaskResult) -> MaterializedTaskR
     # Handle Pydantic TaskResult instance
     storage = get_object_storage()
     match task_result.result:
-        case InlineObject():
-            raw_result = task_result.result.data
+        case InlineObject(data=data):
+            if task_result.collection_index is not None and isinstance(data, list):
+                raw_result = data[task_result.collection_index]
+            else:
+                raw_result = data
         case ExternalObject():
             raw_result = await storage.retrieve(task_result.result)
-        case CollectionObject():
-            raw_result = await materialize_collection_values(task_result.result)
+        case CollectionObject() as collection:
+            if task_result.collection_index is not None:
+                raw_result = await storage.retrieve(
+                    collection.at(task_result.collection_index)
+                )
+            else:
+                raw_result = await materialize_collection_values(collection)
         case _:
             raise TypeError(
                 "Expected TaskResult.result to be a StoredObject, "
                 f"got {type(task_result.result).__name__}"
             )
-
-    # Handle scatter item extraction - if collection_index is set, extract the item
-    if task_result.collection_index is not None and isinstance(raw_result, list):
-        raw_result = raw_result[task_result.collection_index]
 
     return MaterializedTaskResult(
         result=raw_result,
@@ -279,13 +380,24 @@ async def materialize_context(ctx: ExecutionContext) -> MaterializedExecutionCon
     if trigger := ctx.get("TRIGGER"):
         trigger_task_idx = len(action_refs)  # Index after all action tasks
         validated = StoredObjectValidator.validate_python(trigger)
-        coros.append(get_object_storage().retrieve(validated))
+        coros.append(retrieve_stored_object(validated))
 
     # Collect results and map back to their refs
     try:
         materialized_results = await asyncio.gather(*coros)
     except Exception as e:
-        logger.warning("Error materializing context", error=e)
+        retryable = is_retryable_storage_transport_error(e)
+        logger.warning(
+            "Error materializing context",
+            error=e,
+            retryable=retryable,
+        )
+        if retryable:
+            raise ApplicationError(
+                "Failed to materialize context",
+                non_retryable=False,
+                type="StorageMaterializationError",
+            ) from e
         raise ApplicationError(
             "Failed to materialize context",
             non_retryable=True,
@@ -341,6 +453,18 @@ class DSLActivities:
     @activity.defn
     def noop_gather_action_activity(input: RunActionInput, role: Role) -> Any:
         """No-op gather action activity."""
+        return input.exec_context.get("ACTIONS", {}).get(input.task.ref)
+
+    @staticmethod
+    @activity.defn
+    def noop_loop_start_activity(input: RunActionInput, role: Role) -> Any:
+        """No-op activity for loop start interface actions."""
+        return input.exec_context.get("ACTIONS", {}).get(input.task.ref)
+
+    @staticmethod
+    @activity.defn
+    def noop_loop_end_activity(input: RunActionInput, role: Role) -> Any:
+        """No-op activity for loop end interface actions."""
         return input.exec_context.get("ACTIONS", {}).get(input.task.ref)
 
     @staticmethod
@@ -484,18 +608,25 @@ class DSLActivities:
 
         Returns CollectionObject if externalized, InlineObject otherwise.
         """
-        # Materialize each StoredObject to get its raw value
-        storage = get_object_storage()
-        values: list[Any] = []
-        for obj in input.collection:
-            value = await storage.retrieve(obj)
-            values.append(value)
-
         # Guard CollectionObject: only use chunked storage when externalization
         # is enabled. Fall back to inline list for non-externalized deployments.
+        storage = get_object_storage()
         if config.TRACECAT__RESULT_EXTERNALIZATION_ENABLED:
-            return await store_collection(input.key, values)
+            refs: list[dict[str, Any]] = []
+            for i, obj in enumerate(input.collection):
+                value = await storage.retrieve(obj)
+                stored = await storage.store(collection_item_key(input.key, i), value)
+                refs.append(stored.model_dump())
+            return await store_collection(
+                input.key,
+                refs,
+                element_kind="stored_object",
+            )
         else:
+            values: list[Any] = []
+            for obj in input.collection:
+                value = await storage.retrieve(obj)
+                values.append(value)
             return InlineObject(data=values, typename="list")
 
     @staticmethod
@@ -541,37 +672,86 @@ class DSLActivities:
         # Guard CollectionObject: only use chunked storage when externalization
         # is enabled. Fall back to inline list for non-externalized deployments.
         if config.TRACECAT__RESULT_EXTERNALIZATION_ENABLED:
-            stored: StoredObject = await store_collection(input.key, results)
+            stored = await _store_collection_as_refs(input.key, results)
         else:
             stored = InlineObject(data=results, typename="list")
         return FinalizeGatherActivityResult(result=stored, errors=errors)
 
     @staticmethod
     @activity.defn
-    def build_agent_args_activity(
+    async def build_agent_args_activity(
         input: BuildAgentArgsActivityInput,
     ) -> AgentActionArgs:
         """Build an AgentActionArgs from a dictionary of arguments.
 
-        Materializes any StoredObjects in operand before evaluation. This ensures
-        that expressions evaluate against raw values even when results are externalized.
+        Resolves the effective environment, fetches workspace VARS,
+        materializes any StoredObjects in operand, then evaluates templated
+        args. CPU-bound work is offloaded via asyncio.to_thread to avoid
+        blocking the Temporal event loop.
         """
-        materialized = run_sync(materialize_context(input.operand))
-        evaled_args = eval_templated_object(input.args, operand=materialized)
+        operand = input.operand
+        materialized = await materialize_context(operand)
+        environment = await asyncio.to_thread(
+            _resolve_environment,
+            input.task_environment,
+            input.default_environment,
+            materialized,
+        )
+        collected = await asyncio.to_thread(collect_expressions, input.args)
+        if collected.variables:
+            workspace_variables = await get_workspace_variables(
+                variable_exprs=collected.variables,
+                environment=environment,
+                role=input.role,
+            )
+            if workspace_variables:
+                operand["VARS"] = workspace_variables
+                materialized = await materialize_context(operand)
+        args = _strip_string_values(input.args)
+        evaled_args = await asyncio.to_thread(
+            eval_templated_object, args, operand=materialized
+        )
+        mcp_integration_ids = evaled_args.pop("mcp_integrations", None)
+        if mcp_integration_ids:
+            evaled_args["mcp_servers"] = await _resolve_mcp_integrations(
+                mcp_integration_ids, role=input.role
+            )
         return AgentActionArgs(**evaled_args)
 
     @staticmethod
     @activity.defn
-    def build_preset_agent_args_activity(
+    async def build_preset_agent_args_activity(
         input: BuildPresetAgentArgsActivityInput,
     ) -> PresetAgentActionArgs:
         """Build a PresetAgentActionArgs from a dictionary of arguments.
 
-        Materializes any StoredObjects in operand before evaluation. This ensures
-        that expressions evaluate against raw values even when results are externalized.
+        Resolves the effective environment, fetches workspace VARS,
+        materializes any StoredObjects in operand, then evaluates templated
+        args. CPU-bound work is offloaded via asyncio.to_thread to avoid
+        blocking the Temporal event loop.
         """
-        materialized = run_sync(materialize_context(input.operand))
-        evaled_args = eval_templated_object(input.args, operand=materialized)
+        operand = input.operand
+        materialized = await materialize_context(operand)
+        environment = await asyncio.to_thread(
+            _resolve_environment,
+            input.task_environment,
+            input.default_environment,
+            materialized,
+        )
+        collected = await asyncio.to_thread(collect_expressions, input.args)
+        if collected.variables:
+            workspace_variables = await get_workspace_variables(
+                variable_exprs=collected.variables,
+                environment=environment,
+                role=input.role,
+            )
+            if workspace_variables:
+                operand["VARS"] = workspace_variables
+                materialized = await materialize_context(operand)
+        args = _strip_string_values(input.args)
+        evaled_args = await asyncio.to_thread(
+            eval_templated_object, args, operand=materialized
+        )
         return PresetAgentActionArgs(**evaled_args)
 
     @staticmethod
@@ -663,7 +843,7 @@ def _evaluate_scatter_input(input: ScatterActionInput) -> StoredObject:
     # Guard CollectionObject: only use chunked storage when externalization
     # is enabled. Fall back to inline list for non-externalized deployments.
     if config.TRACECAT__RESULT_EXTERNALIZATION_ENABLED:
-        return run_sync(store_collection(input.key, items))
+        return run_sync(_store_collection_as_refs(input.key, items))
     else:
         return InlineObject(data=items, typename="list")
 
@@ -707,6 +887,24 @@ def _as_error_info(detail: Any) -> ActionErrorInfo | None:
         return ActionErrorInfoAdapter.validate_python(detail)
     except Exception:
         return None
+
+
+def _evaluate_subflow_args(
+    args: Mapping[str, Any], operand: Mapping[str, Any]
+) -> tuple[dict[str, Any], ExecuteSubflowArgs]:
+    try:
+        evaluated_args = cast(
+            dict[str, Any],
+            eval_templated_object(dict(args), operand=operand),
+        )
+        return evaluated_args, ExecuteSubflowArgs.model_validate(evaluated_args)
+    except TracecatExpressionError as e:
+        raise UserError(f"Error evaluating subflow arguments: {e}") from e
+    except ValidationError as e:
+        raise UserError(
+            "Invalid subflow arguments",
+            ValidationDetail.list_from_pydantic(e),
+        ) from e
 
 
 def _resolve_subflow_batch(
@@ -788,7 +986,7 @@ def _resolve_subflow_batch(
     storage = get_object_storage()
     trigger_inputs_stored: list[StoredObject] = []
     for i, trigger_input in enumerate(trigger_inputs_list):
-        key = f"{input.key}/item_{i}.json"
+        key = collection_item_key(input.key, i)
         stored = run_sync(storage.store(key, trigger_input))
         trigger_inputs_stored.append(stored)
 
@@ -812,17 +1010,18 @@ def _evaluate_loop_iterations(
         runtime_configs is single DSLConfig if all identical, else list.
     """
     if not task.for_each:
-        raise ApplicationError(
-            "task.for_each is required for loop iterations",
-            non_retryable=True,
+        raise UserError("task.for_each is required for loop iterations")
+    try:
+        iterators = get_iterables_from_expression(
+            expr=task.for_each, operand=materialized
         )
-    iterators = get_iterables_from_expression(expr=task.for_each, operand=materialized)
+    except (TracecatExpressionError, ValueError) as e:
+        raise UserError(f"Error evaluating subflow for_each expression: {e}") from e
     all_items = list(zip(*iterators, strict=False))
 
     if len(all_items) > MAX_LOOP_ITERATIONS:
-        raise ApplicationError(
-            f"Loop exceeds max iterations: {len(all_items)} > {MAX_LOOP_ITERATIONS}",
-            non_retryable=True,
+        raise UserError(
+            f"Loop exceeds max iterations: {len(all_items)} > {MAX_LOOP_ITERATIONS}"
         )
 
     trigger_inputs_list: list[Any] = []
@@ -841,10 +1040,7 @@ def _evaluate_loop_iterations(
             )
 
         # Evaluate the full task args with patched context
-        iter_evaluated_args = eval_templated_object(
-            dict(task.args), operand=patched_context
-        )
-        iter_val_args = ExecuteSubflowArgs.model_validate(iter_evaluated_args)
+        _, iter_val_args = _evaluate_subflow_args(task.args, patched_context)
 
         # Environment precedence: args.environment > dsl.config
         resolved_environment = iter_val_args.environment or dsl_config.environment
@@ -884,8 +1080,10 @@ async def _prepare_subflow(input: PrepareSubflowActivityInput) -> PreparedSubflo
     materialized = await materialize_context(input.operand)
 
     # Evaluate task args to get workflow_id or workflow_alias
-    evaluated_args = eval_templated_object(task.args, operand=materialized)
-    val_args = ExecuteSubflowArgs.model_validate(evaluated_args)
+    # Run CPU-bound expression evaluation in thread to avoid blocking event loop
+    evaluated_args, val_args = await asyncio.to_thread(
+        _evaluate_subflow_args, task.args, materialized
+    )
 
     # Resolve workflow ID
     wf_id: WorkflowUUID
@@ -897,18 +1095,12 @@ async def _prepare_subflow(input: PrepareSubflowActivityInput) -> PreparedSubflo
                 use_committed=input.use_committed,
             )
             if resolved_id is None:
-                raise ApplicationError(
-                    f"Workflow alias '{workflow_alias}' not found",
-                    non_retryable=True,
-                )
+                raise UserError(f"Workflow alias '{workflow_alias}' not found")
             wf_id = WorkflowUUID.new(resolved_id)
     elif workflow_id := val_args.workflow_id:
         wf_id = WorkflowUUID.new(workflow_id)
     else:
-        raise ApplicationError(
-            "Either workflow_id or workflow_alias must be provided",
-            non_retryable=True,
-        )
+        raise UserError("Either workflow_id or workflow_alias must be provided")
 
     # Fetch workflow definition
     async with WorkflowDefinitionsService.with_session(role=input.role) as service:
@@ -916,10 +1108,7 @@ async def _prepare_subflow(input: PrepareSubflowActivityInput) -> PreparedSubflo
             wf_id, version=evaluated_args.get("version")
         )
         if not defn:
-            raise ApplicationError(
-                f"Workflow definition not found for {wf_id.short()}",
-                non_retryable=True,
-            )
+            raise UserError(f"Workflow definition not found for {wf_id.short()}")
     dsl = DSLInput(**defn.content)
     registry_lock = (
         RegistryLock.model_validate(defn.registry_lock) if defn.registry_lock else None
@@ -927,8 +1116,9 @@ async def _prepare_subflow(input: PrepareSubflowActivityInput) -> PreparedSubflo
 
     # For single subflows (no for_each), evaluate args and return
     if not task.for_each:
-        evaluated_args = eval_templated_object(dict(task.args), operand=materialized)
-        val_args = ExecuteSubflowArgs.model_validate(evaluated_args)
+        evaluated_args, val_args = await asyncio.to_thread(
+            _evaluate_subflow_args, task.args, materialized
+        )
 
         runtime_config = DSLConfig(
             environment=val_args.environment or dsl.config.environment,
@@ -956,7 +1146,7 @@ async def _prepare_subflow(input: PrepareSubflowActivityInput) -> PreparedSubflo
     # is enabled. Fall back to inline list for non-externalized deployments.
     trigger_inputs_stored: StoredObject
     if config.TRACECAT__RESULT_EXTERNALIZATION_ENABLED:
-        trigger_inputs_stored = await store_collection(
+        trigger_inputs_stored = await _store_collection_as_refs(
             f"{input.key}/trigger_inputs", trigger_inputs_list
         )
     else:

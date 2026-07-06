@@ -3,20 +3,14 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import {
   type ApiError,
   type WorkspaceMember,
-  type WorkspaceMembershipRead,
   type WorkspaceRead,
   type WorkspacesCreateWorkspaceMembershipData,
   type WorkspacesCreateWorkspaceMembershipResponse,
-  type WorkspacesUpdateWorkspaceMembershipData,
-  type WorkspacesUpdateWorkspaceMembershipResponse,
   workspacesCreateWorkspaceMembership,
   workspacesDeleteWorkspaceMembership,
   workspacesGetWorkspace,
-  workspacesGetWorkspaceMembership,
   workspacesListWorkspaceMembers,
-  workspacesUpdateWorkspaceMembership,
 } from "@/client"
-import { useAuth } from "@/hooks/use-auth"
 import { retryHandler } from "@/lib/errors"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
@@ -34,39 +28,11 @@ export function useWorkspaceDetails() {
     select: (d: WorkspaceRead | undefined) => d,
     enabled: !!workspaceId,
     retry: retryHandler,
+    staleTime: 5 * 60 * 1000,
+    refetchOnWindowFocus: false,
   })
 
   return { workspace, workspaceLoading, workspaceError }
-}
-
-/**
- * Returns the membership role of the current user in the specified workspace.
- *
- * @param workspaceId - The ID of the workspace to check membership for.
- * @returns An object containing:
- *   - role: The user's role in the workspace, or undefined if not found.
- *   - roleLoading: Whether the role is currently loading.
- *   - roleError: Any error encountered while fetching the role.
- */
-export function useCurrentUserRole(workspaceId: string) {
-  const { user } = useAuth()
-  const {
-    data: role,
-    isLoading: roleLoading,
-    error: roleError,
-  } = useQuery({
-    queryKey: ["membership", workspaceId, user?.id],
-    queryFn: () =>
-      workspacesGetWorkspaceMembership({
-        workspaceId,
-        userId: user!.id,
-      }),
-    select: (m: WorkspaceMembershipRead | undefined) => m?.role,
-    enabled: !!user?.id,
-    retry: retryHandler,
-    staleTime: 300_000,
-  })
-  return { role, roleLoading, roleError }
 }
 
 /* ── MUTATIONS ─────────────────────────────────────────────────────────── */
@@ -81,19 +47,13 @@ export function useWorkspaceMutations() {
     WorkspacesCreateWorkspaceMembershipData
   >({
     mutationFn: workspacesCreateWorkspaceMembership,
-    onSuccess: () =>
-      qc.invalidateQueries({ queryKey: ["workspace", workspaceId] }),
-  })
-
-  const { mutateAsync: updateMember, isPending: updatePending } = useMutation<
-    WorkspacesUpdateWorkspaceMembershipResponse,
-    Error,
-    WorkspacesUpdateWorkspaceMembershipData
-  >({
-    mutationFn: workspacesUpdateWorkspaceMembership,
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["workspace", workspaceId] })
-      qc.invalidateQueries({ queryKey: ["membership", workspaceId] })
+    onSuccess: async () => {
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["workspace", workspaceId] }),
+        qc.invalidateQueries({
+          queryKey: ["workspace", workspaceId, "members"],
+        }),
+      ])
     },
   })
 
@@ -107,21 +67,29 @@ export function useWorkspaceMutations() {
         workspaceId,
         userId,
       }),
-    onSuccess: () =>
-      qc.invalidateQueries({ queryKey: ["workspace", workspaceId] }),
+    onSuccess: async () => {
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["workspace", workspaceId] }),
+        qc.invalidateQueries({
+          queryKey: ["workspace", workspaceId, "members"],
+        }),
+      ])
+    },
   })
 
   return {
     addMember,
     addPending,
-    updateMember,
-    updatePending,
     removeMember,
     removePending,
   }
 }
 
-export function useWorkspaceMembers(workspaceId: string) {
+export function useWorkspaceMembers(
+  workspaceId: string,
+  options: { enabled?: boolean } = {}
+) {
+  const enabled = options.enabled ?? true
   const {
     data: members,
     isLoading: membersLoading,
@@ -129,6 +97,9 @@ export function useWorkspaceMembers(workspaceId: string) {
   } = useQuery<WorkspaceMember[], ApiError>({
     queryKey: ["workspace", workspaceId, "members"],
     queryFn: () => workspacesListWorkspaceMembers({ workspaceId }),
+    enabled: enabled && !!workspaceId,
+    staleTime: 5 * 60 * 1000,
+    refetchOnWindowFocus: false,
   })
 
   return { members, membersLoading, membersError }

@@ -1,54 +1,28 @@
-from typing import Annotated
-
 from fastapi import APIRouter, HTTPException, status
 
 from tracecat.agent.schemas import (
+    DefaultModelSelection,
+    DefaultModelSelectionUpdate,
     ModelConfig,
     ModelCredentialCreate,
     ModelCredentialUpdate,
     ProviderCredentialConfig,
 )
 from tracecat.agent.service import AgentManagementService
-from tracecat.auth.credentials import RoleACL
-from tracecat.auth.types import AccessLevel, Role
+from tracecat.auth.dependencies import OrgUserRole, WorkspaceActorRouteRole
+from tracecat.authz.controls import require_scope
 from tracecat.db.dependencies import AsyncDBSession
 from tracecat.exceptions import TracecatNotFoundError
 
 router = APIRouter(prefix="/agent", tags=["agent"])
-
-OrganizationAdminUserRole = Annotated[
-    Role,
-    RoleACL(
-        allow_user=True,
-        allow_service=False,
-        require_workspace="no",
-        min_access_level=AccessLevel.ADMIN,
-    ),
-]
-
-OrganizationUserRole = Annotated[
-    Role,
-    RoleACL(
-        allow_user=True,
-        allow_service=False,
-        require_workspace="no",
-    ),
-]
-
-WorkspaceUserRole = Annotated[
-    Role,
-    RoleACL(
-        allow_user=True,
-        allow_service=False,
-        require_workspace="yes",
-    ),
-]
+workspace_router = APIRouter(prefix="/agent", tags=["agent"])
 
 
 @router.get("/models")
+@require_scope("agent:read")
 async def list_models(
     *,
-    role: OrganizationUserRole,
+    role: OrgUserRole,
     session: AsyncDBSession,
 ) -> dict[str, ModelConfig]:
     """List all available AI models."""
@@ -57,9 +31,10 @@ async def list_models(
 
 
 @router.get("/providers")
+@require_scope("agent:read")
 async def list_providers(
     *,
-    role: OrganizationUserRole,
+    role: OrgUserRole,
     session: AsyncDBSession,
 ) -> list[str]:
     """List all available AI model providers."""
@@ -68,9 +43,10 @@ async def list_providers(
 
 
 @router.get("/providers/status")
+@require_scope("agent:read")
 async def get_providers_status(
     *,
-    role: OrganizationUserRole,
+    role: OrgUserRole,
     session: AsyncDBSession,
 ) -> dict[str, bool]:
     """Get credential status for all providers."""
@@ -79,9 +55,10 @@ async def get_providers_status(
 
 
 @router.get("/providers/configs")
+@require_scope("agent:read")
 async def list_provider_credential_configs(
     *,
-    role: OrganizationAdminUserRole,
+    role: OrgUserRole,
     session: AsyncDBSession,
 ) -> list[ProviderCredentialConfig]:
     """List credential field configurations for all providers."""
@@ -90,10 +67,11 @@ async def list_provider_credential_configs(
 
 
 @router.get("/providers/{provider}/config")
+@require_scope("agent:read")
 async def get_provider_credential_config(
     *,
     provider: str,
-    role: OrganizationAdminUserRole,
+    role: OrgUserRole,
     session: AsyncDBSession,
 ) -> ProviderCredentialConfig:
     """Get credential field configuration for a specific provider."""
@@ -108,10 +86,11 @@ async def get_provider_credential_config(
 
 
 @router.post("/credentials", status_code=status.HTTP_201_CREATED)
+@require_scope("agent:update")
 async def create_provider_credentials(
     *,
     params: ModelCredentialCreate,
-    role: OrganizationAdminUserRole,
+    role: OrgUserRole,
     session: AsyncDBSession,
 ) -> dict[str, str]:
     """Create or update credentials for an AI provider."""
@@ -127,11 +106,12 @@ async def create_provider_credentials(
 
 
 @router.put("/credentials/{provider}")
+@require_scope("agent:update")
 async def update_provider_credentials(
     *,
     provider: str,
     params: ModelCredentialUpdate,
-    role: OrganizationAdminUserRole,
+    role: OrgUserRole,
     session: AsyncDBSession,
 ) -> dict[str, str]:
     """Update existing credentials for an AI provider."""
@@ -152,10 +132,11 @@ async def update_provider_credentials(
 
 
 @router.delete("/credentials/{provider}")
+@require_scope("agent:update")
 async def delete_provider_credentials(
     *,
     provider: str,
-    role: OrganizationAdminUserRole,
+    role: OrgUserRole,
     session: AsyncDBSession,
 ) -> dict[str, str]:
     """Delete credentials for an AI provider."""
@@ -165,9 +146,10 @@ async def delete_provider_credentials(
 
 
 @router.get("/default-model")
+@require_scope("agent:read")
 async def get_default_model(
     *,
-    role: OrganizationUserRole,
+    role: OrgUserRole,
     session: AsyncDBSession,
 ) -> str | None:
     """Get the organization's default AI model."""
@@ -175,34 +157,67 @@ async def get_default_model(
     return await service.get_default_model()
 
 
-@router.put("/default-model")
+@router.put("/default-model", response_model=DefaultModelSelection)
+@require_scope("agent:update")
 async def set_default_model(
     *,
-    model_name: str,
-    role: OrganizationAdminUserRole,
+    params: DefaultModelSelectionUpdate,
+    role: OrgUserRole,
     session: AsyncDBSession,
-) -> dict[str, str]:
-    """Set the organization's default AI model."""
+) -> DefaultModelSelection:
+    """Set the organization's default AI model by catalog id.
+
+    Names aren't unique once an org enables the same ``model_name`` under
+    multiple providers (e.g. ``openai/gpt-4o`` + ``azure_openai/gpt-4o``),
+    so the selection is keyed by catalog row. Rejects catalog ids that
+    aren't enabled for this org with a 404.
+    """
     service = AgentManagementService(session, role=role)
     try:
-        await service.set_default_model(model_name)
-        return {"message": f"Default model set to {model_name}"}
+        return await service.set_default_model(params.catalog_id)
     except TracecatNotFoundError as e:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Model {model_name} not found",
+            detail=str(e),
         ) from e
-    except Exception as e:
+
+
+@router.get("/default-model-selection", response_model=DefaultModelSelection | None)
+@require_scope("agent:read")
+async def get_default_model_selection(
+    *,
+    role: OrgUserRole,
+    session: AsyncDBSession,
+) -> DefaultModelSelection | None:
+    """Get the organization's canonical default model selection."""
+    service = AgentManagementService(session, role=role)
+    return await service.get_default_model_selection()
+
+
+@router.put("/default-model-selection", response_model=DefaultModelSelection)
+@require_scope("agent:update")
+async def set_default_model_selection(
+    *,
+    params: DefaultModelSelectionUpdate,
+    role: OrgUserRole,
+    session: AsyncDBSession,
+) -> DefaultModelSelection:
+    """Set the organization's canonical default model selection."""
+    service = AgentManagementService(session, role=role)
+    try:
+        return await service.set_default_model(params.catalog_id)
+    except TracecatNotFoundError as e:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to set default model: {str(e)}",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
         ) from e
 
 
-@router.get("/workspace/providers/status")
+@workspace_router.get("/workspace/providers/status")
+@require_scope("agent:read")
 async def get_workspace_providers_status(
     *,
-    role: WorkspaceUserRole,
+    role: WorkspaceActorRouteRole,
     session: AsyncDBSession,
 ) -> dict[str, bool]:
     """Get workspace credential status for all providers."""

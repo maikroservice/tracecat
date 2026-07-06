@@ -1,6 +1,9 @@
-from fastapi import Request, Response, status
+from fastapi import HTTPException, Request, Response, status
+from fastapi.exception_handlers import http_exception_handler as default_http_handler
 from fastapi.responses import ORJSONResponse
 from fastapi.routing import APIRoute
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from temporalio.api.enums.v1 import IndexedValueType
 from temporalio.api.operatorservice.v1 import (
     AddSearchAttributesRequest,
@@ -13,17 +16,18 @@ from tenacity import (
     wait_exponential,
 )
 
-from tracecat.auth.types import AccessLevel, Role
+from tracecat.auth.types import Role
 from tracecat.config import TEMPORAL__CLUSTER_NAMESPACE
 from tracecat.contexts import ctx_role
 from tracecat.dsl.client import get_temporal_client
 from tracecat.exceptions import TracecatException
+from tracecat.identifiers import OrganizationID
 from tracecat.logger import logger
 from tracecat.workflow.executions.enums import TemporalSearchAttr
 
 
-def generic_exception_handler(request: Request, exc: Exception) -> Response:
-    logger.error(
+async def generic_exception_handler(request: Request, exc: Exception) -> Response:
+    logger.exception(
         "Unexpected error",
         exc=exc,
         role=ctx_role.get(),
@@ -36,13 +40,66 @@ def generic_exception_handler(request: Request, exc: Exception) -> Response:
     )
 
 
-def bootstrap_role():
-    """Role to bootstrap Tracecat services."""
+async def http_exception_handler(request: Request, exc: Exception) -> Response:
+    """Log HTTP exceptions with tenant context for observability."""
+    http_exc = exc if isinstance(exc, HTTPException) else HTTPException(500, str(exc))
+    role = ctx_role.get()
+    log_method = logger.warning if http_exc.status_code < 500 else logger.error
+    log_method(
+        "HTTP error",
+        status_code=http_exc.status_code,
+        detail=http_exc.detail,
+        path=request.url.path,
+        method=request.method,
+        role=role,
+    )
+    return await default_http_handler(request, http_exc)
+
+
+def bootstrap_role(organization_id: OrganizationID | None = None) -> Role:
+    """Role to bootstrap Tracecat services.
+
+    Args:
+        organization_id: Optional organization ID to scope the bootstrap role to.
+            If None, creates a role without org scope (for platform-level operations).
+
+    Returns:
+        Role: A service role with platform superuser privileges for the specified organization.
+    """
     return Role(
         type="service",
-        access_level=AccessLevel.ADMIN,
         service_id="tracecat-bootstrap",
+        organization_id=organization_id,
+        is_platform_superuser=True,
+        scopes=frozenset({"*"}),
     )
+
+
+async def get_default_organization_id(session: AsyncSession) -> OrganizationID:
+    """Get the default (first) organization ID.
+
+    This is used by auth modules that need to read platform-level settings
+    before user authentication provides an org context.
+
+    Args:
+        session: Database session.
+
+    Returns:
+        OrganizationID: The ID of the first organization.
+
+    Raises:
+        ValueError: If no organizations exist.
+    """
+    # Import here to avoid circular imports
+    from tracecat.db.models import Organization
+
+    result = await session.execute(
+        select(Organization).order_by(Organization.created_at).limit(1)
+    )
+    org = result.scalar_one_or_none()
+    if org is None:
+        raise ValueError("No organizations exist. Run bootstrap first.")
+    return org.id
 
 
 def tracecat_exception_handler(request: Request, exc: Exception) -> Response:
@@ -95,6 +152,7 @@ async def add_temporal_search_attributes():
         TemporalSearchAttr.TRIGGERED_BY_USER_ID.value: IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD,
         TemporalSearchAttr.WORKSPACE_ID.value: IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD,
         TemporalSearchAttr.ALIAS.value: IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD,
+        TemporalSearchAttr.CORRELATION_ID.value: IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD,
         TemporalSearchAttr.EXECUTION_TYPE.value: IndexedValueType.INDEXED_VALUE_TYPE_KEYWORD,
     }
     try:
@@ -139,6 +197,7 @@ async def remove_temporal_search_attributes():
                     TemporalSearchAttr.TRIGGERED_BY_USER_ID.value,
                     TemporalSearchAttr.WORKSPACE_ID.value,
                     TemporalSearchAttr.ALIAS.value,
+                    TemporalSearchAttr.CORRELATION_ID.value,
                     TemporalSearchAttr.EXECUTION_TYPE.value,
                 ],
                 namespace=namespace,
@@ -159,6 +218,7 @@ async def remove_temporal_search_attributes():
                 TemporalSearchAttr.TRIGGERED_BY_USER_ID.value,
                 TemporalSearchAttr.WORKSPACE_ID.value,
                 TemporalSearchAttr.ALIAS.value,
+                TemporalSearchAttr.CORRELATION_ID.value,
                 TemporalSearchAttr.EXECUTION_TYPE.value,
             ],
         )

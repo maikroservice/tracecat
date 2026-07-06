@@ -20,22 +20,21 @@ Usage:
             # Data was externalized to blob storage
             pass
 
-    # Or simply retrieve (works for both variants)
-    data = await storage.retrieve(stored)
+    # Or retrieve from the backend encoded in the object reference
+    data = await retrieve_stored_object(stored)
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
     Discriminator,
     Field,
     TypeAdapter,
-    model_serializer,
     model_validator,
 )
 
@@ -78,7 +77,7 @@ class ObjectRef(BaseModel):
 
 
 class _StoredObjectBase(BaseModel):
-    """Base class for stored object types with shared serialization behavior.
+    """Base class for stored object types.
 
     Subclasses must define a `type` field as the discriminator.
     """
@@ -86,23 +85,37 @@ class _StoredObjectBase(BaseModel):
     typename: str | None = None
     """Optional type name of the original data (e.g., 'str', 'list')."""
 
-    @model_serializer(mode="wrap")
-    def _serialize(self, handler: Any) -> dict[str, Any]:
-        """Always include type field for discriminated union."""
-        result: dict[str, Any] = handler(self)
-        # Access type from subclass (InlineObject or ExternalObject)
-        result["type"] = self.type  # pyright: ignore[reportAttributeAccessIssue]
-        return result
+    @staticmethod
+    def _inject_discriminator_type(data: Any, value: str) -> Any:
+        """Backfill discriminator for ergonomic construction/back-compat."""
+        if isinstance(data, dict) and "type" not in data:
+            data["type"] = value
+        return data
 
 
 class InlineObject[T: Any](_StoredObjectBase):
     """Data stored inline (not externalized)."""
 
-    type: Literal["inline"] = "inline"
+    type: Literal["inline"]
     """Discriminator for tagged union."""
 
     data: T
     """The inline data. Can be any JSON-serializable value, including None."""
+
+    if TYPE_CHECKING:
+
+        def __init__(
+            self,
+            *,
+            data: T,
+            typename: str | None = None,
+            type: Literal["inline"] = "inline",
+        ) -> None: ...
+
+    @model_validator(mode="before")
+    @classmethod
+    def _inject_type(cls, data: Any) -> Any:
+        return cls._inject_discriminator_type(data, "inline")
 
     @model_validator(mode="after")
     def _set_typename(self) -> InlineObject[T]:
@@ -114,11 +127,26 @@ class InlineObject[T: Any](_StoredObjectBase):
 class ExternalObject(_StoredObjectBase):
     """Data externalized to blob storage."""
 
-    type: Literal["external"] = "external"
+    type: Literal["external"]
     """Discriminator for tagged union."""
 
     ref: ObjectRef
     """Reference to the externalized data in blob storage."""
+
+    if TYPE_CHECKING:
+
+        def __init__(
+            self,
+            *,
+            ref: ObjectRef,
+            typename: str | None = None,
+            type: Literal["external"] = "external",
+        ) -> None: ...
+
+    @model_validator(mode="before")
+    @classmethod
+    def _inject_type(cls, data: Any) -> Any:
+        return cls._inject_discriminator_type(data, "external")
 
 
 class CollectionObject(_StoredObjectBase):
@@ -138,7 +166,7 @@ class CollectionObject(_StoredObjectBase):
         schema_version: Manifest schema version for forward compatibility.
     """
 
-    type: Literal["collection"] = "collection"
+    type: Literal["collection"]
     """Discriminator for tagged union."""
 
     manifest_ref: ObjectRef
@@ -171,6 +199,21 @@ class CollectionObject(_StoredObjectBase):
     def __len__(self) -> int:
         return self.count
 
+    if TYPE_CHECKING:
+
+        def __init__(
+            self,
+            *,
+            manifest_ref: ObjectRef,
+            count: int,
+            chunk_size: int,
+            element_kind: Literal["value", "stored_object"],
+            schema_version: int = 1,
+            index: int | None = None,
+            typename: str | None = None,
+            type: Literal["collection"] = "collection",
+        ) -> None: ...
+
     def at(self, index: int) -> CollectionObject:
         """Return a copy of this collection handle pointing to a specific index.
 
@@ -178,6 +221,11 @@ class CollectionObject(_StoredObjectBase):
         The manifest_ref remains the same, but the index field is set.
         """
         return self.model_copy(update={"index": index})
+
+    @model_validator(mode="before")
+    @classmethod
+    def _inject_type(cls, data: Any) -> Any:
+        return cls._inject_discriminator_type(data, "collection")
 
     @model_validator(mode="after")
     def _set_typename(self) -> CollectionObject:
@@ -243,6 +291,38 @@ class ObjectStorage(ABC):
             FileNotFoundError: If the object doesn't exist (for externalized data)
         """
         raise NotImplementedError
+
+
+def get_object_storage_for(stored: StoredObject) -> ObjectStorage:
+    """Resolve the storage backend encoded in a StoredObject reference."""
+    match stored:
+        case InlineObject():
+            return get_object_storage()
+        case ExternalObject(ref=ref) | CollectionObject(manifest_ref=ref):
+            match ref.backend:
+                case "s3":
+                    from tracecat.storage.backends import S3ObjectStorage
+
+                    return S3ObjectStorage(
+                        bucket=ref.bucket,
+                        threshold_bytes=config.TRACECAT__RESULT_EXTERNALIZATION_THRESHOLD_BYTES,
+                    )
+                case _:
+                    raise ValueError(
+                        f"Unsupported object storage backend: {ref.backend}"
+                    )
+
+
+async def retrieve_stored_object(stored: StoredObject) -> Any:
+    """Retrieve a StoredObject using the backend encoded in its reference."""
+    match stored:
+        case InlineObject(data=data):
+            return data
+        case ExternalObject() | CollectionObject():
+            storage = get_object_storage_for(stored)
+            return await storage.retrieve(stored)
+        case _:
+            raise TypeError(f"Expected StoredObject, got {type(stored).__name__}")
 
 
 # === Dependency Injection === #
@@ -334,6 +414,14 @@ def action_collection_prefix(
     return f"{workspace_id}/{wf_exec_id}/actions/{stream_id}/{ref}"
 
 
+def collection_item_key(prefix: str, index: int) -> str:
+    """Generate S3 key for the i-th collection item blob.
+
+    Format: {prefix}/items/{index}.json
+    """
+    return f"{prefix}/items/{index}.json"
+
+
 __all__ = [
     # Types
     "CollectionObject",
@@ -345,11 +433,14 @@ __all__ = [
     "StoredObjectValidator",
     # DI
     "get_object_storage",
+    "get_object_storage_for",
+    "retrieve_stored_object",
     "reset_object_storage",
     "set_object_storage",
     # Key helpers
     "action_collection_prefix",
     "action_key",
+    "collection_item_key",
     "return_key",
     "trigger_key",
 ]

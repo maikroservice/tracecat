@@ -18,7 +18,16 @@ from tracecat.config import (
 )
 from tracecat.logger import logger
 from tracecat.sandbox.exceptions import SandboxTimeoutError, SandboxValidationError
+from tracecat.sandbox.networking import (
+    pasta_dns_mount_config_lines,
+    pasta_user_net_config_lines,
+    write_pasta_network_files,
+)
+from tracecat.sandbox.seccomp import build_untrusted_seccomp_policy
 from tracecat.sandbox.types import ResourceLimits, SandboxConfig, SandboxResult
+
+RUN_PYTHON_ACTION_GATEWAY_SOCKET = Path("/var/run/tracecat/action-gateway.sock")
+"""Path visible inside run_python nsjail for executor-owned SDK calls."""
 
 
 @dataclass
@@ -34,6 +43,9 @@ class ActionSandboxConfig:
         tracecat_app_dir: Directory containing tracecat package (not mounted in untrusted mode).
         site_packages_dir: Directory containing Python site-packages (not mounted in untrusted mode).
         env_vars: Environment variables to inject (SDK context, NOT DB credentials).
+        action_gateway_socket: Optional host-side action gateway Unix socket to bind
+            into the sandbox for SDK calls.
+        action_gateway_socket_mount_path: Socket path visible inside the sandbox.
         resources: Resource limits for the sandbox.
         timeout_seconds: Maximum execution time in seconds.
     """
@@ -42,6 +54,10 @@ class ActionSandboxConfig:
     tracecat_app_dir: Path
     site_packages_dir: Path | None = None
     env_vars: dict[str, str] = field(default_factory=dict)
+    action_gateway_socket: Path | None = None
+    action_gateway_socket_mount_path: Path = Path(
+        "/var/run/tracecat/action-gateway.sock"
+    )
     resources: ResourceLimits = field(default_factory=ResourceLimits)
     timeout_seconds: float = 300
 
@@ -61,6 +77,35 @@ SANDBOX_BASE_ENV = {
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8",
 }
+
+_NSJAIL_HINT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (
+        re.compile(r"\bCLONE_NEWUSER\b|clone_newuser", re.IGNORECASE),
+        "User namespaces appear to be unavailable. Ensure USERNS is enabled on the host "
+        "(e.g., sysctls like kernel.unprivileged_userns_clone and user.max_user_namespaces).",
+    ),
+    (
+        re.compile(r"\bOperation not permitted\b|\bEPERM\b", re.IGNORECASE),
+        "nsjail was denied a required operation (often mount/namespace). In containers, ensure "
+        "CAP_SYS_ADMIN is present and seccomp/AppArmor/SELinux policies allow mounts "
+        "(Docker commonly needs SYS_ADMIN + seccomp:unconfined; some hosts also need AppArmor unconfined).",
+    ),
+    (
+        re.compile(r"/dev/net/tun|TUN|tun", re.IGNORECASE),
+        "Userspace networking (pasta) may require /dev/net/tun. Ensure the container/pod "
+        "has the TUN device available and passt/pasta is installed in the image.",
+    ),
+]
+
+
+def _nsjail_failure_hint(stderr: str) -> str | None:
+    stderr = stderr.strip()
+    if not stderr:
+        return None
+    for pattern, hint in _NSJAIL_HINT_PATTERNS:
+        if pattern.search(stderr):
+            return hint
+    return None
 
 
 def _validate_env_key(key: str) -> None:
@@ -162,14 +207,22 @@ class NsjailExecutor:
         # Validate inputs to prevent injection into protobuf config
         _validate_path(job_dir, "job_dir")
         _validate_path(self.rootfs, "rootfs")
+        for i, python_path_dir in enumerate(config.python_path_dirs):
+            _validate_path(python_path_dir, f"python_path_dir_{i}")
         if cache_key:
             _validate_cache_key(cache_key)
+        if config.action_gateway_socket is not None:
+            _validate_path(config.action_gateway_socket, "action_gateway_socket")
 
         # Determine if network should be enabled
         # - Install phase: always enabled for package downloads
         # - Execute phase: per config.network_enabled
         network_enabled = phase == "install" or config.network_enabled
 
+        # Network behavior:
+        # - always isolate network namespace for private loopback
+        # - network enabled: add pasta userspace networking for outbound access
+        # - network disabled: no route out of the isolated namespace
         lines = [
             'name: "python_sandbox"',
             "mode: ONCE",
@@ -177,23 +230,34 @@ class NsjailExecutor:
             "keep_env: false",
             "",
             "# Namespace isolation",
-            f"clone_newnet: {'false' if network_enabled else 'true'}",
+            "clone_newnet: true",
             "clone_newuser: true",
             "clone_newns: true",
             "clone_newpid: true",
             "clone_newipc: true",
             "clone_newuts: true",
-            "",
-            "# UID/GID mapping - map container user to current user",
-            f'uidmap {{ inside_id: "1000" outside_id: "{os.getuid()}" count: 1 }}',
-            f'gidmap {{ inside_id: "1000" outside_id: "{os.getgid()}" count: 1 }}',
-            "",
-            "# Rootfs mounts - read-only base system",
-            f'mount {{ src: "{self.rootfs}/usr" dst: "/usr" is_bind: true rw: false }}',
-            f'mount {{ src: "{self.rootfs}/lib" dst: "/lib" is_bind: true rw: false }}',
-            f'mount {{ src: "{self.rootfs}/bin" dst: "/bin" is_bind: true rw: false }}',
-            f'mount {{ src: "{self.rootfs}/etc" dst: "/etc" is_bind: true rw: false }}',
         ]
+
+        if network_enabled:
+            lines.extend(pasta_user_net_config_lines())
+
+        lines.extend(
+            [
+                "",
+                "# UID/GID mapping - map container user to current user",
+                f'uidmap {{ inside_id: "1000" outside_id: "{os.getuid()}" count: 1 }}',
+                f'gidmap {{ inside_id: "1000" outside_id: "{os.getgid()}" count: 1 }}',
+                "",
+                "# Syscall filtering",
+                f'seccomp_string: "{build_untrusted_seccomp_policy()}"',
+                "",
+                "# Rootfs mounts - read-only base system",
+                f'mount {{ src: "{self.rootfs}/usr" dst: "/usr" is_bind: true rw: false }}',
+                f'mount {{ src: "{self.rootfs}/lib" dst: "/lib" is_bind: true rw: false }}',
+                f'mount {{ src: "{self.rootfs}/bin" dst: "/bin" is_bind: true rw: false }}',
+                f'mount {{ src: "{self.rootfs}/etc" dst: "/etc" is_bind: true rw: false }}',
+            ]
+        )
 
         # Optional mounts - only include if the directories exist in rootfs
         lib64_path = self.rootfs / "lib64"
@@ -208,13 +272,12 @@ class NsjailExecutor:
                 f'mount {{ src: "{sbin_path}" dst: "/sbin" is_bind: true rw: false }}'
             )
 
+        if network_enabled:
+            network_files = write_pasta_network_files(job_dir)
+            lines.extend(pasta_dns_mount_config_lines(network_files))
+
         lines.extend(
             [
-                "",
-                "# DNS/host resolution - mount container resolver config",
-                'mount { src: "/etc/resolv.conf" dst: "/etc/resolv.conf" is_bind: true rw: false }',
-                'mount { src: "/etc/hosts" dst: "/etc/hosts" is_bind: true rw: false }',
-                'mount { src: "/etc/nsswitch.conf" dst: "/etc/nsswitch.conf" is_bind: true rw: false }',
                 "",
                 "# /dev essentials",
                 'mount { src: "/dev/null" dst: "/dev/null" is_bind: true rw: true }',
@@ -224,14 +287,8 @@ class NsjailExecutor:
                 "",
                 "# Temporary filesystems",
                 'mount { dst: "/tmp" fstype: "tmpfs" rw: true options: "size=256M" }',
-                # Bind mount /proc from host (read-only) instead of creating new procfs.
-                # New procfs mount fails in Docker due to masked paths in /proc.
-                # SECURITY NOTE: This exposes host process info to the sandbox. Mitigation:
-                # - Mount is read-only
-                # - Scripts run as unprivileged UID 1000
-                # - PID namespace isolation limits visibility of sandbox processes
-                # - hidepid=2 cannot be used with bind mounts
-                'mount { src: "/proc" dst: "/proc" is_bind: true rw: false }',
+                "# Fresh procfs requires Docker systempaths=unconfined for nested nsjail.",
+                'mount { dst: "/proc" fstype: "proc" rw: false }',
             ]
         )
 
@@ -261,9 +318,25 @@ class NsjailExecutor:
                     lines.append(
                         f'mount {{ src: "{cache_path}" dst: "/packages" is_bind: true rw: false }}'
                     )
+            for i, python_path_dir in enumerate(config.python_path_dirs):
+                if not python_path_dir.exists():
+                    continue
+                lines.append(
+                    f'mount {{ src: "{python_path_dir}" dst: "/pythonpath/{i}" is_bind: true rw: false }}'
+                )
             lines.append(
                 f'mount {{ src: "{job_dir}" dst: "/work" is_bind: true rw: true }}'
             )
+            if config.action_gateway_socket is not None:
+                lines.extend(
+                    [
+                        "",
+                        "# Action Gateway socket for internal Tracecat SDK calls",
+                        f'mount {{ src: "{config.action_gateway_socket}" '
+                        f'dst: "{RUN_PYTHON_ACTION_GATEWAY_SOCKET}" '
+                        "is_bind: true rw: false }",
+                    ]
+                )
 
         # Resource limits
         lines.extend(
@@ -300,6 +373,7 @@ class NsjailExecutor:
     ) -> dict[str, str]:
         """Construct a sanitized environment for the nsjail process."""
         env_map: dict[str, str] = {**SANDBOX_BASE_ENV}
+        user_pythonpath = config.env_vars.get("PYTHONPATH")
 
         if phase == "install":
             env_map["UV_CACHE_DIR"] = "/uv-cache"
@@ -309,12 +383,23 @@ class NsjailExecutor:
                 env_map["UV_EXTRA_INDEX_URL"] = ",".join(
                     TRACECAT__SANDBOX_PYPI_EXTRA_INDEX_URLS
                 )
-        elif cache_key:
-            cache_path = self.package_cache / cache_key / "site-packages"
-            if cache_path.exists():
-                env_map["PYTHONPATH"] = "/packages"
+        else:
+            pythonpath_parts = []
+            if cache_key:
+                cache_path = self.package_cache / cache_key / "site-packages"
+                if cache_path.exists():
+                    pythonpath_parts.append("/packages")
+            for i, python_path_dir in enumerate(config.python_path_dirs):
+                if python_path_dir.exists():
+                    pythonpath_parts.append(f"/pythonpath/{i}")
+            if user_pythonpath:
+                pythonpath_parts.append(user_pythonpath)
+            if pythonpath_parts:
+                env_map["PYTHONPATH"] = ":".join(pythonpath_parts)
 
         for key, value in config.env_vars.items():
+            if key == "PYTHONPATH":
+                continue
             _validate_env_key(key)
             env_map[key] = value
 
@@ -426,6 +511,10 @@ class NsjailExecutor:
         # No result.json - this is an infrastructure error
         if process.returncode != 0:
             # Don't expose nsjail internals to users
+            hint = _nsjail_failure_hint(stderr)
+            error_msg = "Sandbox execution failed"
+            if hint:
+                error_msg = f"{error_msg}. {hint}"
             logger.error(
                 "Sandbox execution failed",
                 returncode=process.returncode,
@@ -433,7 +522,7 @@ class NsjailExecutor:
             )
             return SandboxResult(
                 success=False,
-                error="Sandbox execution failed",
+                error=error_msg,
                 stdout=stdout,
                 stderr=stderr[:500],  # Truncate for debugging
                 exit_code=process.returncode,
@@ -543,6 +632,9 @@ class NsjailExecutor:
         success = process.returncode == 0
 
         if not success:
+            hint = _nsjail_failure_hint(stderr)
+            if hint:
+                stderr = f"{stderr.rstrip()}\n\nnsjail hint: {hint}\n"
             logger.error(
                 "Package installation failed",
                 returncode=process.returncode,
@@ -583,16 +675,21 @@ class NsjailExecutor:
         _validate_path(config.tracecat_app_dir, "tracecat_app_dir")
         if config.site_packages_dir:
             _validate_path(config.site_packages_dir, "site_packages_dir")
+        if config.action_gateway_socket is not None:
+            _validate_path(config.action_gateway_socket, "action_gateway_socket")
+            _validate_path(
+                config.action_gateway_socket_mount_path,
+                "action_gateway_socket_mount_path",
+            )
 
-        # Network always enabled for action execution (DB, S3, external APIs)
         lines = [
             'name: "action_sandbox"',
             "mode: ONCE",
             'hostname: "sandbox"',
             "keep_env: false",
             "",
-            "# Namespace isolation - network enabled for DB/S3/external APIs",
-            "clone_newnet: false",
+            "# Namespace isolation",
+            "clone_newnet: true",
             "clone_newuser: true",
             "clone_newns: true",
             "clone_newpid: true",
@@ -603,12 +700,17 @@ class NsjailExecutor:
             f'uidmap {{ inside_id: "1000" outside_id: "{os.getuid()}" count: 1 }}',
             f'gidmap {{ inside_id: "1000" outside_id: "{os.getgid()}" count: 1 }}',
             "",
+            "# Syscall filtering",
+            f'seccomp_string: "{build_untrusted_seccomp_policy()}"',
+            "",
             "# Rootfs mounts - read-only base system",
             f'mount {{ src: "{self.rootfs}/usr" dst: "/usr" is_bind: true rw: false }}',
             f'mount {{ src: "{self.rootfs}/lib" dst: "/lib" is_bind: true rw: false }}',
             f'mount {{ src: "{self.rootfs}/bin" dst: "/bin" is_bind: true rw: false }}',
             f'mount {{ src: "{self.rootfs}/etc" dst: "/etc" is_bind: true rw: false }}',
         ]
+
+        lines.extend(pasta_user_net_config_lines())
 
         # Optional mounts - only include if the directories exist in rootfs
         lib64_path = self.rootfs / "lib64"
@@ -623,13 +725,11 @@ class NsjailExecutor:
                 f'mount {{ src: "{sbin_path}" dst: "/sbin" is_bind: true rw: false }}'
             )
 
+        network_files = write_pasta_network_files(job_dir)
+        lines.extend(pasta_dns_mount_config_lines(network_files))
+
         lines.extend(
             [
-                "",
-                "# DNS/host resolution - mount container resolver config",
-                'mount { src: "/etc/resolv.conf" dst: "/etc/resolv.conf" is_bind: true rw: false }',
-                'mount { src: "/etc/hosts" dst: "/etc/hosts" is_bind: true rw: false }',
-                'mount { src: "/etc/nsswitch.conf" dst: "/etc/nsswitch.conf" is_bind: true rw: false }',
                 "",
                 "# /dev essentials",
                 'mount { src: "/dev/null" dst: "/dev/null" is_bind: true rw: true }',
@@ -639,7 +739,8 @@ class NsjailExecutor:
                 "",
                 "# Temporary filesystems",
                 'mount { dst: "/tmp" fstype: "tmpfs" rw: true options: "size=256M" }',
-                'mount { src: "/proc" dst: "/proc" is_bind: true rw: false }',
+                "# Fresh procfs requires Docker systempaths=unconfined for nested nsjail.",
+                'mount { dst: "/proc" fstype: "proc" rw: false }',
                 "",
                 "# Action execution mounts",
                 f'mount {{ src: "{job_dir}" dst: "/work" is_bind: true rw: true }}',
@@ -652,6 +753,15 @@ class NsjailExecutor:
                 lines.append(
                     f'mount {{ src: "{registry_path}" dst: "/packages/{i}" is_bind: true rw: false }}'
                 )
+
+        if config.action_gateway_socket is not None:
+            lines.extend(
+                [
+                    "",
+                    "# Action Gateway socket for SDK calls",
+                    f'mount {{ src: "{config.action_gateway_socket}" dst: "{config.action_gateway_socket_mount_path}" is_bind: true rw: false }}',
+                ]
+            )
 
         # NOTE: /app and /site-packages are NOT mounted in untrusted mode
         # Untrusted mode uses minimal_runner.py copied to /work, no tracecat imports
@@ -819,6 +929,10 @@ class NsjailExecutor:
 
         # No result.json - infrastructure error
         if process.returncode != 0:
+            hint = _nsjail_failure_hint(stderr)
+            error_msg = "Action sandbox execution failed"
+            if hint:
+                error_msg = f"{error_msg}. {hint}"
             logger.error(
                 "Action sandbox execution failed",
                 returncode=process.returncode,
@@ -826,7 +940,7 @@ class NsjailExecutor:
             )
             return SandboxResult(
                 success=False,
-                error="Action sandbox execution failed",
+                error=error_msg,
                 stdout=stdout,
                 stderr=stderr[:2000],
                 exit_code=process.returncode,

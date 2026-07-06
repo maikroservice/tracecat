@@ -1,13 +1,21 @@
+"""Feature flag identifiers used for controlled engineering rollouts.
+
+Boundary note:
+- ``workflow-concurrency-limits`` gates tier and organization concurrency
+  enforcement only (workflow permits, action permits, and per-workflow action
+  execution budget).
+- Engine backpressure controls are independent and always on:
+  ``TRACECAT__CHILD_WORKFLOW_DISPATCH_WINDOW`` and
+  ``TRACECAT__DSL_SCHEDULER_MAX_PENDING_TASKS``.
+"""
+
 from enum import StrEnum
 
 
 class FeatureFlag(StrEnum):
-    """Feature flag enum."""
+    """Feature flag enum reserved for engineering rollouts."""
 
-    GIT_SYNC = "git-sync"
-    AGENT_APPROVALS = "agent-approvals"
-    AGENT_PRESETS = "agent-presets"
-    CASE_DURATIONS = "case-durations"
-    CASE_TASKS = "case-tasks"
-    REGISTRY_CLIENT = "registry-client"
-    REGISTRY_SYNC_V2 = "registry-sync-v2"
+    AI_RANKING = "ai-ranking"
+    WORKFLOW_CONCURRENCY_LIMITS = "workflow-concurrency-limits"
+    AGENT_CHANNELS = "agent-channels"
+    AGENT_FS_PERSISTENCE = "agent-fs-persistence"

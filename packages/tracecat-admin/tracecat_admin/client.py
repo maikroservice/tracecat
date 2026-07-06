@@ -63,7 +63,6 @@ class AdminClient:
                 headers={
                     "x-tracecat-service-key": self._config.service_key,
                     "x-tracecat-role-service-id": "tracecat-admin-cli",
-                    "x-tracecat-role-access-level": "ADMIN",
                     "Content-Type": "application/json",
                 },
                 timeout=30.0,
@@ -170,9 +169,13 @@ class AdminClient:
         )
         return OrgRead.model_validate(response.json())
 
-    async def delete_organization(self, org_id: str) -> None:
+    async def delete_organization(self, org_id: str, *, confirmation: str) -> None:
         """Delete an organization."""
-        await self._request("DELETE", f"/admin/organizations/{org_id}")
+        await self._request(
+            "DELETE",
+            f"/admin/organizations/{org_id}",
+            params={"confirm": confirmation},
+        )
 
     # Registry endpoints
     async def sync_registry(

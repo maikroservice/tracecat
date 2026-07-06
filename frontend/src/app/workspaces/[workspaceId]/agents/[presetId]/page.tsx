@@ -1,35 +1,35 @@
 "use client"
 
-import { useParams } from "next/navigation"
+import { useParams, useSearchParams } from "next/navigation"
 import { useEffect } from "react"
 import { AgentPresetsBuilder } from "@/components/agents/agent-presets-builder"
-import { FeatureFlagEmptyState } from "@/components/feature-flag-empty-state"
+import { EntitlementRequiredEmptyState } from "@/components/entitlement-required-empty-state"
 import { CenteredSpinner } from "@/components/loading/spinner"
-import { useFeatureFlag } from "@/hooks/use-feature-flags"
+import { useEntitlements } from "@/hooks/use-entitlements"
 
 export default function AgentPresetsPage() {
   const params = useParams<{
     presetId: string
   }>()
+  const searchParams = useSearchParams()
   const presetId = params?.presetId
-  const { isFeatureEnabled, isLoading: featureFlagsLoading } = useFeatureFlag()
-  const agentApprovalsEnabled = isFeatureEnabled("agent-approvals")
-  const agentPresetsEnabled = isFeatureEnabled("agent-presets")
-  const agentsFeatureEnabled = agentApprovalsEnabled && agentPresetsEnabled
+  const builderPrompt = searchParams.get("builderPrompt") ?? undefined
+  const { hasEntitlement, isLoading: entitlementsLoading } = useEntitlements()
+  const agentAddonsEnabled = hasEntitlement("agent_addons")
 
   useEffect(() => {
     document.title = "Agent Presets"
   }, [])
 
-  if (featureFlagsLoading) {
+  if (entitlementsLoading) {
     return <CenteredSpinner />
   }
 
-  if (!agentsFeatureEnabled) {
+  if (!agentAddonsEnabled) {
     return (
       <div className="size-full overflow-auto">
         <div className="mx-auto flex w-full h-full max-w-3xl flex-1 items-center justify-center py-12">
-          <FeatureFlagEmptyState
+          <EntitlementRequiredEmptyState
             title="Enterprise only"
             description="Advanced AI agents (human-in-the-loop and subagents) are only available on enterprise plans."
           />
@@ -40,7 +40,7 @@ export default function AgentPresetsPage() {
 
   return (
     <div className="h-full">
-      <AgentPresetsBuilder presetId={presetId} />
+      <AgentPresetsBuilder presetId={presetId} builderPrompt={builderPrompt} />
     </div>
   )
 }

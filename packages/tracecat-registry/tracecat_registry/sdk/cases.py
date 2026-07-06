@@ -18,7 +18,6 @@ from tracecat_registry.sdk.types import (
 
 if TYPE_CHECKING:
     from tracecat_registry.sdk.client import TracecatClient
-    from tracecat_ee.cases.types import CaseDurationMetric
 
 
 class CasesClient:
@@ -26,6 +25,22 @@ class CasesClient:
 
     def __init__(self, client: TracecatClient) -> None:
         self._client = client
+
+    @staticmethod
+    def _serialize_dropdown_values(
+        dropdown_values: list[types.CaseDropdownValueInput] | None,
+    ) -> list[dict[str, Any]] | None:
+        """Serialize dropdown UUID values to strings for JSON transport."""
+        if dropdown_values is None:
+            return None
+
+        serialized: list[dict[str, Any]] = []
+        for dropdown_value in dropdown_values:
+            item: dict[str, Any] = {}
+            for key, value in dropdown_value.items():
+                item[key] = str(value) if isinstance(value, UUID) else value
+            serialized.append(item)
+        return serialized
 
     # === Case CRUD === #
 
@@ -41,6 +56,7 @@ class CasesClient:
         payload: dict[str, Any] | None | Unset = UNSET,
         tags: list[str] | None | Unset = UNSET,
         fields: dict[str, Any] | None | Unset = UNSET,
+        dropdown_values: list[types.CaseDropdownValueInput] | None | Unset = UNSET,
     ) -> types.CaseRead:
         """Create a new case.
 
@@ -54,6 +70,7 @@ class CasesClient:
             payload: Additional JSON payload.
             tags: List of tag names or IDs to attach.
             fields: Custom field values.
+            dropdown_values: Dropdown selections to set on the case.
 
         Returns:
             Created case data.
@@ -73,10 +90,16 @@ class CasesClient:
             data["tags"] = tags
         if is_set(fields):
             data["fields"] = fields
+        if is_set(dropdown_values):
+            # Write payloads use `dropdown_values` because they represent persisted
+            # per-case selections (definition/option IDs).
+            data["dropdown_values"] = self._serialize_dropdown_values(dropdown_values)
 
         return await self._client.post("/cases", json=data)
 
-    async def get_case(self, case_id: str) -> types.CaseRead:
+    async def get_case(
+        self, case_id: str, *, include_rows: bool | Unset = UNSET
+    ) -> types.CaseRead:
         """Get a case by ID.
 
         Args:
@@ -85,7 +108,10 @@ class CasesClient:
         Returns:
             Case data.
         """
-        return await self._client.get(f"/cases/{case_id}")
+        params: dict[str, Any] = {}
+        if is_set(include_rows):
+            params["include_rows"] = include_rows
+        return await self._client.get(f"/cases/{case_id}", params=params)
 
     async def update_case(
         self,
@@ -100,6 +126,7 @@ class CasesClient:
         payload: dict[str, Any] | None | Unset = UNSET,
         fields: dict[str, Any] | None | Unset = UNSET,
         tags: list[str] | None | Unset = UNSET,
+        dropdown_values: list[types.CaseDropdownValueInput] | None | Unset = UNSET,
     ) -> types.CaseRead:
         """Update a case.
 
@@ -114,6 +141,7 @@ class CasesClient:
             payload: New payload (merged with existing). Pass None to clear.
             fields: Custom field values to update.
             tags: List of tag IDs or refs to set (replaces existing).
+            dropdown_values: Dropdown selections to set or clear.
 
         Returns:
             Updated case data.
@@ -137,6 +165,10 @@ class CasesClient:
             data["fields"] = fields
         if is_set(tags):
             data["tags"] = tags
+        if is_set(dropdown_values):
+            # Keep write/update naming aligned with API body schemas:
+            # `CaseCreate.dropdown_values` and `CaseUpdate.dropdown_values`.
+            data["dropdown_values"] = self._serialize_dropdown_values(dropdown_values)
 
         return await self._client.patch(f"/cases/{case_id}", json=data)
 
@@ -153,35 +185,68 @@ class CasesClient:
         *,
         limit: int = 20,
         cursor: str | Unset = UNSET,
+        reverse: bool | Unset = UNSET,
+        order_by: str | Unset = UNSET,
+        sort: Literal["asc", "desc"] | Unset = UNSET,
+        include_rows: bool | Unset = UNSET,
+        include_payload: bool | Unset = UNSET,
+    ) -> types.CaseListResponse:
+        """List cases using default server-side filtering.
+
+        Args:
+            limit: Maximum items per page.
+            cursor: Pagination cursor.
+            reverse: Reverse pagination direction.
+            order_by: Column to order by.
+            sort: Sort direction.
+
+        Returns:
+            Paginated list of cases with cursor metadata.
+        """
+        params: dict[str, Any] = {"limit": limit}
+        if is_set(cursor):
+            params["cursor"] = cursor
+        if is_set(reverse):
+            params["reverse"] = reverse
+        if is_set(order_by):
+            params["order_by"] = order_by
+        if is_set(sort):
+            params["sort"] = sort
+        if is_set(include_rows):
+            params["include_rows"] = include_rows
+        if is_set(include_payload):
+            params["include_payload"] = include_payload
+
+        return await self._client.get("/cases", params=params)
+
+    async def search_cases(
+        self,
+        *,
+        limit: int = 20,
+        cursor: str | Unset = UNSET,
+        reverse: bool | Unset = UNSET,
         search_term: str | Unset = UNSET,
         status: list[CaseStatus] | Unset = UNSET,
         priority: list[CasePriority] | Unset = UNSET,
         severity: list[CaseSeverity] | Unset = UNSET,
         assignee_id: list[str] | Unset = UNSET,
         tags: list[str] | Unset = UNSET,
+        dropdown: list[str] | Unset = UNSET,
         order_by: str | Unset = UNSET,
         sort: Literal["asc", "desc"] | Unset = UNSET,
+        start_time: datetime | str | Unset = UNSET,
+        end_time: datetime | str | Unset = UNSET,
+        updated_after: datetime | str | Unset = UNSET,
+        updated_before: datetime | str | Unset = UNSET,
+        include_rows: bool | Unset = UNSET,
+        include_payload: bool | Unset = UNSET,
     ) -> types.CaseListResponse:
-        """List cases with filtering and pagination.
-
-        Args:
-            limit: Maximum items per page.
-            cursor: Pagination cursor.
-            search_term: Text to search in summary/description.
-            status: Filter by status(es).
-            priority: Filter by priority(ies).
-            severity: Filter by severity(ies).
-            assignee_id: Filter by assignee ID(s).
-            tags: Filter by tag names/IDs.
-            order_by: Column to order by.
-            sort: Sort direction.
-
-        Returns:
-            Paginated list of cases with cursor.
-        """
+        """Search cases with filtering and pagination."""
         params: dict[str, Any] = {"limit": limit}
         if is_set(cursor):
             params["cursor"] = cursor
+        if is_set(reverse):
+            params["reverse"] = reverse
         if is_set(search_term):
             params["search_term"] = search_term
         if is_set(status):
@@ -194,61 +259,10 @@ class CasesClient:
             params["assignee_id"] = assignee_id
         if is_set(tags):
             params["tags"] = tags
-        if is_set(order_by):
-            params["order_by"] = order_by
-        if is_set(sort):
-            params["sort"] = sort
-
-        return await self._client.get("/cases", params=params)
-
-    async def search_cases(
-        self,
-        *,
-        search_term: str | Unset = UNSET,
-        status: CaseStatus | Unset = UNSET,
-        priority: CasePriority | Unset = UNSET,
-        severity: CaseSeverity | Unset = UNSET,
-        tags: list[str] | Unset = UNSET,
-        limit: int | Unset = UNSET,
-        order_by: str | Unset = UNSET,
-        sort: Literal["asc", "desc"] | Unset = UNSET,
-        start_time: datetime | str | Unset = UNSET,
-        end_time: datetime | str | Unset = UNSET,
-        updated_after: datetime | str | Unset = UNSET,
-        updated_before: datetime | str | Unset = UNSET,
-    ) -> list[types.CaseReadMinimal]:
-        """Search cases with filtering.
-
-        Args:
-            search_term: Text to search.
-            status: Filter by status.
-            priority: Filter by priority.
-            severity: Filter by severity.
-            tags: Filter by tag names/IDs.
-            limit: Maximum results.
-            order_by: Column to order by.
-            sort: Sort direction.
-            start_time: Cases created after (ISO format or datetime).
-            end_time: Cases created before (ISO format or datetime).
-            updated_after: Cases updated after (ISO format or datetime).
-            updated_before: Cases updated before (ISO format or datetime).
-
-        Returns:
-            List of matching cases.
-        """
-        params: dict[str, Any] = {}
-        if is_set(search_term):
-            params["search_term"] = search_term
-        if is_set(status):
-            params["status"] = status
-        if is_set(priority):
-            params["priority"] = priority
-        if is_set(severity):
-            params["severity"] = severity
-        if is_set(tags):
-            params["tags"] = tags
-        if is_set(limit):
-            params["limit"] = limit
+        if is_set(dropdown):
+            # Search uses query param `dropdown` (not `dropdown_values`) because this
+            # is a filter expression list like "definition_ref:option_ref".
+            params["dropdown"] = dropdown
         if is_set(order_by):
             params["order_by"] = order_by
         if is_set(sort):
@@ -275,6 +289,10 @@ class CasesClient:
                 if isinstance(updated_before, datetime)
                 else updated_before
             )
+        if is_set(include_rows):
+            params["include_rows"] = include_rows
+        if is_set(include_payload):
+            params["include_payload"] = include_payload
 
         return await self._client.get("/cases/search", params=params)
 
@@ -290,6 +308,12 @@ class CasesClient:
             List of comments.
         """
         return await self._client.get(f"/cases/{case_id}/comments")
+
+    async def list_comment_threads(
+        self, case_id: str
+    ) -> list[types.CaseCommentThreadRead]:
+        """List threaded comments on a case."""
+        return await self._client.get(f"/cases/{case_id}/comments/threads")
 
     async def create_comment(
         self,
@@ -318,6 +342,20 @@ class CasesClient:
             json=data,
         )
 
+    async def reply_to_comment(
+        self,
+        case_id: str,
+        *,
+        parent_comment_id: str,
+        content: str,
+    ) -> types.CaseComment:
+        """Reply to a top-level case comment using the UDF-compatible endpoint."""
+        return await self.create_comment_simple(
+            case_id,
+            content=content,
+            parent_id=parent_comment_id,
+        )
+
     async def update_comment(
         self,
         case_id: str,
@@ -344,28 +382,25 @@ class CasesClient:
         self,
         comment_id: str,
         *,
-        content: str | Unset = UNSET,
-        parent_id: str | Unset = UNSET,
+        content: str,
     ) -> types.CaseCommentRead:
         """Update a comment by ID without requiring case_id.
 
         Args:
             comment_id: The comment UUID.
             content: New content.
-            parent_id: New parent comment ID.
 
         Returns:
             Updated comment data.
         """
-        data: dict[str, Any] = {}
-        if is_set(content):
-            data["content"] = content
-        if is_set(parent_id):
-            data["parent_id"] = parent_id
         return await self._client.patch(
             f"/comments/{comment_id}",
-            json=data,
+            json={"content": content},
         )
+
+    async def get_comment_thread(self, comment_id: str) -> types.CaseCommentThreadRead:
+        """Get the thread containing a given comment."""
+        return await self._client.get(f"/comments/{comment_id}/thread")
 
     async def delete_comment(self, case_id: str, comment_id: str) -> None:
         """Delete a comment.
@@ -602,6 +637,8 @@ class CasesClient:
         payload: dict[str, Any] | None | Unset = UNSET,
         tags: list[str] | None | Unset = UNSET,
         fields: dict[str, Any] | None | Unset = UNSET,
+        dropdown_values: list[types.CaseDropdownValueInput] | None | Unset = UNSET,
+        create_missing_tags: bool = False,
     ) -> types.Case:
         """Create a new case and return simple dict format.
 
@@ -617,6 +654,7 @@ class CasesClient:
             payload: Additional JSON payload.
             tags: List of tag names or IDs to attach.
             fields: Custom field values.
+            dropdown_values: Dropdown selections to set on the case.
 
         Returns:
             Created case data (CaseDict format).
@@ -636,6 +674,12 @@ class CasesClient:
             data["tags"] = tags
         if is_set(fields):
             data["fields"] = fields
+        if is_set(dropdown_values):
+            # Write payloads use `dropdown_values` because they represent persisted
+            # per-case selections (definition/option IDs).
+            data["dropdown_values"] = self._serialize_dropdown_values(dropdown_values)
+        if create_missing_tags:
+            data["create_missing_tags"] = create_missing_tags
 
         return await self._client.post("/cases/simple", json=data)
 
@@ -652,7 +696,9 @@ class CasesClient:
         payload: dict[str, Any] | None | Unset = UNSET,
         fields: dict[str, Any] | None | Unset = UNSET,
         tags: list[str] | None | Unset = UNSET,
+        dropdown_values: list[types.CaseDropdownValueInput] | None | Unset = UNSET,
         append_description: bool = False,
+        create_missing_tags: bool = False,
     ) -> types.Case:
         """Update a case and return simple dict format.
 
@@ -669,6 +715,7 @@ class CasesClient:
             payload: New payload (merged with existing). Pass None to clear.
             fields: Custom field values to update.
             tags: List of tag IDs or refs to set (replaces existing).
+            dropdown_values: Dropdown selections to set or clear.
             append_description: If True, append description to existing.
 
         Returns:
@@ -693,8 +740,14 @@ class CasesClient:
             data["fields"] = fields
         if is_set(tags):
             data["tags"] = tags
+        if is_set(dropdown_values):
+            # Keep write/update naming aligned with API body schemas:
+            # `CaseCreate.dropdown_values` and `CaseUpdate.dropdown_values`.
+            data["dropdown_values"] = self._serialize_dropdown_values(dropdown_values)
         if append_description:
             data["append_description"] = append_description
+        if create_missing_tags:
+            data["create_missing_tags"] = create_missing_tags
 
         return await self._client.patch(f"/cases/{case_id}/simple", json=data)
 
@@ -704,6 +757,7 @@ class CasesClient:
         *,
         content: str,
         parent_id: str | Unset = UNSET,
+        workflow_id: str | Unset = UNSET,
     ) -> types.CaseComment:
         """Create a comment on a case and return simple dict format.
 
@@ -713,6 +767,7 @@ class CasesClient:
             case_id: The case UUID.
             content: Comment content.
             parent_id: Parent comment ID for replies.
+            workflow_id: Selected workflow ID for workflow-backed comments.
 
         Returns:
             Created comment data (CaseCommentDict format).
@@ -720,6 +775,8 @@ class CasesClient:
         data: dict[str, Any] = {"content": content}
         if is_set(parent_id):
             data["parent_id"] = parent_id
+        if is_set(workflow_id):
+            data["workflow_id"] = workflow_id
         return await self._client.post(
             f"/cases/{case_id}/comments/simple",
             json=data,
@@ -729,8 +786,7 @@ class CasesClient:
         self,
         comment_id: str,
         *,
-        content: str | Unset = UNSET,
-        parent_id: str | Unset = UNSET,
+        content: str,
     ) -> types.CaseComment:
         """Update a comment and return simple dict format.
 
@@ -739,19 +795,13 @@ class CasesClient:
         Args:
             comment_id: The comment UUID.
             content: New content.
-            parent_id: New parent comment ID.
 
         Returns:
             Updated comment data (CaseCommentDict format).
         """
-        data: dict[str, Any] = {}
-        if is_set(content):
-            data["content"] = content
-        if is_set(parent_id):
-            data["parent_id"] = parent_id
         return await self._client.patch(
             f"/comments/{comment_id}/simple",
-            json=data,
+            json={"content": content},
         )
 
     async def assign_user_simple(
@@ -822,7 +872,7 @@ class CasesClient:
     async def get_case_metrics(
         self,
         case_ids: list[str],
-    ) -> list["CaseDurationMetric"]:
+    ) -> list[types.CaseDurationMetric]:
         """Get case metrics as time-series for the provided case IDs.
 
         Args:
@@ -955,3 +1005,39 @@ class CasesClient:
             task_id: The task UUID.
         """
         await self._client.delete(f"/cases/tasks/{task_id}")
+
+    async def list_case_rows(
+        self,
+        case_id: str,
+        *,
+        limit: int = 20,
+        cursor: str | Unset = UNSET,
+        reverse: bool | Unset = UNSET,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": limit}
+        if is_set(cursor):
+            params["cursor"] = cursor
+        if is_set(reverse):
+            params["reverse"] = reverse
+        return await self._client.get(f"/cases/{case_id}/rows", params=params)
+
+    async def link_case_row(
+        self, case_id: str, *, table_id: str, row_id: str
+    ) -> types.CaseTableRowRead:
+        return await self._client.post(
+            f"/cases/{case_id}/rows",
+            json={"table_id": table_id, "row_id": row_id},
+        )
+
+    async def unlink_case_row(
+        self, case_id: str, *, table_id: str, row_id: str
+    ) -> None:
+        await self._client.delete(f"/cases/{case_id}/rows/{table_id}/{row_id}")
+
+    async def insert_case_row(
+        self, case_id: str, *, table_id: str, row: dict[str, Any]
+    ) -> types.CaseTableRowRead:
+        return await self._client.post(
+            f"/cases/{case_id}/rows/insert",
+            json={"table_id": table_id, "row": {"data": row}},
+        )

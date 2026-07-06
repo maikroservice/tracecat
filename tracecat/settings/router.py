@@ -1,14 +1,15 @@
-from typing import Annotated
-
 from fastapi import APIRouter, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from tracecat.auth.credentials import RoleACL
-from tracecat.auth.dependencies import Role
+from tracecat import config
+from tracecat.auth.dependencies import OrgUserRole
 from tracecat.auth.enums import AuthType
-from tracecat.auth.types import AccessLevel
+from tracecat.authz.controls import require_scope
 from tracecat.config import SAML_PUBLIC_ACS_URL
 from tracecat.db.dependencies import AsyncDBSession
-from tracecat.settings.constants import AUTH_TYPE_TO_SETTING_KEY
+from tracecat.db.models import OrganizationDomain
+from tracecat.identifiers import OrganizationID
 from tracecat.settings.schemas import (
     AgentSettingsRead,
     AgentSettingsUpdate,
@@ -16,37 +17,16 @@ from tracecat.settings.schemas import (
     AppSettingsUpdate,
     AuditSettingsRead,
     AuditSettingsUpdate,
-    AuthSettingsRead,
-    AuthSettingsUpdate,
     GitSettingsRead,
     GitSettingsUpdate,
-    OAuthSettingsRead,
-    OAuthSettingsUpdate,
     SAMLSettingsRead,
     SAMLSettingsUpdate,
 )
 from tracecat.settings.service import SettingsService
+from tracecat.tiers.entitlements import check_entitlement
+from tracecat.tiers.enums import Entitlement
 
 router = APIRouter(prefix="/settings", tags=["settings"])
-
-OrgAdminUserRole = Annotated[
-    Role,
-    RoleACL(
-        allow_user=True,
-        allow_service=False,
-        require_workspace="no",
-        min_access_level=AccessLevel.ADMIN,
-    ),
-]
-
-OrgUserRole = Annotated[
-    Role,
-    RoleACL(
-        allow_user=True,
-        allow_service=False,
-        require_workspace="no",
-    ),
-]
 
 # NOTE: We expose settings groups
 # We don't need create or delete endpoints as we only need to read/update settings.
@@ -54,130 +34,146 @@ OrgUserRole = Annotated[
 
 
 async def check_other_auth_enabled(
-    service: SettingsService, auth_type: AuthType
+    _service: SettingsService, auth_type: AuthType
 ) -> None:
     """Check if at least one other auth type is enabled."""
-
-    all_keys = set(AUTH_TYPE_TO_SETTING_KEY.values())
-    all_keys.remove(AUTH_TYPE_TO_SETTING_KEY[auth_type])
-    for key in all_keys:
-        setting = await service.get_org_setting(key)
-        if setting and service.get_value(setting) is True:
-            return
+    if auth_type is not AuthType.SAML:
+        return
+    if any(
+        candidate_auth_type in config.TRACECAT__AUTH_TYPES
+        for candidate_auth_type in (
+            AuthType.BASIC,
+            AuthType.OIDC,
+        )
+    ):
+        return
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail="At least one other auth type must be enabled",
     )
 
 
+async def _organization_has_active_domain(
+    *, session: AsyncSession, organization_id: OrganizationID
+) -> bool:
+    stmt = (
+        select(OrganizationDomain.id)
+        .where(
+            OrganizationDomain.organization_id == organization_id,
+            OrganizationDomain.is_active.is_(True),
+        )
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none() is not None
+
+
+async def check_saml_domain_prerequisites(
+    *, session: AsyncSession, role: OrgUserRole, params: SAMLSettingsUpdate
+) -> None:
+    """Enforce domain guardrails for multi-tenant SAML enablement.
+
+    In multi-tenant mode, enabling SAML must require at least one active
+    organization domain. This prevents org enrollment on arbitrary email domains
+    when SAML assertions are accepted.
+    """
+    if not config.TRACECAT__EE_MULTI_TENANT:
+        return
+
+    fields_set = params.model_fields_set
+    enabling_saml = "saml_enabled" in fields_set and params.saml_enabled
+    if not enabling_saml:
+        return
+
+    organization_id = role.organization_id
+    if organization_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No organization context",
+        )
+
+    if await _organization_has_active_domain(
+        session=session, organization_id=organization_id
+    ):
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=(
+            "At least one active organization domain is required before enabling "
+            "SAML in multi-tenant mode"
+        ),
+    )
+
+
 @router.get("/git", response_model=GitSettingsRead)
+@require_scope("org:settings:read")
 async def get_git_settings(
     *,
-    role: OrgAdminUserRole,
+    role: OrgUserRole,
     session: AsyncDBSession,
 ) -> GitSettingsRead:
+    await check_entitlement(session, role, Entitlement.CUSTOM_REGISTRY)
     service = SettingsService(session, role)
     keys = GitSettingsRead.keys()
     settings = await service.list_org_settings(keys=keys)
-    settings_dict = {setting.key: service.get_value(setting) for setting in settings}
+    settings_dict, _ = service.get_values_with_decryption_fallback(settings)
     return GitSettingsRead(**settings_dict)
 
 
 @router.patch("/git", status_code=status.HTTP_204_NO_CONTENT)
+@require_scope("org:settings:update")
 async def update_git_settings(
     *,
-    role: OrgAdminUserRole,
+    role: OrgUserRole,
     session: AsyncDBSession,
     params: GitSettingsUpdate,
 ) -> None:
+    await check_entitlement(session, role, Entitlement.CUSTOM_REGISTRY)
     service = SettingsService(session, role)
     await service.update_git_settings(params)
 
 
 @router.get("/saml", response_model=SAMLSettingsRead)
+@require_scope("org:settings:read")
 async def get_saml_settings(
     *,
-    role: OrgAdminUserRole,
+    role: OrgUserRole,
     session: AsyncDBSession,
 ) -> SAMLSettingsRead:
     service = SettingsService(session, role)
 
     # Exclude read-only keys
-    keys = SAMLSettingsRead.keys(exclude={"saml_sp_acs_url"})
+    keys = SAMLSettingsRead.keys(exclude={"saml_sp_acs_url", "decryption_failed_keys"})
     settings = await service.list_org_settings(keys=keys)
-    settings_dict = {setting.key: service.get_value(setting) for setting in settings}
+    settings_dict, decryption_failed_keys = service.get_values_with_decryption_fallback(
+        settings
+    )
 
     # Public ACS url
-    return SAMLSettingsRead(**settings_dict, saml_sp_acs_url=SAML_PUBLIC_ACS_URL)
+    return SAMLSettingsRead(
+        **settings_dict,
+        saml_sp_acs_url=SAML_PUBLIC_ACS_URL,
+        decryption_failed_keys=decryption_failed_keys,
+    )
 
 
 @router.patch("/saml", status_code=status.HTTP_204_NO_CONTENT)
+@require_scope("org:settings:update")
 async def update_saml_settings(
     *,
-    role: OrgAdminUserRole,
+    role: OrgUserRole,
     session: AsyncDBSession,
     params: SAMLSettingsUpdate,
 ) -> None:
     service = SettingsService(session, role)
+    await check_saml_domain_prerequisites(session=session, role=role, params=params)
     if not params.saml_enabled:
         await check_other_auth_enabled(service, AuthType.SAML)
     await service.update_saml_settings(params)
 
 
-@router.get("/auth", response_model=AuthSettingsRead)
-async def get_auth_settings(
-    *,
-    role: OrgAdminUserRole,
-    session: AsyncDBSession,
-) -> AuthSettingsRead:
-    service = SettingsService(session, role)
-    keys = AuthSettingsRead.keys()
-    settings = await service.list_org_settings(keys=keys)
-    settings_dict = {setting.key: service.get_value(setting) for setting in settings}
-    return AuthSettingsRead(**settings_dict)
-
-
-@router.patch("/auth", status_code=status.HTTP_204_NO_CONTENT)
-async def update_auth_settings(
-    *,
-    role: OrgAdminUserRole,
-    session: AsyncDBSession,
-    params: AuthSettingsUpdate,
-) -> None:
-    service = SettingsService(session, role)
-    if not params.auth_basic_enabled:
-        await check_other_auth_enabled(service, AuthType.BASIC)
-    await service.update_auth_settings(params)
-
-
-@router.get("/oauth", response_model=OAuthSettingsRead)
-async def get_oauth_settings(
-    *,
-    role: OrgAdminUserRole,
-    session: AsyncDBSession,
-) -> OAuthSettingsRead:
-    service = SettingsService(session, role)
-    keys = OAuthSettingsRead.keys()
-    settings = await service.list_org_settings(keys=keys)
-    settings_dict = {setting.key: service.get_value(setting) for setting in settings}
-    return OAuthSettingsRead(**settings_dict)
-
-
-@router.patch("/oauth", status_code=status.HTTP_204_NO_CONTENT)
-async def update_oauth_settings(
-    *,
-    role: OrgAdminUserRole,
-    session: AsyncDBSession,
-    params: OAuthSettingsUpdate,
-) -> None:
-    service = SettingsService(session, role)
-    # If we're trying to disable OAuth, we must have at least one other auth type enabled
-    if not params.oauth_google_enabled:
-        await check_other_auth_enabled(service, AuthType.GOOGLE_OAUTH)
-    await service.update_oauth_settings(params)
-
-
 @router.get("/app", response_model=AppSettingsRead)
+@require_scope("org:settings:read")
 async def get_app_settings(
     *,
     role: OrgUserRole,
@@ -186,14 +182,15 @@ async def get_app_settings(
     service = SettingsService(session, role)
     keys = AppSettingsRead.keys()
     settings = await service.list_org_settings(keys=keys)
-    settings_dict = {setting.key: service.get_value(setting) for setting in settings}
+    settings_dict, _ = service.get_values_with_decryption_fallback(settings)
     return AppSettingsRead(**settings_dict)
 
 
 @router.patch("/app", status_code=status.HTTP_204_NO_CONTENT)
+@require_scope("org:settings:update")
 async def update_app_settings(
     *,
-    role: OrgAdminUserRole,
+    role: OrgUserRole,
     session: AsyncDBSession,
     params: AppSettingsUpdate,
 ) -> None:
@@ -202,22 +199,28 @@ async def update_app_settings(
 
 
 @router.get("/audit", response_model=AuditSettingsRead)
+@require_scope("org:settings:read")
 async def get_audit_settings(
     *,
-    role: OrgAdminUserRole,
+    role: OrgUserRole,
     session: AsyncDBSession,
 ) -> AuditSettingsRead:
     service = SettingsService(session, role)
-    keys = AuditSettingsRead.keys()
+    keys = AuditSettingsRead.keys(exclude={"decryption_failed_keys"})
     settings = await service.list_org_settings(keys=keys)
-    settings_dict = {setting.key: service.get_value(setting) for setting in settings}
-    return AuditSettingsRead(**settings_dict)
+    settings_dict, decryption_failed_keys = service.get_values_with_decryption_fallback(
+        settings
+    )
+    return AuditSettingsRead(
+        **settings_dict, decryption_failed_keys=decryption_failed_keys
+    )
 
 
 @router.patch("/audit", status_code=status.HTTP_204_NO_CONTENT)
+@require_scope("org:settings:update")
 async def update_audit_settings(
     *,
-    role: OrgAdminUserRole,
+    role: OrgUserRole,
     session: AsyncDBSession,
     params: AuditSettingsUpdate,
 ) -> None:
@@ -226,22 +229,24 @@ async def update_audit_settings(
 
 
 @router.get("/agent", response_model=AgentSettingsRead)
+@require_scope("org:settings:read")
 async def get_agent_settings(
     *,
-    role: OrgAdminUserRole,
+    role: OrgUserRole,
     session: AsyncDBSession,
 ) -> AgentSettingsRead:
     service = SettingsService(session, role)
     keys = AgentSettingsRead.keys()
     settings = await service.list_org_settings(keys=keys)
-    settings_dict = {setting.key: service.get_value(setting) for setting in settings}
+    settings_dict, _ = service.get_values_with_decryption_fallback(settings)
     return AgentSettingsRead(**settings_dict)
 
 
 @router.patch("/agent", status_code=status.HTTP_204_NO_CONTENT)
+@require_scope("org:settings:update")
 async def update_agent_settings(
     *,
-    role: OrgAdminUserRole,
+    role: OrgUserRole,
     session: AsyncDBSession,
     params: AgentSettingsUpdate,
 ) -> None:

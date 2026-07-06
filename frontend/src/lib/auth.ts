@@ -1,10 +1,4 @@
-import {
-  ApiError,
-  type UserRead,
-  type UserRole,
-  usersUsersCurrentUser,
-  type WorkspaceMembershipRead,
-} from "@/client"
+import { ApiError, type UserRead, usersUsersCurrentUser } from "@/client"
 
 export const SYSTEM_USER_READ: UserRead = {
   id: "system",
@@ -30,18 +24,14 @@ export async function getCurrentUser(): Promise<UserRead | null> {
   }
 }
 
-export function userIsPrivileged(
-  user: UserRead | null,
-  membership?: WorkspaceMembershipRead
-): boolean {
-  if (!user) {
-    return false
-  }
-  return userIsOrgAdmin(user) || membership?.role === "admin"
-}
-
-export function userIsOrgAdmin(user?: UserRead | null): boolean {
-  return user?.is_superuser || user?.role === "admin"
+/**
+ * Check if user has platform-level admin privileges.
+ *
+ * Backend platform admin routes are gated by User.is_superuser.
+ * For org-level admin checks, use useScopeCheck("org:update").
+ */
+export function userIsPlatformAdmin(user?: UserRead | null): boolean {
+  return user?.is_superuser ?? false
 }
 
 export function getDisplayName(
@@ -56,6 +46,9 @@ export function getDisplayName(
   }
 }
 
+/**
+ * User class that wraps UserRead data for authorization checks.
+ */
 export class User {
   constructor(private user: UserRead) {}
 
@@ -67,10 +60,6 @@ export class User {
     return this.user.email
   }
 
-  get role(): UserRole {
-    return this.user.role
-  }
-
   get firstName(): string | null | undefined {
     return this.user.first_name
   }
@@ -80,19 +69,19 @@ export class User {
   }
 
   get settings(): Record<string, unknown> {
-    return this.user.settings
+    return this.user.settings ?? {}
   }
 
   get isSuperuser(): boolean {
-    return this.user.is_superuser || false
+    return this.user.is_superuser ?? false
   }
 
   get isActive(): boolean {
-    return this.user.is_active || false
+    return this.user.is_active ?? false
   }
 
   get isVerified(): boolean {
-    return this.user.is_verified || false
+    return this.user.is_verified ?? false
   }
 
   get unwrap(): UserRead {
@@ -100,24 +89,13 @@ export class User {
   }
 
   /**
-   * Returns true if the user is privileged in the context of this workspace.
+   * Returns true if the user has platform-level admin privileges.
+   *
+   * Backend platform admin routes are gated by User.is_superuser.
+   * For org-level admin checks, use useScopeCheck("org:update").
    */
-  isPrivileged(membership?: WorkspaceMembershipRead): boolean {
-    return userIsPrivileged(this.user, membership)
-  }
-
-  /**
-   * Returns true if the user is an organization admin.
-   */
-  isOrgAdmin(): boolean {
-    return userIsOrgAdmin(this.user)
-  }
-
-  /**
-   * Returns true if the user is a workspace admin.
-   */
-  isWorkspaceAdmin(membership?: WorkspaceMembershipRead): boolean {
-    return membership?.role === "admin"
+  isPlatformAdmin(): boolean {
+    return userIsPlatformAdmin(this.user)
   }
 
   /**

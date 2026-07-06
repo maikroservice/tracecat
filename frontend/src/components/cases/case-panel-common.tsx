@@ -1,9 +1,8 @@
 "use client"
 
-import { Clock, PlayCircle } from "lucide-react"
+import { Clock } from "lucide-react"
 import type React from "react"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
-import { Button } from "@/components/ui/button"
 import {
   HoverCard,
   HoverCardContent,
@@ -29,29 +28,22 @@ export function UserHoverCard({
 }) {
   const displayName = user.getDisplayName()
   const avatarText = displayName.substring(0, 1).toUpperCase()
-  const username = user.email.split("@")[0]
 
   return (
     <HoverCard>
       <HoverCardTrigger asChild>{children}</HoverCardTrigger>
-      <HoverCardContent className="w-auto" side="top">
-        <div className="flex items-center gap-4">
-          <Avatar className="size-16">
-            <AvatarFallback className="bg-primary/10 text-lg text-primary">
+      <HoverCardContent className="w-auto max-w-xs" side="top">
+        <div className="flex items-center gap-3">
+          <Avatar className="size-8 shrink-0">
+            <AvatarFallback className="text-sm font-medium">
               {avatarText}
             </AvatarFallback>
           </Avatar>
-          <div className="flex flex-col gap-1">
-            <div className="flex items-center gap-2">
-              <span className="text-base font-medium">{displayName}</span>
-              <span className="text-muted-foreground">({username})</span>
-              {user.role && (
-                <span className="rounded-md bg-primary/10 px-2 py-0.5 text-xs font-medium capitalize text-primary">
-                  {user.role}
-                </span>
-              )}
-            </div>
-            <span className="text-xs text-muted-foreground">{user.email}</span>
+          <div className="flex min-w-0 flex-col">
+            <span className="truncate text-sm font-medium">{displayName}</span>
+            <span className="truncate text-xs text-muted-foreground">
+              {user.email}
+            </span>
           </div>
         </div>
       </HoverCardContent>
@@ -75,15 +67,15 @@ export function CaseUserAvatar({
         className={cn(
           "cursor-default",
           className,
-          size === "sm" && "size-4",
+          size === "sm" && "size-5",
           size === "md" && "size-8",
           size === "lg" && "size-12"
         )}
       >
         <AvatarFallback
           className={cn(
-            "bg-primary/10 text-primary",
-            size === "sm" && "text-xs",
+            "text-sm font-medium",
+            size === "sm" && "text-[10px]",
             size === "md" && "text-sm",
             size === "lg" && "text-lg"
           )}
@@ -125,38 +117,6 @@ export function CaseEventTimestamp({
               Edited: {lastEditedAtDate.toLocaleString()}
             </>
           )}
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
-  )
-}
-
-export function CaseWorkflowTriggerButton({
-  className,
-}: {
-  className?: string
-}) {
-  const handleClick = () => {
-    window.dispatchEvent(new Event(CASE_WORKFLOW_TRIGGER_EVENT))
-  }
-
-  return (
-    <TooltipProvider>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className={cn("h-7 w-7 shrink-0 text-muted-foreground", className)}
-            onClick={handleClick}
-          >
-            <PlayCircle className="h-4 w-4" />
-            <span className="sr-only">Trigger workflow</span>
-          </Button>
-        </TooltipTrigger>
-        <TooltipContent side="bottom" className="text-xs">
-          Trigger workflow
         </TooltipContent>
       </Tooltip>
     </TooltipProvider>

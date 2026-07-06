@@ -11,6 +11,8 @@ from pydantic import BaseModel, Field
 from tracecat.agent.adapter.vercel import UIMessage
 from tracecat.agent.common.stream_types import HarnessType
 from tracecat.agent.session.types import AgentSessionEntity
+from tracecat.agent.subagents import ResolvedAgentsConfig
+from tracecat.artifacts.schemas import Artifact
 
 
 class AgentSessionCreate(BaseModel):
@@ -41,12 +43,24 @@ class AgentSessionCreate(BaseModel):
     )
     tools: list[str] | None = Field(
         default=None,
-        description="Tools available to the agent for this session",
+        description="Extra tools added to this session alongside entity defaults",
+        max_length=50,
+    )
+    mcp_integrations: list[str] | None = Field(
+        default=None,
+        description="MCP integration IDs attached to this session",
         max_length=50,
     )
     agent_preset_id: uuid.UUID | None = Field(
         default=None,
         description="Agent preset used for this session (if any)",
+    )
+    agent_preset_version_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "Pinned preset version used for this session. "
+            "If null, the session follows the preset's current version."
+        ),
     )
     # Harness fields
     harness_type: HarnessType = Field(
@@ -61,10 +75,24 @@ class AgentSessionUpdate(BaseModel):
         default=None, description="Session title", min_length=1, max_length=200
     )
     tools: list[str] | None = Field(
-        default=None, description="Tools available to the agent", max_length=50
+        default=None,
+        description="Extra tools added to this session alongside entity defaults",
+        max_length=50,
+    )
+    mcp_integrations: list[str] | None = Field(
+        default=None,
+        description="MCP integration IDs attached to this session",
+        max_length=50,
     )
     agent_preset_id: uuid.UUID | None = Field(
         default=None, description="Agent preset to use for this session"
+    )
+    agent_preset_version_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "Pinned preset version to use for this session. "
+            "Set null to follow the preset's current version."
+        ),
     )
     harness_type: HarnessType | None = Field(
         default=None, description="Agent harness type"
@@ -95,14 +123,23 @@ class AgentSessionRead(BaseModel):
     # Metadata
     title: str
     created_by: uuid.UUID | None
-    entity_type: str
+    entity_type: AgentSessionEntity
     entity_id: uuid.UUID
+    channel_context: dict[str, Any] | None
     tools: list[str] | None
+    mcp_integrations: list[str] | None
     agent_preset_id: uuid.UUID | None
+    agent_preset_version_id: uuid.UUID | None
+    agents_binding: ResolvedAgentsConfig | None = None
     # Harness
     harness_type: str | None
+    # Terminal error of the most recent run, present iff it failed (errors are
+    # run-ending). The detail pane reads this to show why the run failed, since
+    # terminal errors are not persisted into the replayable message history.
+    last_error: str | None = None
     # Stream tracking
     last_stream_id: str | None = None
+    artifacts: list[Artifact] = Field(default_factory=list)
     # Fork tracking
     parent_session_id: uuid.UUID | None = None
     # Timestamps
@@ -126,6 +163,12 @@ class AgentSessionReadVercel(AgentSessionRead):
     messages: list[UIMessage] = Field(
         default_factory=list, description="Session messages in Vercel UI format"
     )
+
+
+class AgentSessionArtifactsRead(BaseModel):
+    """Response schema for persisted agent session artifacts."""
+
+    artifacts: list[Artifact] = Field(default_factory=list)
 
 
 class AgentSessionForkRequest(BaseModel):

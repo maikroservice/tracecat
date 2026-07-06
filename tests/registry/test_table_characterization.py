@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import uuid
 from typing import get_args
-from unittest.mock import patch
 
 import pytest
 import respx
@@ -41,7 +40,8 @@ from tracecat_registry.core.table import (
 from tracecat import config
 from tracecat.api.app import app
 from tracecat.auth.dependencies import ExecutorWorkspaceRole
-from tracecat.auth.types import AccessLevel, Role
+from tracecat.auth.types import Role
+from tracecat.authz.scopes import SERVICE_PRINCIPAL_SCOPES
 from tracecat.contexts import ctx_role
 from tracecat.db.dependencies import get_async_session
 from tracecat.db.models import Workspace
@@ -52,26 +52,23 @@ async def table_test_role(svc_workspace: Workspace) -> Role:
     """Create a service role for table UDF tests."""
     return Role(
         type="service",
-        access_level=AccessLevel.ADMIN,
         workspace_id=svc_workspace.id,
+        organization_id=svc_workspace.organization_id,
         user_id=uuid.uuid4(),
         service_id="tracecat-runner",
+        scopes=SERVICE_PRINCIPAL_SCOPES["tracecat-runner"],
     )
-
-
-@pytest.fixture(params=[False, True], ids=["registry_client_off", "registry_client_on"])
-def registry_client_enabled(request) -> bool:
-    """Toggle the REGISTRY_CLIENT feature flag."""
-    return request.param
 
 
 @pytest.fixture
 async def table_ctx(
     table_test_role: Role,
     session: AsyncSession,
-    registry_client_enabled: bool,
 ):
-    """Set up the ctx_role and registry context for table UDF tests."""
+    """Set up the ctx_role and registry context for table UDF tests.
+
+    Uses SDK path with respx mock to route HTTP calls to the FastAPI app.
+    """
     registry_ctx = RegistryContext(
         workspace_id=str(table_test_role.workspace_id),
         workflow_id="test-workflow-id",
@@ -81,39 +78,33 @@ async def table_ctx(
     )
     set_context(registry_ctx)
 
-    respx_mock = None
-    with patch(
-        "tracecat_registry.config.flags.registry_client", registry_client_enabled
-    ):
-        if registry_client_enabled:
-            respx_mock = respx.mock(assert_all_mocked=False, assert_all_called=False)
-            respx_mock.start()
-            respx_mock.route(url__startswith=config.TRACECAT__API_URL).mock(
-                side_effect=ASGITransport(app).handle_async_request
-            )
+    # Set up respx mock to route SDK HTTP calls to the FastAPI app
+    respx_mock = respx.mock(assert_all_mocked=False, assert_all_called=False)
+    respx_mock.start()
+    respx_mock.route(url__startswith=config.TRACECAT__API_URL).mock(
+        side_effect=ASGITransport(app).handle_async_request
+    )
 
-            def override_role():
-                return table_test_role
+    def override_role():
+        return table_test_role
 
-            metadata = get_args(ExecutorWorkspaceRole)
-            if len(metadata) > 1 and hasattr(metadata[1], "dependency"):
-                app.dependency_overrides[metadata[1].dependency] = override_role
+    metadata = get_args(ExecutorWorkspaceRole)
+    if len(metadata) > 1 and hasattr(metadata[1], "dependency"):
+        app.dependency_overrides[metadata[1].dependency] = override_role
 
-            async def override_get_async_session():
-                yield session
+    async def override_get_async_session():
+        yield session
 
-            app.dependency_overrides[get_async_session] = override_get_async_session
+    app.dependency_overrides[get_async_session] = override_get_async_session
 
-        token = ctx_role.set(table_test_role)
-        try:
-            yield table_test_role
-        finally:
-            ctx_role.reset(token)
-            clear_context()
-            if respx_mock is not None:
-                respx_mock.stop()
-            if registry_client_enabled:
-                app.dependency_overrides.clear()
+    token = ctx_role.set(table_test_role)
+    try:
+        yield table_test_role
+    finally:
+        ctx_role.reset(token)
+        clear_context()
+        respx_mock.stop()
+        app.dependency_overrides.clear()
 
 
 @pytest.fixture
@@ -640,6 +631,7 @@ class TestSearchRows:
             search_term="Security",
         )
 
+        assert isinstance(result, list)
         assert len(result) == 2
         titles = [r["title"] for r in result]
         assert "Security Alert" in titles
@@ -662,6 +654,7 @@ class TestSearchRows:
             limit=3,
         )
 
+        assert isinstance(result, list)
         assert len(result) == 3
 
     async def test_search_rows_no_matches(
@@ -680,6 +673,7 @@ class TestSearchRows:
             search_term="Nonexistent",
         )
 
+        assert isinstance(result, list)
         assert result == []
 
 

@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterable
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from fastapi.responses import ORJSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, computed_field, field_validator
 
 from tracecat.auth.types import Role
+from tracecat.cases.enums import CaseEventType
 from tracecat.core.schemas import Schema
 from tracecat.db.models import Workflow, WorkflowDefinition
 from tracecat.dsl.common import DSLInput, DSLRunArgs
@@ -21,7 +24,47 @@ from tracecat.tags.schemas import TagRead
 from tracecat.validation.schemas import ValidationResult
 from tracecat.webhooks.schemas import WebhookRead
 from tracecat.workflow.actions.schemas import ActionRead
+from tracecat.workflow.case_triggers.schemas import (
+    CaseTriggerConfig,
+    is_case_trigger_configured,
+)
 from tracecat.workflow.schedules.schemas import ScheduleRead
+
+
+def format_registry_lock_entry(origin: str, version: str) -> str:
+    """Format a registry lock origin/version pair for API consumers."""
+    return (
+        f"{format_registry_origin(origin)}@{format_registry_version(origin, version)}"
+    )
+
+
+def format_registry_origin(origin: str) -> str:
+    """Normalize registry origins for compact display."""
+    if origin == "tracecat_registry":
+        return origin
+
+    parsed = urlparse(origin)
+    if parsed.scheme != "git+ssh":
+        return origin
+
+    path = parsed.path.lstrip("/")
+    if not path:
+        return origin
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = path.split("/")
+    if len(parts) < 2:
+        return origin
+
+    org, repo = parts[-2], parts[-1]
+    return f"{org}/{repo}"
+
+
+def format_registry_version(origin: str, version: str) -> str:
+    """Keep platform versions intact and shorten custom registry revisions."""
+    if origin == "tracecat_registry":
+        return version
+    return version[:12] if len(version) > 12 else version
 
 
 class WorkflowRead(Schema):
@@ -40,6 +83,7 @@ class WorkflowRead(Schema):
     returns: Any
     config: DSLConfig | None
     alias: str | None = None
+    git_sync_branch: str | None = None
     error_handler: str | None = None
     sample_data: dict[str, Any] | None = None
     trigger_position_x: float = 0.0
@@ -55,6 +99,14 @@ class WorkflowDefinitionReadMinimal(Schema):
     created_at: datetime
 
 
+class RegistryLockEntryRead(Schema):
+    """Display metadata for one registry lock origin."""
+
+    origin: str
+    version: str
+    label: str
+
+
 class WorkflowDefinitionRead(Schema):
     """API response model for persisted workflow definitions."""
 
@@ -63,8 +115,49 @@ class WorkflowDefinitionRead(Schema):
     workspace_id: WorkspaceID
     version: int
     content: dict[str, Any] | None = None
+    registry_lock: RegistryLock | None = Field(default=None, exclude=True)
     created_at: datetime
     updated_at: datetime
+
+    @field_validator("registry_lock", mode="before")
+    @classmethod
+    def normalize_legacy_registry_lock(cls, value: Any) -> Any:
+        """Accept flat registry locks written by the original DB migration."""
+        if value is None or isinstance(value, RegistryLock):
+            return value
+        if not isinstance(value, dict):
+            return value
+        if any(key in value for key in ("origins", "actions", "origin_fingerprints")):
+            return value
+        if not all(
+            isinstance(origin, str) and isinstance(version, str)
+            for origin, version in value.items()
+        ):
+            return value
+        return {"origins": value, "actions": {}}
+
+    @computed_field
+    @property
+    def registry_lock_entries(self) -> list[RegistryLockEntryRead]:
+        """Registry lock origins with server-normalized display labels."""
+        if self.registry_lock is None:
+            return []
+        return [
+            RegistryLockEntryRead(
+                origin=origin,
+                version=version,
+                label=format_registry_lock_entry(origin, version),
+            )
+            for origin, version in sorted(self.registry_lock.origins.items())
+        ]
+
+
+class WorkflowTriggerSummary(Schema):
+    schedule_count_online: int = 0
+    schedule_cron: str | None = None
+    schedule_natural: str | None = None
+    webhook_active: bool = False
+    case_trigger_events: list[CaseEventType] = Field(default_factory=list)
 
 
 class WorkflowReadMinimal(Schema):
@@ -83,6 +176,7 @@ class WorkflowReadMinimal(Schema):
     error_handler: str | None = None
     latest_definition: WorkflowDefinitionReadMinimal | None = None
     folder_id: uuid.UUID | None = None
+    trigger_summary: WorkflowTriggerSummary | None = None
 
 
 class WorkflowUpdate(BaseModel):
@@ -110,6 +204,14 @@ class WorkflowUpdate(BaseModel):
         default=None,
         description="Sample input data for testing the workflow",
     )
+
+    @field_validator("alias", "error_handler", mode="before")
+    @classmethod
+    def empty_string_to_none(cls, v: Any) -> Any:
+        """Coerce "" to None so clearing the field doesn't collide on unique constraints."""
+        if isinstance(v, str) and v.strip() == "":
+            return None
+        return v
 
 
 class WorkflowCreate(BaseModel):
@@ -199,9 +301,29 @@ class ExternalWorkflowDefinition(BaseModel):
     )
     version: int = Field(default=1, gt=0)
     definition: DSLInput
+    layout: WorkflowLayout | None = None
+    case_trigger: CaseTriggerConfig | None = None
 
     @staticmethod
-    def from_database(defn: WorkflowDefinition) -> ExternalWorkflowDefinition:
+    def from_database(
+        defn: WorkflowDefinition,
+        *,
+        case_trigger: CaseTriggerConfig | None = None,
+    ) -> ExternalWorkflowDefinition:
+        if case_trigger is None and defn.workflow and defn.workflow.case_trigger:
+            workflow_case_trigger = defn.workflow.case_trigger
+            if is_case_trigger_configured(
+                status=workflow_case_trigger.status,
+                event_types=workflow_case_trigger.event_types,
+                tag_filters=workflow_case_trigger.tag_filters,
+            ):
+                case_trigger = CaseTriggerConfig.model_validate(
+                    {
+                        "status": workflow_case_trigger.status,
+                        "event_types": workflow_case_trigger.event_types,
+                        "tag_filters": workflow_case_trigger.tag_filters,
+                    }
+                )
         return ExternalWorkflowDefinition(
             workspace_id=defn.workspace_id,
             workflow_id=WorkflowUUID.new(defn.workflow_id),
@@ -209,6 +331,10 @@ class ExternalWorkflowDefinition(BaseModel):
             updated_at=defn.updated_at,
             version=defn.version,
             definition=DSLInput.model_validate(defn.content),
+            layout=WorkflowLayout.from_workflow(defn.workflow)
+            if defn.workflow
+            else None,
+            case_trigger=case_trigger,
         )
 
     @field_validator("workflow_id", mode="before")
@@ -218,6 +344,117 @@ class ExternalWorkflowDefinition(BaseModel):
         if v is None:
             return None
         return WorkflowUUID.new(v)
+
+    def extract_layout_positions(
+        self,
+    ) -> tuple[
+        tuple[float, float] | None,
+        tuple[float, float, float] | None,
+        dict[str, tuple[float, float]] | None,
+    ]:
+        if self.layout is None:
+            return None, None, None
+        return self.layout.extract_positions()
+
+
+class WorkflowLayoutPosition(BaseModel):
+    x: float | None = None
+    y: float | None = None
+    position: dict[str, float] | None = None
+
+    @field_validator("position")
+    @classmethod
+    def validate_position(
+        cls, value: dict[str, float] | None
+    ) -> dict[str, float] | None:
+        if value is None:
+            return None
+        return {
+            key: coordinate for key, coordinate in value.items() if key in {"x", "y"}
+        }
+
+    @field_validator("x", "y", mode="before")
+    @classmethod
+    def coerce_coordinate(cls, value: Any) -> float | None:
+        if value is None:
+            return None
+        return float(value)
+
+    def resolved(self) -> tuple[float, float]:
+        x = self.x
+        y = self.y
+        if self.position is not None:
+            if x is None:
+                x = self.position.get("x")
+            if y is None:
+                y = self.position.get("y")
+        return (x if x is not None else 0.0, y if y is not None else 0.0)
+
+
+class WorkflowLayoutViewport(BaseModel):
+    x: float | None = None
+    y: float | None = None
+    zoom: float | None = None
+
+
+class WorkflowLayoutActionPosition(WorkflowLayoutPosition):
+    ref: str
+
+
+class WorkflowLayout(BaseModel):
+    trigger: WorkflowLayoutPosition | None = None
+    viewport: WorkflowLayoutViewport | None = None
+    actions: list[WorkflowLayoutActionPosition] = Field(default_factory=list)
+
+    @classmethod
+    def from_workflow(cls, workflow: Workflow) -> WorkflowLayout:
+        return cls(
+            trigger=WorkflowLayoutPosition(
+                x=workflow.trigger_position_x,
+                y=workflow.trigger_position_y,
+            ),
+            viewport=WorkflowLayoutViewport(
+                x=workflow.viewport_x,
+                y=workflow.viewport_y,
+                zoom=workflow.viewport_zoom,
+            ),
+            actions=[
+                WorkflowLayoutActionPosition(
+                    ref=action.ref,
+                    x=action.position_x,
+                    y=action.position_y,
+                )
+                for action in _iter_sorted_actions(workflow.actions or [])
+            ],
+        )
+
+    def extract_positions(
+        self,
+    ) -> tuple[
+        tuple[float, float] | None,
+        tuple[float, float, float] | None,
+        dict[str, tuple[float, float]] | None,
+    ]:
+        trigger_position = self.trigger.resolved() if self.trigger is not None else None
+        viewport = (
+            (
+                self.viewport.x if self.viewport.x is not None else 0.0,
+                self.viewport.y if self.viewport.y is not None else 0.0,
+                self.viewport.zoom if self.viewport.zoom is not None else 1.0,
+            )
+            if self.viewport is not None
+            else None
+        )
+        action_positions = (
+            {action.ref: action.resolved() for action in self.actions}
+            if self.actions
+            else None
+        )
+        return trigger_position, viewport, action_positions
+
+
+def _iter_sorted_actions(actions: Iterable[Any]) -> list[Any]:
+    return sorted(actions, key=lambda action: action.ref)
 
 
 class WorkflowCommitResponse(BaseModel):

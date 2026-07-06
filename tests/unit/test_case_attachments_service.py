@@ -6,9 +6,9 @@ import pytest
 from dotenv import dotenv_values
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import tests.conftest as conf
 from tracecat import config
-from tracecat.auth.types import AccessLevel, Role
+from tracecat.auth.types import Role
+from tracecat.authz.scopes import ADMIN_SCOPES
 from tracecat.cases.attachments.schemas import CaseAttachmentCreate
 from tracecat.cases.attachments.service import CaseAttachmentService
 from tracecat.cases.enums import CaseEventType, CasePriority, CaseSeverity, CaseStatus
@@ -30,9 +30,9 @@ pytestmark = pytest.mark.usefixtures("db")
 def sync_minio_credentials(monkeysession: pytest.MonkeyPatch):
     """Ensure MinIO server and S3 client use same creds from .env.
 
-    Reads AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY via python-dotenv, then:
-    - sets env vars for the storage client, and
-    - patches tests.conftest MinIO constants so the Docker container uses them.
+    Reads credentials via python-dotenv using the same fallback chain as
+    ``tests.conftest._minio_credentials`` so the test client authenticates
+    with the same identity the MinIO container was started with.
     """
     try:
         env = dotenv_values()
@@ -41,25 +41,21 @@ def sync_minio_credentials(monkeysession: pytest.MonkeyPatch):
 
     access_key = (
         env.get("AWS_ACCESS_KEY_ID")
+        or env.get("MINIO_ROOT_USER")
         or os.environ.get("AWS_ACCESS_KEY_ID")
-        or "minioadmin"
+        or os.environ.get("MINIO_ROOT_USER")
+        or "minio"
     )
     secret_key = (
         env.get("AWS_SECRET_ACCESS_KEY")
+        or env.get("MINIO_ROOT_PASSWORD")
         or os.environ.get("AWS_SECRET_ACCESS_KEY")
-        or "minioadmin"
+        or os.environ.get("MINIO_ROOT_PASSWORD")
+        or "password"
     )
 
-    # Env for storage client
     monkeysession.setenv("AWS_ACCESS_KEY_ID", access_key)
     monkeysession.setenv("AWS_SECRET_ACCESS_KEY", secret_key)
-
-    # Patch tests.conftest constants used to start MinIO
-    try:
-        monkeysession.setattr(conf, "AWS_ACCESS_KEY_ID", access_key, raising=False)
-        monkeysession.setattr(conf, "AWS_SECRET_ACCESS_KEY", secret_key, raising=False)
-    except Exception:
-        pass
 
 
 @pytest.fixture
@@ -363,10 +359,11 @@ async def test_delete_authorization_basic_vs_admin(
     # Attempt delete with a different BASIC user in the same workspace
     other_role = Role(
         type="user",
-        access_level=AccessLevel.BASIC,
         workspace_id=attachments_service.role.workspace_id,
+        organization_id=attachments_service.role.organization_id,
         user_id=uuid.uuid4(),
         service_id="tracecat-api",
+        scopes=ADMIN_SCOPES,
     )
     other_svc = CaseAttachmentService(session=session, role=other_role)
     with pytest.raises(TracecatAuthorizationError):

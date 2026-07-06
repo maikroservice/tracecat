@@ -10,8 +10,24 @@ from fastapi.testclient import TestClient
 from temporalio.client import WorkflowExecutionStatus
 
 from tracecat.auth.types import Role
+from tracecat.dsl.common import DSLInput
+from tracecat.identifiers.workflow import WorkflowUUID
+from tracecat.validation.schemas import ValidationResult, ValidationResultType
 from tracecat.workflow.executions import internal_router as internal_executions_router
 from tracecat.workflow.executions import router as executions_router
+
+
+def _workflow_definition_content(title: str = "Test Workflow") -> dict:
+    return DSLInput(
+        **{
+            "title": title,
+            "description": "Test workflow",
+            "entrypoint": {"ref": "start"},
+            "actions": [{"ref": "start", "action": "core.noop"}],
+            "config": {"enable_runtime_tests": False},
+        }
+    ).model_dump()
+
 
 # --- Internal Router: GET /executions/{execution_id} ---
 
@@ -172,6 +188,56 @@ async def test_internal_get_execution_status_returns_error_for_failed_workflow(
     assert payload["status"] == "FAILED"
     assert payload["error"] is not None
     assert "connection timeout" in payload["error"]
+
+
+@pytest.mark.anyio
+async def test_internal_get_execution_status_unwraps_nested_failure_cause(
+    client: TestClient,
+    test_admin_role: Role,
+) -> None:
+    """Test that nested ActivityError-style causes are unwrapped to root message."""
+    from temporalio.client import WorkflowFailureError
+    from temporalio.exceptions import ApplicationError
+
+    wf_exec_id = "wf_abc/exec_failed_nested"
+
+    mock_execution = Mock()
+    mock_execution.status = WorkflowExecutionStatus.FAILED
+    mock_execution.start_time = datetime(2024, 1, 1, tzinfo=UTC)
+    mock_execution.close_time = datetime(2024, 1, 1, 0, 1, tzinfo=UTC)
+
+    class FakeActivityError(Exception):
+        def __init__(self, message: str, cause: Exception | None = None) -> None:
+            super().__init__(message)
+            self.cause = cause
+
+    root_cause = ApplicationError(
+        "EntitlementRequired: Feature 'custom_registry' requires an upgraded plan"
+    )
+    activity_wrapper = FakeActivityError("Activity task failed", cause=root_cause)
+
+    mock_handle = Mock()
+    mock_handle.result = AsyncMock(
+        side_effect=WorkflowFailureError(cause=activity_wrapper)
+    )
+
+    mock_svc = AsyncMock()
+    mock_svc.get_execution.return_value = mock_execution
+    mock_svc.handle = Mock(return_value=mock_handle)
+
+    with patch.object(
+        internal_executions_router.WorkflowExecutionsService,
+        "connect",
+        AsyncMock(return_value=mock_svc),
+    ):
+        response = client.get(f"/internal/workflows/executions/{wf_exec_id}")
+
+    assert response.status_code == status.HTTP_200_OK
+    payload = response.json()
+    assert payload["status"] == "FAILED"
+    assert payload["error"] is not None
+    assert "custom_registry" in payload["error"]
+    assert "Activity task failed" not in payload["error"]
 
 
 # --- Internal Router: POST /executions ---
@@ -391,9 +457,6 @@ async def test_internal_execute_workflow_returns_404_for_missing_definition(
 
 
 @pytest.mark.anyio
-@pytest.mark.xfail(
-    reason="Public router doesn't support {execution_id:path} yet - only internal router does"
-)
 async def test_get_workflow_execution_compact_accepts_slash_id(
     client: TestClient,
     test_admin_role: Role,
@@ -437,3 +500,163 @@ async def test_get_workflow_execution_compact_accepts_slash_id(
     assert payload["status"] == "RUNNING"
     mock_svc.get_execution.assert_awaited_once_with(wf_exec_id)
     mock_svc.list_workflow_execution_events_compact.assert_awaited_once_with(wf_exec_id)
+
+
+@pytest.mark.anyio
+async def test_create_workflow_execution_uses_workspace_scoped_definition(
+    client: TestClient,
+    test_admin_role: Role,
+) -> None:
+    workflow_id = "wf_4itKqkgCZrLhgYiq5L211X"
+    wf_exec_id = f"{workflow_id}/exec_abc"
+
+    mock_defn = Mock()
+    mock_defn.content = _workflow_definition_content()
+    mock_defn.registry_lock = None
+
+    mock_get_definition = AsyncMock(return_value=mock_defn)
+    mock_exec_service = AsyncMock()
+    mock_exec_service.create_workflow_execution_nowait = Mock(
+        return_value={
+            "wf_id": workflow_id,
+            "wf_exec_id": wf_exec_id,
+            "message": "Workflow execution started",
+        }
+    )
+
+    with (
+        patch.object(
+            executions_router.WorkflowDefinitionsService,
+            "__init__",
+            lambda self, session, role: None,
+        ),
+        patch.object(
+            executions_router.WorkflowDefinitionsService,
+            "get_definition_by_workflow_id",
+            mock_get_definition,
+        ),
+        patch.object(
+            executions_router.WorkflowExecutionsService,
+            "connect",
+            AsyncMock(return_value=mock_exec_service),
+        ),
+    ):
+        response = client.post(
+            "/workflow-executions",
+            json={"workflow_id": workflow_id, "inputs": {"key": "value"}},
+        )
+
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["wf_exec_id"] == wf_exec_id
+    mock_get_definition.assert_awaited_once_with(
+        WorkflowUUID.new(workflow_id), load_relationships=False
+    )
+    mock_exec_service.create_workflow_execution_nowait.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_create_workflow_execution_returns_404_for_unscoped_definition(
+    client: TestClient,
+    test_admin_role: Role,
+) -> None:
+    """Cross-workspace workflow IDs are rejected by the scoped definition lookup."""
+    workflow_id = "wf_4itKqkgCZrLhgYiq5L211X"
+
+    mock_get_definition = AsyncMock(return_value=None)
+    mock_connect = AsyncMock()
+
+    with (
+        patch.object(
+            executions_router.WorkflowDefinitionsService,
+            "__init__",
+            lambda self, session, role: None,
+        ),
+        patch.object(
+            executions_router.WorkflowDefinitionsService,
+            "get_definition_by_workflow_id",
+            mock_get_definition,
+        ),
+        patch.object(
+            executions_router.WorkflowExecutionsService,
+            "connect",
+            mock_connect,
+        ),
+    ):
+        response = client.post(
+            "/workflow-executions",
+            json={"workflow_id": workflow_id, "inputs": {"key": "value"}},
+        )
+
+    assert response.status_code == status.HTTP_404_NOT_FOUND
+    assert response.json()["detail"] == "Invalid workflow ID"
+    mock_get_definition.assert_awaited_once_with(
+        WorkflowUUID.new(workflow_id), load_relationships=False
+    )
+    mock_connect.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_draft_execution_returns_400_when_dsl_validation_fails(
+    client: TestClient,
+    test_admin_role: Role,
+) -> None:
+    """Draft execution should fail fast on commit-equivalent DSL validation errors."""
+    workflow_id = "wf_4itKqkgCZrLhgYiq5L211X"
+
+    mock_workflow = Mock()
+    mock_mgmt_service = AsyncMock()
+    mock_mgmt_service.get_workflow.return_value = mock_workflow
+    mock_mgmt_service.build_dsl_from_workflow.return_value = DSLInput(
+        **{
+            "title": "Draft workflow",
+            "description": "Draft workflow for validation test",
+            "entrypoint": {"expects": {}, "ref": "start"},
+            "actions": [{"ref": "start", "action": "core.noop"}],
+            "config": {"enable_runtime_tests": False},
+        }
+    )
+    mock_mgmt_ctx = AsyncMock()
+    mock_mgmt_ctx.__aenter__.return_value = mock_mgmt_service
+    mock_mgmt_ctx.__aexit__.return_value = None
+
+    validation_error = ValidationResult.new(
+        type=ValidationResultType.DSL,
+        status="error",
+        msg="Action validation failed",
+        ref="start",
+    )
+    mock_validate_dsl = AsyncMock(return_value={validation_error})
+
+    mock_exec_service = AsyncMock()
+    mock_exec_service.create_draft_workflow_execution_nowait = Mock()
+
+    with (
+        patch.object(
+            executions_router.WorkflowExecutionsService,
+            "connect",
+            AsyncMock(return_value=mock_exec_service),
+        ),
+        patch.object(
+            executions_router.WorkflowsManagementService,
+            "with_session",
+            return_value=mock_mgmt_ctx,
+        ),
+        patch.object(
+            executions_router,
+            "validate_dsl",
+            mock_validate_dsl,
+        ),
+    ):
+        response = client.post(
+            "/workflow-executions/draft",
+            json={"workflow_id": workflow_id, "inputs": {"sample": "value"}},
+        )
+
+    assert response.status_code == status.HTTP_400_BAD_REQUEST
+    payload = response.json()
+    assert payload["detail"]["type"] == "TracecatValidationError"
+    assert "validation failed with 1 error" in payload["detail"]["message"].lower()
+    assert isinstance(payload["detail"]["detail"], list)
+    assert payload["detail"]["detail"][0]["type"] == "dsl"
+    mock_validate_dsl.assert_awaited_once()
+    mock_exec_service.create_draft_workflow_execution_nowait.assert_not_called()

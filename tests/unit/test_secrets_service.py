@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from cryptography import x509
@@ -15,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from tracecat.auth.types import Role
 from tracecat.exceptions import (
+    ScopeDeniedError,
     TracecatCredentialsNotFoundError,
     TracecatNotFoundError,
 )
@@ -31,9 +33,9 @@ pytestmark = pytest.mark.usefixtures("db")
 
 
 @pytest.fixture
-async def service(session: AsyncSession, svc_role: Role) -> SecretsService:
+async def service(session: AsyncSession, svc_admin_role: Role) -> SecretsService:
     """Create a secrets service instance for testing."""
-    return SecretsService(session=session, role=svc_role)
+    return SecretsService(session=session, role=svc_admin_role)
 
 
 @pytest.fixture(scope="session")
@@ -254,6 +256,30 @@ class TestSecretsService:
         assert decrypted_keys[0].key == secret_create_params.keys[0].key
         assert decrypted_keys[0].value == secret_create_params.keys[0].value
 
+    async def test_get_github_app_org_secret_accepts_legacy_or_workspace_sync_scope(
+        self,
+        session: AsyncSession,
+        svc_admin_role: Role,
+    ) -> None:
+        for scope in ("workflow:sync", "workspace_sync:sync"):
+            service = SecretsService(
+                session=session,
+                role=svc_admin_role.model_copy(update={"scopes": frozenset({scope})}),
+            )
+            with patch.object(
+                service,
+                "_get_github_app_org_secret",
+                new=AsyncMock(return_value=Mock()),
+            ):
+                await service.get_github_app_org_secret()
+
+        service = SecretsService(
+            session=session,
+            role=svc_admin_role.model_copy(update={"scopes": frozenset()}),
+        )
+        with pytest.raises(ScopeDeniedError):
+            await service.get_github_app_org_secret()
+
     async def test_update_secret_preserves_empty_values(
         self, service: SecretsService, secret_create_params: SecretCreate
     ) -> None:
@@ -310,6 +336,98 @@ class TestSecretsService:
         assert decrypted_keys["key2"] == "updated_value2"  # Value updated
         assert "key3" not in decrypted_keys  # Key removed
         assert decrypted_keys["key4"] == "new_value4"  # New key added
+
+    async def test_update_secret_recovers_from_corrupted_encrypted_keys(
+        self, service: SecretsService
+    ) -> None:
+        """Test that corrupted encrypted keys can be recovered with full key input."""
+        create_params = SecretCreate(
+            name="test-corrupted-secret-recovery",
+            type=SecretType.CUSTOM,
+            description="Initial description",
+            keys=[
+                SecretKeyValue(key="api_key", value=SecretStr("old-api-key")),
+                SecretKeyValue(key="api_secret", value=SecretStr("old-api-secret")),
+            ],
+        )
+        await service.create_secret(create_params)
+        secret = await service.get_secret_by_name(create_params.name)
+
+        # Simulate a bad DB encryption key by corrupting the stored ciphertext.
+        secret.encrypted_keys = b"not-a-valid-fernet-token"
+        service.session.add(secret)
+        await service.session.commit()
+
+        update_params = SecretUpdate(
+            description="Recovered description",
+            keys=[
+                SecretKeyValue(key="api_key", value=SecretStr("new-api-key")),
+                SecretKeyValue(key="api_secret", value=SecretStr("new-api-secret")),
+            ],
+        )
+        await service.update_secret(secret, update_params)
+
+        recovered_secret = await service.get_secret_by_name(create_params.name)
+        recovered_keys = {
+            k.key: k.value.get_secret_value()
+            for k in service.decrypt_keys(recovered_secret.encrypted_keys)
+        }
+        assert recovered_secret.description == "Recovered description"
+        assert recovered_keys == {
+            "api_key": "new-api-key",
+            "api_secret": "new-api-secret",
+        }
+
+    async def test_update_secret_corrupted_encrypted_keys_require_full_values(
+        self, service: SecretsService
+    ) -> None:
+        """Test that corrupted secrets reject blank key values on recovery."""
+        create_params = SecretCreate(
+            name="test-corrupted-secret-empty-values",
+            type=SecretType.CUSTOM,
+            description="Initial description",
+            keys=[SecretKeyValue(key="token", value=SecretStr("old-token"))],
+        )
+        await service.create_secret(create_params)
+        secret = await service.get_secret_by_name(create_params.name)
+
+        secret.encrypted_keys = b"not-a-valid-fernet-token"
+        service.session.add(secret)
+        await service.session.commit()
+
+        with pytest.raises(ValueError, match="Re-enter all key values"):
+            await service.update_secret(
+                secret,
+                SecretUpdate(
+                    keys=[SecretKeyValue(key="token", value=SecretStr(""))],
+                ),
+            )
+
+    async def test_update_secret_corrupted_encrypted_keys_require_keys_payload(
+        self, service: SecretsService
+    ) -> None:
+        """Test that corrupted secrets reject updates that omit keys entirely."""
+        create_params = SecretCreate(
+            name="test-corrupted-secret-missing-keys",
+            type=SecretType.CUSTOM,
+            description="Initial description",
+            keys=[SecretKeyValue(key="token", value=SecretStr("old-token"))],
+        )
+        await service.create_secret(create_params)
+        secret = await service.get_secret_by_name(create_params.name)
+
+        secret.encrypted_keys = b"not-a-valid-fernet-token"
+        service.session.add(secret)
+        await service.session.commit()
+
+        with pytest.raises(
+            ValueError,
+            match="Re-enter all key names and values",
+        ):
+            await service.update_secret(
+                secret,
+                SecretUpdate(description="Updated description"),
+            )
 
     async def test_update_mtls_secret_preserves_empty_values(
         self,

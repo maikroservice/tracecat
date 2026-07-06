@@ -1,12 +1,25 @@
 "use client"
 
 import { type ComponentPropsWithoutRef, useState } from "react"
-import { authOauthGoogleDatabaseAuthorize } from "@/client"
 import { Icons } from "@/components/icons"
 import { Button } from "@/components/ui/button"
+import { startOidcLogin } from "@/lib/auth-login"
 
-type OAuthButtonProps = ComponentPropsWithoutRef<typeof Button>
-export function GithubOAuthButton(props: OAuthButtonProps) {
+type OAuthButtonProps = ComponentPropsWithoutRef<typeof Button> & {
+  returnUrl?: string | null
+}
+
+type OidcProviderIcon = "google" | "login"
+
+type OidcOAuthButtonProps = OAuthButtonProps & {
+  providerLabel?: string
+  providerIcon?: OidcProviderIcon
+}
+
+export function GithubOAuthButton({
+  returnUrl: _,
+  ...props
+}: OAuthButtonProps) {
   const [isLoading, setIsLoading] = useState<boolean>(false)
   const handleClick = async () => {
     setIsLoading(true)
@@ -29,17 +42,22 @@ export function GithubOAuthButton(props: OAuthButtonProps) {
     </Button>
   )
 }
-export function GoogleOAuthButton(props: OAuthButtonProps) {
+
+export function OidcOAuthButton({
+  returnUrl,
+  providerLabel = "Social login",
+  providerIcon = "login",
+  ...props
+}: OidcOAuthButtonProps) {
   const [isLoading, setIsLoading] = useState<boolean>(false)
+  const ProviderIcon = providerIcon === "google" ? Icons.google : Icons.login
+
   const handleClick = async () => {
     try {
       setIsLoading(true)
-      const { authorization_url } = await authOauthGoogleDatabaseAuthorize({
-        scopes: ["openid", "email", "profile"],
-      })
-      window.location.href = authorization_url
+      await startOidcLogin(returnUrl)
     } catch (error) {
-      console.error("Error authorizing with Google", error)
+      console.error("Error authorizing with OIDC", error)
     } finally {
       setIsLoading(false)
     }
@@ -54,9 +72,15 @@ export function GoogleOAuthButton(props: OAuthButtonProps) {
       {isLoading ? (
         <Icons.spinner className="mr-2 size-4 animate-spin" />
       ) : (
-        <Icons.google className="mr-2 size-4" />
+        <ProviderIcon className="mr-2 size-4" />
       )}{" "}
-      Google
+      {providerLabel}
     </Button>
+  )
+}
+
+export function GoogleOAuthButton(props: OAuthButtonProps) {
+  return (
+    <OidcOAuthButton {...props} providerLabel="Google" providerIcon="google" />
   )
 }

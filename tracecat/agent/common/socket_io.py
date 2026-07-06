@@ -111,13 +111,15 @@ class SocketStreamWriter:
 
     def __init__(self, writer: asyncio.StreamWriter):
         self._writer = writer
+        self._send_lock = asyncio.Lock()
 
     async def _send(self, envelope: RuntimeEventEnvelope) -> None:
         """Send an envelope over the socket."""
         payload = orjson.dumps(envelope.to_dict())
         message = build_message(MessageType.EVENT, payload)
-        self._writer.write(message)
-        await self._writer.drain()
+        async with self._send_lock:
+            self._writer.write(message)
+            await self._writer.drain()
 
     async def send_stream_event(self, event: UnifiedStreamEvent) -> None:
         """Send a stream event (partial delta) to the orchestrator."""
@@ -167,6 +169,7 @@ class SocketStreamWriter:
         usage: dict[str, Any] | None = None,
         num_turns: int | None = None,
         duration_ms: int | None = None,
+        output: Any = None,
     ) -> None:
         """Send final result with usage data from Claude SDK ResultMessage."""
         await self._send(
@@ -174,6 +177,7 @@ class SocketStreamWriter:
                 usage=usage,
                 num_turns=num_turns,
                 duration_ms=duration_ms,
+                output=output,
             )
         )
 

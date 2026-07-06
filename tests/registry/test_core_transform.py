@@ -1,11 +1,16 @@
 import asyncio
+import os
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
+import redis.asyncio as aioredis
 from tracecat_registry._internal.exceptions import TracecatExpressionError
+from tracecat_registry.context import clear_context, set_context
 from tracecat_registry.core.transform import (
     apply,
     deduplicate,
+    drop_nulls,
     eval_jsonpaths,
     filter,
     flatten_json,
@@ -13,6 +18,52 @@ from tracecat_registry.core.transform import (
     map,
     not_in,
 )
+
+
+@pytest.fixture(autouse=True)
+def deduplicate_workspace_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure deduplication tests have an explicit workspace scope by default."""
+    monkeypatch.setenv("TRACECAT__WORKSPACE_ID", "test-workspace")
+
+
+class _RedisDedupClient:
+    """Test helper: DeduplicateClient backed by real Redis (no API server needed)."""
+
+    def __init__(self, workspace_id: str) -> None:
+        self._workspace_id = workspace_id
+
+    async def create_digests(
+        self, digests: list[str], expire_seconds: int
+    ) -> list[bool]:
+        redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
+        client = aioredis.from_url(redis_url, decode_responses=True)
+        try:
+            created: list[bool] = []
+            for digest in digests:
+                key = f"dedup:{self._workspace_id}:{digest}"
+                was_set = await client.set(key, "1", ex=expire_seconds, nx=True)
+                created.append(bool(was_set))
+            return created
+        finally:
+            await client.aclose()
+
+
+@pytest.fixture(autouse=True)
+async def dedup_registry_context(deduplicate_workspace_scope: None) -> Any:
+    """Set a RegistryContext with a Redis-backed DeduplicateClient for tests.
+
+    Must be async so the contextvar is set in the same async task context
+    as the test (pytest-anyio runs async fixtures and tests in the same task).
+    The Redis connection is made lazily when create_digests is called,
+    so non-dedup tests don't require a running Redis instance.
+    """
+    workspace_id = os.environ.get("TRACECAT__WORKSPACE_ID", "test-workspace")
+    ctx = MagicMock()
+    ctx.workspace_id = workspace_id
+    ctx.deduplicate = _RedisDedupClient(workspace_id)
+    set_context(ctx)
+    yield
+    clear_context()
 
 
 @pytest.mark.parametrize(
@@ -155,6 +206,22 @@ def test_apply(input: Any, python_lambda: str, expected: Any) -> None:
 )
 def test_map(input: list[Any], python_lambda: str, expected: list[Any]) -> None:
     assert map(input, python_lambda) == expected
+
+
+@pytest.mark.parametrize(
+    "items,expected",
+    [
+        ([1, None, 2, "", 3], [1, 2, "", 3]),
+        ([None, "", None], [""]),
+        (["a", "b", "c"], ["a", "b", "c"]),
+    ],
+)
+def test_drop_nulls(items: list[Any], expected: list[Any]) -> None:
+    assert drop_nulls(items) == expected
+
+
+def test_drop_nulls_action_key() -> None:
+    assert getattr(drop_nulls, "__tracecat_udf_key") == "core.transform.drop_nulls"
 
 
 @pytest.mark.parametrize(
@@ -564,6 +631,48 @@ async def test_deduplicate_ttl_expiry(redis_server, clean_redis_db) -> None:
         pytest.skip("Redis not available")
 
 
+@pytest.mark.anyio
+async def test_deduplicate_is_scoped_by_workspace_id(
+    redis_server,
+    clean_redis_db,
+) -> None:
+    """Deduplication keys should be isolated between workspaces."""
+    payload = [{"id": 7, "value": "same-key"}]
+
+    try:
+        # Workspace A
+        ctx_a = MagicMock()
+        ctx_a.workspace_id = "workspace-a"
+        ctx_a.deduplicate = _RedisDedupClient("workspace-a")
+        set_context(ctx_a)
+
+        first_workspace_a = await deduplicate(payload, ["id"])
+        assert first_workspace_a == payload
+
+        second_workspace_a = await deduplicate(payload, ["id"])
+        assert second_workspace_a == []
+
+        # Workspace B — same digest should succeed (different scope)
+        ctx_b = MagicMock()
+        ctx_b.workspace_id = "workspace-b"
+        ctx_b.deduplicate = _RedisDedupClient("workspace-b")
+        set_context(ctx_b)
+
+        first_workspace_b = await deduplicate(payload, ["id"])
+        assert first_workspace_b == payload
+    except ConnectionError:
+        pytest.skip("Redis not available")
+
+
+@pytest.mark.anyio
+async def test_deduplicate_requires_registry_context() -> None:
+    """Deduplication should fail without a registry context."""
+    clear_context()
+
+    with pytest.raises(RuntimeError, match="No registry context is set"):
+        await deduplicate([{"id": 1}], ["id"])
+
+
 @pytest.mark.parametrize(
     "items,keys,error_type",
     [
@@ -706,29 +815,20 @@ async def test_deduplicate_complex_keys(
 
 
 @pytest.mark.anyio
-async def test_deduplicate_redis_operation_error(monkeypatch) -> None:
-    """Test that deduplicate raises ConnectionError on Redis operation failures."""
+async def test_deduplicate_sdk_error_propagates() -> None:
+    """Test that errors from the dedup SDK client propagate to the caller."""
 
-    # Mock redis.from_url to return a failing client
-    class MockRedisClient:
-        async def set(self, *args, **kwargs):
-            raise Exception("Redis SET failed")
+    class _FailingDedupClient:
+        async def create_digests(
+            self, digests: list[str], expire_seconds: int
+        ) -> list[bool]:
+            raise ConnectionError("Deduplication service temporarily unavailable")
 
-        async def aclose(self):
-            pass
+    ctx = MagicMock()
+    ctx.deduplicate = _FailingDedupClient()
+    set_context(ctx)
 
-        def pipeline(self, *args, **kwargs):
-            return self
-
-    def mock_from_url(*args, **kwargs):
-        return MockRedisClient()
-
-    # Import redis.asyncio within the function to patch it
-    import redis.asyncio as redis
-
-    monkeypatch.setattr(redis, "from_url", mock_from_url)
-
-    with pytest.raises(ConnectionError, match="key-value store.*"):
+    with pytest.raises(ConnectionError, match="temporarily unavailable"):
         await deduplicate([{"id": 1}], ["id"])
 
 

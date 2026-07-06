@@ -31,6 +31,10 @@ class TracecatValidationError(TracecatException):
     """Tracecat user-facing validation error"""
 
 
+class TracecatConflictError(TracecatException):
+    """Tracecat user-facing resource conflict error"""
+
+
 class TracecatDSLError(TracecatValidationError):
     """Tracecat user-facing DSL error"""
 
@@ -51,6 +55,62 @@ class TracecatAuthorizationError(TracecatException):
     """Tracecat user-facing authorization error"""
 
 
+class ScopeDeniedError(TracecatAuthorizationError):
+    """Raised when a user lacks required scopes for an operation.
+
+    This exception provides detailed information about which scopes were
+    required and which were missing, enabling proper 403 responses with
+    machine-readable error details.
+    """
+
+    def __init__(
+        self,
+        required_scopes: list[str],
+        missing_scopes: list[str],
+        message: str | None = None,
+    ):
+        self.required_scopes = required_scopes
+        self.missing_scopes = missing_scopes
+        default_message = "You don't have permission to perform this action."
+        super().__init__(
+            message or default_message,
+            detail={
+                "code": "insufficient_scope",
+                "required_scopes": required_scopes,
+                "missing_scopes": missing_scopes,
+            },
+        )
+
+
+class TracecatRLSViolationError(TracecatAuthorizationError):
+    """Raised when Row-Level Security blocks access to a resource.
+
+    This exception indicates that the current user's context (org/workspace)
+    does not have permission to access the requested database record.
+    """
+
+    def __init__(
+        self,
+        *args,
+        table: str,
+        operation: str,
+        org_id: str | None = None,
+        workspace_id: str | None = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.table = table
+        self.operation = operation
+        self.org_id = org_id
+        self.workspace_id = workspace_id
+        self.detail = {
+            "table": table,
+            "operation": operation,
+            "org_id": org_id,
+            "workspace_id": workspace_id,
+        }
+
+
 class TracecatManagementError(TracecatException):
     """Tracecat user-facing management error"""
 
@@ -65,6 +125,10 @@ class TracecatServiceError(TracecatException):
 
 class RegistryError(TracecatException):
     """Generic exception raised when a registry error occurs."""
+
+
+class BuiltinRegistryHasNoSelectionError(RegistryError):
+    """Raised when the builtin platform registry has no selected version yet."""
 
 
 class RegistryActionError(RegistryError):
@@ -195,12 +259,42 @@ class PayloadSizeExceeded(TracecatException):
 
 
 class EntitlementRequired(TracecatException):
-    """Exception raised when a feature requires a higher subscription tier.
+    """Exception raised when a feature requires an upgraded plan.
 
     Raised when an organization attempts to use a feature they are not entitled to.
     """
 
-    def __init__(self, entitlement: str):
+    def __init__(
+        self,
+        entitlement: str,
+        *,
+        unavailable_actions: list[str] | None = None,
+        unavailable_origins: list[str] | None = None,
+    ):
+        def _format_bulleted_preview(items: list[str], *, limit: int = 5) -> str:
+            shown = items[:limit]
+            lines = [f"- {item}" for item in shown]
+            if len(items) > limit:
+                lines.append(f"- +{len(items) - limit} more")
+            return "\n".join(lines)
+
         self.entitlement = entitlement
-        message = f"Feature '{entitlement}' requires a higher subscription tier"
-        super().__init__(message, detail={"entitlement": entitlement})
+        message = f"Feature '{entitlement}' requires an upgraded plan."
+        detail: dict[str, object] = {"entitlement": entitlement}
+
+        if unavailable_actions:
+            unique_actions = list(dict.fromkeys(unavailable_actions))
+            detail["unavailable_actions"] = unique_actions
+            message += (
+                "\n\nUnavailable actions on your current plan:\n"
+                f"{_format_bulleted_preview(unique_actions)}"
+            )
+
+        if unavailable_origins:
+            unique_origins = list(dict.fromkeys(unavailable_origins))
+            # Origins can include sensitive repository details; keep only a count.
+            detail["unavailable_origin_count"] = len(unique_origins)
+            if not unavailable_actions:
+                message += "\n\nSome actions are unavailable on your current plan."
+
+        super().__init__(message, detail=detail)

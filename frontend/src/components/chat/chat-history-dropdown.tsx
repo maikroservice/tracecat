@@ -5,6 +5,7 @@ import { Check, ChevronDown, Loader2 } from "lucide-react"
 import { useState } from "react"
 
 import type { AgentSessionsListSessionsResponse } from "@/client"
+import { ChatLastErrorIndicator } from "@/components/chat/chat-last-error-indicator"
 import { Button } from "@/components/ui/button"
 import {
   Command,
@@ -26,6 +27,7 @@ interface ChatHistoryDropdownProps {
   error: unknown
   selectedChatId: string | undefined
   onSelectChat: (chatId: string) => void
+  align?: "start" | "center" | "end"
 }
 
 export function ChatHistoryDropdown({
@@ -34,12 +36,20 @@ export function ChatHistoryDropdown({
   error,
   selectedChatId,
   onSelectChat,
+  align = "start",
 }: ChatHistoryDropdownProps) {
   const [open, setOpen] = useState(false)
 
   const handleSelect = (chatId: string) => {
     onSelectChat(chatId)
     setOpen(false)
+  }
+
+  // Hide the selector entirely when there is no chat history — an empty
+  // dropdown is just noise. Still render while loading or on error so those
+  // states aren't silently swallowed.
+  if (!isLoading && !error && (chats?.length ?? 0) === 0) {
+    return null
   }
 
   return (
@@ -52,11 +62,11 @@ export function ChatHistoryDropdown({
           role="combobox"
           aria-expanded={open}
         >
-          Conversations
+          Chats
           <ChevronDown className="ml-1 size-3" />
         </Button>
       </PopoverTrigger>
-      <PopoverContent align="start" className="w-64 p-0">
+      <PopoverContent align={align} className="w-64 p-0">
         {isLoading ? (
           <div className="flex items-center gap-2 p-3 text-sm text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" />
@@ -65,22 +75,46 @@ export function ChatHistoryDropdown({
         ) : error ? (
           <div className="p-3 text-sm text-red-600">Failed to load chats</div>
         ) : (
-          <Command>
-            <CommandInput placeholder="Search chats..." className="h-9" />
+          <Command
+            filter={(value, search) => {
+              const chat = chats?.find((item) => item.id === value)
+              if (!chat) {
+                return 0
+              }
+
+              const normalizedSearch = search.trim().toLowerCase()
+              if (!normalizedSearch) {
+                return 1
+              }
+
+              return `${chat.title} ${chat.id}`
+                .toLowerCase()
+                .includes(normalizedSearch)
+                ? 1
+                : 0
+            }}
+          >
+            <CommandInput
+              placeholder="Search chats..."
+              className="h-8 text-xs"
+            />
             <CommandList className="max-h-64 overflow-y-auto">
-              <CommandEmpty>No chats found.</CommandEmpty>
+              <CommandEmpty className="text-xs">No chats found.</CommandEmpty>
               <CommandGroup>
                 {chats?.map((chat) => (
                   <CommandItem
                     key={chat.id}
-                    value={chat.title}
+                    value={chat.id}
                     onSelect={() => handleSelect(chat.id)}
-                    className="flex items-start justify-between gap-2 py-2"
+                    className="flex items-start justify-between gap-2 py-2 text-xs"
                   >
                     <div className="flex min-w-0 flex-col">
-                      <span className="truncate text-sm font-medium">
-                        {chat.title}
-                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <span className="truncate font-medium">
+                          {chat.title}
+                        </span>
+                        <ChatLastErrorIndicator session={chat} />
+                      </div>
                       <span className="text-xs text-muted-foreground">
                         {formatDistanceToNow(new Date(chat.created_at), {
                           addSuffix: true,

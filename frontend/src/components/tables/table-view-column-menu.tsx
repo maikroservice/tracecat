@@ -5,11 +5,13 @@ import {
   CopyIcon,
   DatabaseZapIcon,
   Trash2Icon,
+  UnlinkIcon,
 } from "lucide-react"
 import { useParams } from "next/navigation"
 import { useState } from "react"
 import { z } from "zod"
 import type { TableColumnRead } from "@/client"
+import { useScopeCheck } from "@/components/auth/scope-guard"
 import { Spinner } from "@/components/loading/spinner"
 import {
   AlertDialog,
@@ -30,15 +32,20 @@ import {
 } from "@/components/ui/dropdown-menu"
 import { Input } from "@/components/ui/input"
 import { toast } from "@/components/ui/use-toast"
-import { useAuth } from "@/hooks/use-auth"
 import { useDeleteColumn, useUpdateColumn } from "@/lib/hooks"
 import { SqlTypeCreatableEnum } from "@/lib/tables"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
-type TableViewColumnMenuType = "delete" | "edit" | "set-natural-key" | null
+type TableViewColumnMenuType =
+  | "delete"
+  | "edit"
+  | "set-natural-key"
+  | "drop-natural-key"
+  | null
 
 export function TableViewColumnMenu({ column }: { column: TableColumnRead }) {
-  const { user } = useAuth()
+  const canUpdateTable = useScopeCheck("table:update")
+  const canDeleteColumn = useScopeCheck("table:delete")
   const params = useParams<{ tableId?: string }>()
   const tableId = params?.tableId
   const [activeType, setActiveType] = useState<TableViewColumnMenuType>(null)
@@ -74,30 +81,41 @@ export function TableViewColumnMenu({ column }: { column: TableColumnRead }) {
             <CopyIcon className="mr-2 size-3 group-hover/item:text-accent-foreground" />
             Copy name
           </DropdownMenuItem>
-          {user?.isPrivileged() && (
-            <>
+          {canUpdateTable &&
+            (column.is_index ? (
+              <DropdownMenuItem
+                className="py-1 text-xs text-foreground/80"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setActiveType("drop-natural-key")
+                }}
+              >
+                <UnlinkIcon className="mr-2 size-3 group-hover/item:text-accent-foreground" />
+                Remove unique index
+              </DropdownMenuItem>
+            ) : (
               <DropdownMenuItem
                 className="py-1 text-xs text-foreground/80"
                 onClick={(e) => {
                   e.stopPropagation()
                   setActiveType("set-natural-key")
                 }}
-                disabled={column.is_index}
               >
                 <DatabaseZapIcon className="mr-2 size-3 group-hover/item:text-accent-foreground" />
-                {column.is_index ? "Unique index" : "Create unique index"}
+                Create unique index
               </DropdownMenuItem>
-              <DropdownMenuItem
-                className="py-1 text-xs text-destructive"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  setActiveType("delete")
-                }}
-              >
-                <Trash2Icon className="mr-2 size-3 group-hover/item:text-destructive" />
-                Delete column
-              </DropdownMenuItem>
-            </>
+            ))}
+          {canDeleteColumn && (
+            <DropdownMenuItem
+              className="py-1 text-xs text-destructive"
+              onClick={(e) => {
+                e.stopPropagation()
+                setActiveType("delete")
+              }}
+            >
+              <Trash2Icon className="mr-2 size-3 group-hover/item:text-destructive" />
+              Delete column
+            </DropdownMenuItem>
           )}
         </DropdownMenuContent>
       </DropdownMenu>
@@ -111,6 +129,12 @@ export function TableViewColumnMenu({ column }: { column: TableColumnRead }) {
         tableId={tableId}
         column={column}
         open={activeType === "set-natural-key"}
+        onOpenChange={onOpenChange}
+      />
+      <TableColumnDropIndexDialog
+        tableId={tableId}
+        column={column}
+        open={activeType === "drop-natural-key"}
         onOpenChange={onOpenChange}
       />
     </>
@@ -283,7 +307,7 @@ function TableColumnIndexDialog({
             <strong>Requirements:</strong>
             <ul className="mt-2 list-disc pl-5 text-xs">
               <li>All values in the column must be unique</li>
-              <li>This cannot be undone except by recreating the column</li>
+              <li>Only one unique index is allowed per table</li>
             </ul>
           </AlertDialogDescription>
         </AlertDialogHeader>
@@ -304,6 +328,92 @@ function TableColumnIndexDialog({
               <>
                 <DatabaseZapIcon className="mr-2 size-4" />
                 Create unique index
+              </>
+            )}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  )
+}
+
+function TableColumnDropIndexDialog({
+  tableId,
+  column,
+  open,
+  onOpenChange,
+}: {
+  tableId?: string
+  column: TableColumnRead
+  open: boolean
+  onOpenChange: () => void
+}) {
+  const workspaceId = useWorkspaceId()
+  const { updateColumn, updateColumnIsPending } = useUpdateColumn()
+
+  if (!tableId || !workspaceId) {
+    return null
+  }
+
+  const handleDropIndex = async () => {
+    try {
+      await updateColumn({
+        tableId,
+        columnId: column.id,
+        workspaceId,
+        requestBody: { is_index: false },
+      })
+
+      toast({
+        title: "Removed unique index",
+        description: "Column is no longer a unique index.",
+      })
+
+      onOpenChange()
+    } catch (error) {
+      console.error("Error removing unique index:", error)
+    }
+  }
+
+  return (
+    <AlertDialog
+      open={open}
+      onOpenChange={() => {
+        if (!updateColumnIsPending) {
+          onOpenChange()
+        }
+      }}
+    >
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Remove unique index</AlertDialogTitle>
+          <AlertDialogDescription>
+            Are you sure you want to remove the unique index from column{" "}
+            <b>{column.name}</b>?
+            <br />
+            <br />
+            Upsert operations that rely on this column as the conflict key will
+            stop working until a new unique index is created on another column.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel disabled={updateColumnIsPending}>
+            Cancel
+          </AlertDialogCancel>
+          <AlertDialogAction
+            onClick={handleDropIndex}
+            disabled={updateColumnIsPending}
+            variant="destructive"
+          >
+            {updateColumnIsPending ? (
+              <>
+                <Spinner />
+                Removing...
+              </>
+            ) : (
+              <>
+                <UnlinkIcon className="mr-2 size-4" />
+                Remove unique index
               </>
             )}
           </AlertDialogAction>

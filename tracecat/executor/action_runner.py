@@ -1,47 +1,52 @@
 """Action runner for subprocess-based execution (untrusted mode).
 
 This module provides the ActionRunner class that executes registry actions
-in isolated subprocesses with tarball venv caching.
+in isolated subprocesses with registry artifact caching.
 
 All execution is untrusted - DB credentials are never passed to subprocesses.
 Secrets and variables are pre-resolved on the host.
 
 Key features:
-- Tarball extraction: Downloads and extracts pre-built venv tarballs from S3
-- Caching: Reuses extracted tarballs by cache key for fast subsequent runs
+- Registry artifacts: Materializes pre-built registry environments from S3
+- Caching: Reuses materialized environments by cache key for fast subsequent runs
 - Subprocess execution: Runs actions via minimal_runner.py
 - nsjail sandboxing: Optional OS-level isolation with resource limits
-- Timeout handling: Kills subprocess on timeout
+- Timeout handling: Kills subprocess on timeouts
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
 import shutil
 import sys
-import tarfile
 import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlparse
 
-import httpx
 import orjson
 from pydantic_core import to_json
 
 from tracecat import config
 from tracecat.auth.executor_tokens import mint_executor_token
+from tracecat.executor.action_gateway.config import (
+    ACTION_GATEWAY_SANDBOX_SOCKET,
+    action_gateway_socket_path,
+)
+from tracecat.executor.registry_artifacts import RegistryArtifactCache
 from tracecat.executor.schemas import (
     ExecutorActionErrorInfo,
     ResolvedContext,
 )
+from tracecat.executor.secret_preprocessors import (
+    SecretEnvProjection,
+    project_secret_env,
+)
 from tracecat.logger import logger
 from tracecat.sandbox.executor import ActionSandboxConfig, NsjailExecutor
 from tracecat.sandbox.types import ResourceLimits
-from tracecat.storage import blob
+from tracecat.secrets.common import apply_masks, apply_masks_object
 
 if TYPE_CHECKING:
     from tracecat.auth.types import Role
@@ -103,198 +108,80 @@ def _is_sandbox_available() -> bool:
     return True
 
 
-def _parse_s3_uri(uri: str) -> tuple[str, str]:
-    """Parse an s3://bucket/key URI into (bucket, key)."""
-    if not uri.startswith("s3://"):
-        raise ValueError(f"Invalid S3 URI: {uri}")
-    rest = uri.removeprefix("s3://")
-    bucket, _, key = rest.partition("/")
-    if not bucket or not key:
-        raise ValueError(f"Invalid S3 URI: {uri}")
-    return bucket, key
+def _direct_subprocess_command(minimal_runner_path: Path) -> list[str]:
+    """Build the direct action subprocess command with new privileges disabled."""
+    runner_command = [sys.executable, str(minimal_runner_path)]
+    if sys.platform != "linux":
+        return runner_command
+
+    setpriv = shutil.which("setpriv")
+    if setpriv is None:
+        raise RuntimeError("setpriv is required for direct action subprocess isolation")
+
+    return [
+        setpriv,
+        "--no-new-privs",
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        *runner_command,
+    ]
 
 
 class ActionRunner:
-    """Runs registry actions in subprocesses with tarball venv caching.
+    """Runs registry actions in subprocesses with registry artifact caching.
 
     This runner:
-    1. Computes a cache key from the tarball URI
-    2. Downloads and extracts tarballs to a cached target directory
+    1. Materializes registry artifact URIs to cached Python paths
+    2. Builds subprocess or sandbox execution environments
     3. Executes the action in a subprocess with PYTHONPATH set
     4. Returns the result or error
     """
 
     def __init__(self, cache_dir: Path | None = None):
         self.cache_dir = cache_dir or Path(config.TRACECAT__EXECUTOR_REGISTRY_CACHE_DIR)
-        # Per-cache-key locks to prevent duplicate downloads in async context
-        self._extraction_locks: dict[str, asyncio.Lock] = {}
-        self._locks_lock = asyncio.Lock()  # Protects _extraction_locks dict
+        self.registry_artifacts = RegistryArtifactCache(self.cache_dir)
         logger.info("ActionRunner initialized", cache_dir=str(self.cache_dir))
 
-    async def _get_extraction_lock(self, cache_key: str) -> asyncio.Lock:
-        """Get or create a lock for the given cache key.
+    async def ensure_registry_environment(self, artifact_uri: str | None) -> list[Path]:
+        """Ensure the registry environment is set up and return PYTHONPATH entries.
 
-        This prevents multiple concurrent async tasks from downloading
-        the same tarball simultaneously.
-        """
-        async with self._locks_lock:
-            if cache_key not in self._extraction_locks:
-                self._extraction_locks[cache_key] = asyncio.Lock()
-            return self._extraction_locks[cache_key]
-
-    async def _tarball_uri_to_http_url(self, s3_uri: str) -> str:
-        """Convert S3 URI to presigned HTTP URL for tarball download."""
-        bucket, key = _parse_s3_uri(s3_uri)
-        url = await blob.generate_presigned_download_url(
-            key=key,
-            bucket=bucket,
-            expiry=3600,
-            force_download=False,
-        )
-        logger.debug("Generated presigned URL for tarball", s3_uri=s3_uri)
-        return url
-
-    def compute_tarball_cache_key(self, tarball_uri: str) -> str:
-        """Compute cache key from tarball URI."""
-        if not tarball_uri:
-            return "base"
-        # Don't lowercase - S3 keys are case-sensitive, lowercasing could cause collisions
-        content = tarball_uri.strip()
-        return hashlib.sha256(content.encode()).hexdigest()[:16]
-
-    async def ensure_registry_environment(self, tarball_uri: str | None) -> Path | None:
-        """Ensure the registry environment is set up and return the PYTHONPATH.
-
-        This is the public API for pool workers to get the path to add to PYTHONPATH.
+        This is the public API for pool workers to get the paths to add to PYTHONPATH.
 
         Args:
-            tarball_uri: S3 URI to the pre-built tarball venv.
+            artifact_uri: S3 URI to the registry execution artifact.
 
         Returns:
-            Path to add to PYTHONPATH, or None if no tarball available.
+            Paths to add to PYTHONPATH (empty if no artifact is available).
         """
-        if not tarball_uri:
-            return None
-        cache_key = self.compute_tarball_cache_key(tarball_uri)
-        return await self.ensure_tarball_extracted(cache_key, tarball_uri)
+        return await self.registry_artifacts.ensure_environment(artifact_uri)
 
-    async def ensure_tarball_extracted(self, cache_key: str, tarball_uri: str) -> Path:
-        """Ensure tarball is extracted to a target directory.
-
-        Uses per-cache-key locking to prevent duplicate downloads from
-        concurrent async tasks. Falls back to atomic rename pattern for
-        cross-process coordination (e.g., multiple worker pods).
-
-        Returns the path to the extracted directory (add to PYTHONPATH).
-        """
-        target_dir = self.cache_dir / f"tarball-{cache_key}"
-
-        # Fast path: already extracted (no lock needed for read check)
-        if target_dir.exists():
-            logger.debug("Using cached tarball extraction", cache_key=cache_key)
-            return target_dir
-
-        # Acquire per-cache-key lock to prevent duplicate downloads
-        lock = await self._get_extraction_lock(cache_key)
-        async with lock:
-            # Double-check after acquiring lock (another task may have finished)
-            if target_dir.exists():
-                logger.debug(
-                    "Tarball extracted by another task while waiting",
-                    cache_key=cache_key,
+    async def resolve_registry_paths(
+        self, artifact_uris: list[str] | None = None
+    ) -> list[Path]:
+        """Materialize registry artifacts and return importable Python paths."""
+        registry_paths: list[Path] = []
+        if artifact_uris:
+            for artifact_uri in artifact_uris:
+                registry_paths.extend(
+                    await self.ensure_registry_environment(artifact_uri)
                 )
-                return target_dir
-
-            logger.info("Downloading and extracting tarball", cache_key=cache_key)
-            start_time = time.monotonic()
-
-            # Use PID + unique ID in temp names to avoid conflicts
-            # PID handles cross-process conflicts, unique_id handles concurrent async tasks
-            unique_id = id(asyncio.current_task())
-            temp_tarball = (
-                self.cache_dir / f"{cache_key}.{os.getpid()}.{unique_id}.tar.gz"
+            logger.info(
+                "Using registry artifact environments",
+                count=len(registry_paths),
             )
-            temp_dir = self.cache_dir / f"{cache_key}.{os.getpid()}.{unique_id}.tmp"
+            return registry_paths
 
-            try:
-                # Create cache dir if needed
-                self.cache_dir.mkdir(parents=True, exist_ok=True)
-
-                # Download tarball
-                download_start = time.monotonic()
-                http_url = await self._tarball_uri_to_http_url(tarball_uri)
-                await self._download_file(http_url, temp_tarball)
-                download_elapsed = (time.monotonic() - download_start) * 1000
-
-                # Extract tarball
-                extract_start = time.monotonic()
-                temp_dir.mkdir(parents=True, exist_ok=True)
-                await self._extract_tarball(temp_tarball, temp_dir)
-                extract_elapsed = (time.monotonic() - extract_start) * 1000
-
-                # Atomic rename - if another process won the race, this fails
-                try:
-                    temp_dir.rename(target_dir)
-                    total_elapsed = (time.monotonic() - start_time) * 1000
-                    logger.info(
-                        "Tarball extracted and cached",
-                        cache_key=cache_key,
-                        download_ms=f"{download_elapsed:.1f}",
-                        extract_ms=f"{extract_elapsed:.1f}",
-                        total_ms=f"{total_elapsed:.1f}",
-                    )
-                except OSError:
-                    # Another process already created target_dir - that's fine
-                    if target_dir.exists():
-                        logger.debug(
-                            "Tarball already extracted by another process",
-                            cache_key=cache_key,
-                        )
-                    else:
-                        raise
-            finally:
-                # Clean up temp files
-                if temp_dir.exists():
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-                if temp_tarball.exists():
-                    temp_tarball.unlink(missing_ok=True)
-
-            return target_dir
-
-    async def _download_file(self, url: str, output_path: Path) -> None:
-        """Download a file from HTTP URL to local path."""
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            output_path.write_bytes(response.content)
-
-        # Log only the path portion to avoid leaking presigned URL signatures
-        parsed = urlparse(url)
-        safe_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-        logger.debug(
-            "File downloaded",
-            url=safe_url[:80],
-            size_bytes=output_path.stat().st_size,
-        )
-
-    async def _extract_tarball(self, tarball_path: Path, target_dir: Path) -> None:
-        """Extract a gzipped tarball to target directory."""
-
-        def _do_extract() -> None:
-            with tarfile.open(tarball_path, "r:gz") as tar:
-                # Extract all contents to target directory
-                # Use filter='data' to prevent path traversal attacks (CVE-2007-4559)
-                tar.extractall(path=target_dir, filter="data")
-
-        await asyncio.to_thread(_do_extract)
-        logger.debug("Tarball extracted", target=str(target_dir))
+        base_dir = self.cache_dir / "base"
+        base_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("No registry artifact URIs provided, using base PYTHONPATH")
+        return [base_dir]
 
     async def execute_action(
         self,
         input: RunActionInput,
         role: Role,
         resolved_context: ResolvedContext,
-        tarball_uris: list[str] | None = None,
+        artifact_uris: list[str] | None = None,
         env_vars: dict[str, str] | None = None,
         timeout: float | None = None,
         force_sandbox: bool = False,
@@ -307,7 +194,7 @@ class ActionRunner:
         Args:
             input: The RunActionInput containing task and context
             role: The Role for authorization
-            tarball_uris: List of S3 URIs to pre-built tarball venvs (deterministic order)
+            artifact_uris: List of registry artifact S3 URIs (deterministic order)
             env_vars: Additional environment variables for the subprocess
             timeout: Execution timeout in seconds
             force_sandbox: If True, always use nsjail sandbox regardless of config
@@ -319,23 +206,8 @@ class ActionRunner:
         """
         timeout = timeout or config.TRACECAT__EXECUTOR_CLIENT_TIMEOUT
 
-        # Download and extract each tarball venv, collect paths in deterministic order
-        registry_paths: list[Path] = []
-        if tarball_uris:
-            for tarball_uri in tarball_uris:
-                cache_key = self.compute_tarball_cache_key(tarball_uri)
-                target_dir = await self.ensure_tarball_extracted(cache_key, tarball_uri)
-                registry_paths.append(target_dir)
-            logger.info(
-                "Using tarball venvs",
-                count=len(registry_paths),
-            )
-        else:
-            # No tarballs available - use empty base dir
-            base_dir = self.cache_dir / "base"
-            base_dir.mkdir(parents=True, exist_ok=True)
-            registry_paths = [base_dir]
-            logger.info("No tarball URIs provided, using base PYTHONPATH")
+        # Materialize each registry artifact, collect paths in deterministic order.
+        registry_paths = await self.resolve_registry_paths(artifact_uris)
 
         # Check if sandbox execution is enabled and available
         # force_sandbox=True overrides config (used by ephemeral backend)
@@ -348,11 +220,20 @@ class ActionRunner:
             force_sandbox=force_sandbox,
         )
 
+        secret_projection = resolved_context.secret_projection
+        if secret_projection is None:
+            secret_projection = await project_secret_env(
+                secrets=resolved_context.secrets,
+                role=role,
+                run_context=input.run_context,
+            )
+
         if use_sandbox:
             return await self._execute_sandboxed(
                 input=input,
                 role=role,
                 registry_paths=registry_paths,
+                secret_projection=secret_projection,
                 env_vars=env_vars,
                 timeout=timeout,
                 resolved_context=resolved_context,
@@ -362,6 +243,7 @@ class ActionRunner:
                 input=input,
                 role=role,
                 registry_paths=registry_paths,
+                secret_projection=secret_projection,
                 env_vars=env_vars,
                 timeout=timeout,
                 resolved_context=resolved_context,
@@ -372,6 +254,7 @@ class ActionRunner:
         input: RunActionInput,
         role: Role,
         registry_paths: list[Path],
+        secret_projection: SecretEnvProjection,
         resolved_context: ResolvedContext,
         env_vars: dict[str, str] | None = None,
         timeout: float | None = None,
@@ -400,6 +283,7 @@ class ActionRunner:
                 "input": input,
                 "role": role,
                 "resolved_context": resolved_context,
+                "secret_env": secret_projection.env,
             }
 
             # Write input JSON to job directory
@@ -429,6 +313,13 @@ class ActionRunner:
             sandbox_env["TRACECAT__RUN_ID"] = str(input.run_context.wf_run_id)
             sandbox_env["TRACECAT__WF_EXEC_ID"] = str(input.run_context.wf_exec_id)
             sandbox_env["TRACECAT__ENVIRONMENT"] = input.run_context.environment
+            action_gateway_socket = action_gateway_socket_path()
+            if action_gateway_socket is not None:
+                sandbox_env["TRACECAT__ACTION_GATEWAY_SOCKET"] = str(
+                    ACTION_GATEWAY_SANDBOX_SOCKET
+                )
+            else:
+                sandbox_env.pop("TRACECAT__ACTION_GATEWAY_SOCKET", None)
 
             # Mint an executor token for SDK calls
             if role.workspace_id is None:
@@ -436,12 +327,11 @@ class ActionRunner:
             executor_token = mint_executor_token(
                 workspace_id=role.workspace_id,
                 user_id=role.user_id,
+                service_id=role.service_id,
                 wf_id=str(input.run_context.wf_id),
                 wf_exec_id=str(input.run_context.wf_run_id),
             )
             sandbox_env["TRACECAT__EXECUTOR_TOKEN"] = executor_token
-            # Only forward sandbox-safe feature flags (not EE flags like case-tasks)
-            sandbox_env["TRACECAT__FEATURE_FLAGS"] = "registry-client"
 
             logger.debug(
                 "Using untrusted mode - no DB credentials passed to sandbox",
@@ -454,6 +344,8 @@ class ActionRunner:
                 tracecat_app_dir=_get_tracecat_app_dir(),
                 site_packages_dir=_get_site_packages_dir(),
                 env_vars=sandbox_env,
+                action_gateway_socket=action_gateway_socket,
+                action_gateway_socket_mount_path=ACTION_GATEWAY_SANDBOX_SOCKET,
                 resources=ResourceLimits(
                     memory_mb=config.TRACECAT__SANDBOX_DEFAULT_MEMORY_MB,
                     timeout_seconds=int(timeout),
@@ -487,12 +379,15 @@ class ActionRunner:
 
             # Handle error from sandbox
             if result.error:
+                masked_error = apply_masks_object(
+                    result.error, masks=secret_projection.mask_values
+                )
                 # Try to parse as ExecutorActionErrorInfo
-                if isinstance(result.error, dict):
-                    return ExecutorActionErrorInfo.model_validate(result.error)
+                if isinstance(masked_error, dict):
+                    return ExecutorActionErrorInfo.model_validate(masked_error)
                 return ExecutorActionErrorInfo(
                     type="SandboxError",
-                    message=str(result.error),
+                    message=str(masked_error),
                     action_name=input.task.action,
                     filename="<sandbox>",
                     function="execute_action",
@@ -515,6 +410,7 @@ class ActionRunner:
         input: RunActionInput,
         role: Role,
         registry_paths: list[Path],
+        secret_projection: SecretEnvProjection,
         env_vars: dict[str, str] | None = None,
         timeout: float | None = None,
         resolved_context: ResolvedContext | None = None,
@@ -526,12 +422,27 @@ class ActionRunner:
         payload: dict[str, Any] = {"input": input, "role": role}
         if resolved_context is not None:
             payload["resolved_context"] = resolved_context
+            payload["secret_env"] = secret_projection.env
         input_json = to_json(payload)
 
         # Build environment with registry paths in PYTHONPATH
         env = os.environ.copy()
         if env_vars:
             env.update(env_vars)
+
+        # Ensure SDK context is available for registry actions executed by minimal_runner.
+        if resolved_context is not None:
+            env["TRACECAT__API_URL"] = config.TRACECAT__API_URL
+            env["TRACECAT__WORKSPACE_ID"] = resolved_context.workspace_id
+            env["TRACECAT__WORKFLOW_ID"] = resolved_context.workflow_id
+            env["TRACECAT__RUN_ID"] = resolved_context.run_id
+            env["TRACECAT__WF_EXEC_ID"] = str(input.run_context.wf_exec_id)
+            env["TRACECAT__ENVIRONMENT"] = input.run_context.environment
+            env["TRACECAT__EXECUTOR_TOKEN"] = resolved_context.executor_token
+            if socket_path := action_gateway_socket_path():
+                env["TRACECAT__ACTION_GATEWAY_SOCKET"] = str(socket_path)
+            else:
+                env.pop("TRACECAT__ACTION_GATEWAY_SOCKET", None)
 
         # Build PYTHONPATH with multiple registry paths (deterministic order)
         pythonpath_parts = [str(p) for p in registry_paths if p.exists()]
@@ -544,6 +455,17 @@ class ActionRunner:
         from tracecat.executor import minimal_runner as minimal_runner_module
 
         minimal_runner_path = Path(minimal_runner_module.__file__)
+        try:
+            command = _direct_subprocess_command(minimal_runner_path)
+        except RuntimeError as e:
+            logger.error("Failed to prepare direct action subprocess", error=str(e))
+            return ExecutorActionErrorInfo(
+                type="SubprocessError",
+                message=str(e),
+                action_name=input.task.action,
+                filename="<subprocess>",
+                function="execute_action",
+            )
 
         logger.debug(
             "Executing action in subprocess",
@@ -553,8 +475,7 @@ class ActionRunner:
 
         start_time = time.monotonic()
         proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            str(minimal_runner_path),
+            *command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -591,7 +512,10 @@ class ActionRunner:
 
         # Check for subprocess crash
         if proc.returncode != 0:
-            stderr_text = stderr.decode()
+            stderr_text = apply_masks(
+                stderr.decode(errors="replace"),
+                masks=secret_projection.mask_values,
+            )
             logger.error(
                 "Subprocess failed",
                 action=input.task.action,
@@ -631,7 +555,9 @@ class ActionRunner:
         # Reconstruct error info
         error_data = result_data.get("error")
         if error_data:
-            return ExecutorActionErrorInfo.model_validate(error_data)
+            return ExecutorActionErrorInfo.model_validate(
+                apply_masks_object(error_data, masks=secret_projection.mask_values)
+            )
 
         return ExecutorActionErrorInfo(
             type="UnknownError",

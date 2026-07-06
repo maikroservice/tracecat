@@ -19,6 +19,15 @@
   font-size: 0.875rem;
   line-height: 1.6;
   color: hsl(var(--foreground));
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.case-description-editor--compact
+  .case-description-editor
+  .simple-editor-content
+  .simple-editor {
+  min-height: 160px;
 }
 
 .case-description-editor {
@@ -32,7 +41,7 @@
   position: sticky;
   top: 0;
   z-index: 5;
-  --simple-editor-toolbar-gap: 1rem;
+  --simple-editor-toolbar-gap: 0.25rem;
   background: transparent;
 }
 

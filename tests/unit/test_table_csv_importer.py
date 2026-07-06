@@ -1,5 +1,8 @@
 """Unit tests for the CSVImporter class."""
 
+from collections.abc import Mapping
+from decimal import Decimal
+from typing import cast
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
@@ -81,8 +84,8 @@ class TestCSVImporter:
     def test_convert_value_empty(self, csv_importer: CSVImporter) -> None:
         """Test convert_value with empty values."""
         assert csv_importer.convert_value("", SqlType.TEXT) == ""
-        assert csv_importer.convert_value("", SqlType.INTEGER) == ""
-        assert csv_importer.convert_value("", SqlType.BOOLEAN) == ""
+        assert csv_importer.convert_value("", SqlType.INTEGER) is None
+        assert csv_importer.convert_value("", SqlType.BOOLEAN) is None
 
     def test_convert_value_text(self, csv_importer: CSVImporter) -> None:
         """Test convert_value with text values."""
@@ -99,8 +102,12 @@ class TestCSVImporter:
 
     def test_convert_value_numeric(self, csv_importer: CSVImporter) -> None:
         """Test convert_value with numeric values."""
-        assert csv_importer.convert_value("123.45", SqlType.NUMERIC) == 123.45
-        assert csv_importer.convert_value("-456.78", SqlType.NUMERIC) == -456.78
+        assert csv_importer.convert_value("123.45", SqlType.NUMERIC) == Decimal(
+            "123.45"
+        )
+        assert csv_importer.convert_value("-456.78", SqlType.NUMERIC) == Decimal(
+            "-456.78"
+        )
         with pytest.raises(
             TypeError, match="Cannot convert value 'abc' to SqlType NUMERIC"
         ):
@@ -164,9 +171,34 @@ class TestCSVImporter:
 
         assert mapped_row == {
             "name": "",
-            "age": "",
-            "active": "",
-            "score": "",
+            "age": None,
+            "active": None,
+            "score": None,
+        }
+
+    def test_map_row_strips_non_text_values(self, csv_importer: CSVImporter) -> None:
+        """Test mapping trims whitespace for non-text columns."""
+        csv_row = {
+            "csv_name": "  John Doe  ",
+            "csv_age": " 30 ",
+            "csv_active": " true ",
+            "csv_score": " 95.5 ",
+        }
+
+        column_mapping = {
+            "csv_name": "name",
+            "csv_age": "age",
+            "csv_active": "active",
+            "csv_score": "score",
+        }
+
+        mapped_row = csv_importer.map_row(csv_row, column_mapping)
+
+        assert mapped_row == {
+            "name": "  John Doe  ",
+            "age": 30,
+            "active": True,
+            "score": 95.5,
         }
 
     def test_map_row_with_invalid_mapping(self, csv_importer: CSVImporter) -> None:
@@ -176,6 +208,80 @@ class TestCSVImporter:
 
         mapped_row = csv_importer.map_row(csv_row, column_mapping)
         assert mapped_row == {}
+
+    def test_map_row_with_bom_prefixed_header(self, csv_importer: CSVImporter) -> None:
+        """Test mapping still works when the first CSV header contains a BOM."""
+        csv_row = {
+            "\ufeffcsv_name": "John Doe",
+            "csv_age": "30",
+        }
+        column_mapping = {
+            "csv_name": "name",
+            "csv_age": "age",
+        }
+
+        mapped_row = csv_importer.map_row(csv_row, column_mapping, row_number=2)
+
+        assert mapped_row == {
+            "name": "John Doe",
+            "age": 30,
+        }
+
+    def test_map_row_with_missing_csv_header_raises(
+        self, csv_importer: CSVImporter
+    ) -> None:
+        """Test missing CSV headers raise a user-friendly import error."""
+        csv_row = {"csv_age": "30"}
+        column_mapping = {
+            "csv_name": "name",
+            "csv_age": "age",
+        }
+
+        with pytest.raises(
+            TracecatImportError,
+            match=(
+                "Mapped CSV column 'csv_name' was not found in file headers"
+                " at CSV row 2"
+            ),
+        ):
+            csv_importer.map_row(csv_row, column_mapping, row_number=2)
+
+    def test_map_row_with_null_byte_raises(self, csv_importer: CSVImporter) -> None:
+        """Test null bytes in CSV content raise a user-friendly import error."""
+        csv_row = {
+            "csv_name": "bad\x00value",
+            "csv_age": "30",
+        }
+        column_mapping = {
+            "csv_name": "name",
+            "csv_age": "age",
+        }
+
+        with pytest.raises(
+            TracecatImportError,
+            match="Invalid null byte in column 'name' at CSV row 2",
+        ):
+            csv_importer.map_row(csv_row, column_mapping, row_number=2)
+
+    def test_map_row_ignores_none_restkey(self, csv_importer: CSVImporter) -> None:
+        """Test malformed rows with DictReader restkey entries do not crash mapping."""
+        raw_row: dict[str | None, str | list[str]] = {
+            "csv_name": "John Doe",
+            "csv_age": "30",
+            None: ["extra", "values"],
+        }
+        csv_row = cast(Mapping[str, str | None], raw_row)
+        column_mapping = {
+            "csv_name": "name",
+            "csv_age": "age",
+        }
+
+        mapped_row = csv_importer.map_row(csv_row, column_mapping, row_number=2)
+
+        assert mapped_row == {
+            "name": "John Doe",
+            "age": 30,
+        }
 
     @pytest.mark.anyio
     async def test_process_chunk(self, csv_importer: CSVImporter) -> None:
@@ -267,7 +373,7 @@ class TestCSVSchemaInferer:
         assert type_map["active"] is SqlType.BOOLEAN
         assert type_map["score"] is SqlType.NUMERIC
         assert type_map["joined"] is SqlType.TIMESTAMPTZ
-        assert type_map["identifier"] is SqlType.UUID
+        assert type_map["identifier"] is SqlType.TEXT
         assert type_map["metadata"] is SqlType.JSONB
 
     def test_handles_duplicate_and_invalid_headers(self) -> None:

@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tracecat.auth.types import Role
+from tracecat.authz.scopes import SERVICE_PRINCIPAL_SCOPES
 from tracecat.git.utils import GitUrl
 from tracecat.ssh import (
     SshEnv,
@@ -24,7 +25,11 @@ class TestGetGitSshCommand:
         """Test get_git_ssh_command returns proper SSH command."""
         git_url = GitUrl(host="github.com", org="myorg", repo="myrepo")
         mock_session = MagicMock(spec=AsyncSession)
-        role = Role(type="service", service_id="tracecat-service")
+        role = Role(
+            type="service",
+            service_id="tracecat-service",
+            scopes=SERVICE_PRINCIPAL_SCOPES["tracecat-service"],
+        )
 
         mock_service = AsyncMock()
         mock_secret = MagicMock()
@@ -55,7 +60,11 @@ class TestGetGitSshCommand:
         expected_ssh_cmd = "ssh -i /path/to/key -o IdentitiesOnly=yes"
 
         # Mock the ctx_role module instead of ctx_role.get
-        mock_role = Role(type="service", service_id="tracecat-service")
+        mock_role = Role(
+            type="service",
+            service_id="tracecat-service",
+            scopes=SERVICE_PRINCIPAL_SCOPES["tracecat-service"],
+        )
         with (
             patch("tracecat.ssh.ctx_role") as mock_ctx_role,
             patch("tracecat.ssh.SecretsService", return_value=mock_service),
@@ -76,7 +85,7 @@ class TestAddHostToKnownHosts:
         env = SshEnv(ssh_auth_sock="/tmp/sock", ssh_agent_pid="123")
         captured_cmd: list[list[str]] = []
 
-        def fake_run(cmd, capture_output, text, env, check):  # noqa: ANN001
+        def fake_run(cmd, capture_output, text, env, check, timeout=None):  # noqa: ANN001
             captured_cmd.append(cmd)
             return SimpleNamespace(
                 returncode=0,

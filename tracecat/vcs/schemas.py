@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, SecretStr
 
 from tracecat.vcs.github.manifest import GitHubAppManifest
@@ -30,9 +32,11 @@ class GitHubAppCredentialsStatus(BaseModel):
     """Status of GitHub App credentials."""
 
     exists: bool
+    is_corrupted: bool = False
     app_id: str | None = None
     has_webhook_secret: bool = False
-    has_client_id: bool = False
+    webhook_secret_preview: str | None = None
+    client_id: str | None = None
     created_at: str | None = None
 
 
@@ -43,54 +47,39 @@ class GitHubAppManifestResponse(BaseModel):
     instructions: list[str]
 
 
-# GitLab schemas
+class GitHubAppCredentialsSaveResponse(BaseModel):
+    """Response after creating or updating GitHub App credentials."""
+
+    message: str
+    action: Literal["created", "updated"]
+    app_id: str
 
 
-class GitLabCredentialsRequest(BaseModel):
-    """Request to register or update GitLab credentials."""
+class GitLabTokenCredentialsRequest(BaseModel):
+    """Request to register or update GitLab token credentials."""
 
-    access_token: SecretStr = Field(
-        ..., description="GitLab Group Access Token or Personal Access Token"
-    )
-    gitlab_url: str = Field(
+    base_url: str = Field(
         default="https://gitlab.com",
-        description="GitLab instance URL (for self-hosted instances)",
+        description="Base URL for GitLab.com or a self-managed GitLab instance.",
+    )
+    token: SecretStr = Field(
+        ...,
+        description="GitLab personal/project/group access token with api scope.",
     )
 
 
-class GitLabCredentialsStatus(BaseModel):
-    """Status of GitLab credentials."""
+class GitLabTokenCredentialsStatus(BaseModel):
+    """Status of GitLab token credentials."""
 
     exists: bool
-    gitlab_url: str | None = None
+    is_corrupted: bool = False
+    base_url: str | None = None
     created_at: str | None = None
 
 
-class GitLabTestConnectionRequest(BaseModel):
-    """Request to test GitLab repository connection."""
+class GitLabTokenCredentialsSaveResponse(BaseModel):
+    """Response after creating or updating GitLab token credentials."""
 
-    git_repo_url: str = Field(..., description="GitLab repository URL to test")
-
-
-class GitLabTestConnectionResponse(BaseModel):
-    """Response from GitLab connection test."""
-
-    success: bool
-    project_name: str | None = None
-    default_branch: str | None = None
-    branches: list[str] = Field(default_factory=list)
-    branch_count: int = 0
-    error: str | None = None
-
-
-class GitLabWorkspaceConfig(BaseModel):
-    """Minimal workspace info with git configuration for GitLab integration.
-
-    Used by GitLab VCS integration to show workspace git settings
-    without exposing other workspace configuration.
-    """
-
-    id: str = Field(..., description="Workspace ID")
-    name: str = Field(..., description="Workspace name")
-    git_repo_url: str | None = Field(None, description="Git repository URL")
-    git_branch: str | None = Field(None, description="Git branch for workflow sync")
+    message: str
+    action: Literal["created", "updated"]
+    base_url: str

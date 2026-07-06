@@ -15,13 +15,12 @@ import pytest
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tracecat import config
 from tracecat.auth.types import Role
 from tracecat.contexts import ctx_role
 from tracecat.db.models import RegistryVersion
 from tracecat.dsl.common import create_default_execution_context
 from tracecat.dsl.schemas import ActionStatement, RunActionInput, RunContext
-from tracecat.executor.backends.direct import DirectBackend
+from tracecat.executor.backends.test import TestBackend
 from tracecat.executor.service import dispatch_action
 from tracecat.expressions.expectations import ExpectedField
 from tracecat.identifiers.workflow import WorkflowUUID
@@ -47,8 +46,11 @@ async def create_manifest_for_actions(
     session: AsyncSession,
     repo_id: UUID,
     actions: list[BoundRegistryAction],
+    organization_id: UUID | None,
 ) -> RegistryLock:
     """Create a RegistryVersion with manifest for the given actions."""
+    assert organization_id is not None, "organization_id must be provided"
+
     from sqlalchemy import select
 
     from tracecat.db.models import RegistryRepository
@@ -91,7 +93,7 @@ async def create_manifest_for_actions(
     manifest = {"schema_version": "1.0", "actions": manifest_actions}
 
     rv = RegistryVersion(
-        organization_id=config.TRACECAT__DEFAULT_ORG_ID,
+        organization_id=organization_id,
         repository_id=repo_id,
         version=TEST_VERSION,
         manifest=manifest,
@@ -133,13 +135,16 @@ def mock_run_context():
 
 
 async def run_template_test(
-    input: RunActionInput, role: Role, backend: DirectBackend | None = None
+    input: RunActionInput, role: Role, backend: TestBackend | None = None
 ) -> Any:
     """Test helper: execute template action using production code path."""
     if backend is None:
-        backend = DirectBackend()
-    ctx_role.set(role)
-    return await dispatch_action(backend, input)
+        backend = TestBackend()
+    token = ctx_role.set(role)
+    try:
+        return await dispatch_action(backend, input)
+    finally:
+        ctx_role.reset(token)
 
 
 @pytest.mark.integration
@@ -147,7 +152,7 @@ async def run_template_test(
 async def test_template_action_two_steps_via_direct_backend(
     test_role, db_session_with_repo, mock_run_context, monkeysession
 ):
-    """Test that a 2-step template executes correctly via DirectBackend.
+    """Test that a 2-step template executes correctly via TestBackend.
 
     This verifies the service-layer orchestration where each step becomes
     a separate backend.execute() call.
@@ -206,7 +211,10 @@ async def test_template_action_two_steps_via_direct_backend(
 
     # Create manifest for the test actions
     registry_lock = await create_manifest_for_actions(
-        session, db_repo_id, [repo.get("testing.two_step_math")]
+        session,
+        db_repo_id,
+        [repo.get("testing.two_step_math")],
+        test_role.organization_id,
     )
 
     # Create and run the action
@@ -288,7 +296,10 @@ async def test_template_action_step_results_accessible(
     )
 
     registry_lock = await create_manifest_for_actions(
-        session, db_repo_id, [repo.get("testing.step_data_flow")]
+        session,
+        db_repo_id,
+        [repo.get("testing.step_data_flow")],
+        test_role.organization_id,
     )
 
     input = RunActionInput(
@@ -364,7 +375,10 @@ async def test_template_action_returns_expression_evaluated(
     )
 
     registry_lock = await create_manifest_for_actions(
-        session, db_repo_id, [repo.get("testing.complex_returns")]
+        session,
+        db_repo_id,
+        [repo.get("testing.complex_returns")],
+        test_role.organization_id,
     )
 
     input = RunActionInput(
@@ -460,7 +474,10 @@ async def test_template_action_with_secrets_in_top_level_args(
         )
 
         registry_lock = await create_manifest_for_actions(
-            session, db_repo_id, [repo.get("testing.secret_user")]
+            session,
+            db_repo_id,
+            [repo.get("testing.secret_user")],
+            test_role.organization_id,
         )
 
         # Pass the secret expression in the top-level args
@@ -565,6 +582,7 @@ async def test_nested_template_actions(
         session,
         db_repo_id,
         [repo.get("testing.inner_double"), repo.get("testing.outer_quad")],
+        test_role.organization_id,
     )
 
     input = RunActionInput(
@@ -629,7 +647,7 @@ async def test_template_action_for_each(
     )
 
     registry_lock = await create_manifest_for_actions(
-        session, db_repo_id, [repo.get("testing.add_ten")]
+        session, db_repo_id, [repo.get("testing.add_ten")], test_role.organization_id
     )
 
     # Create input with for_each

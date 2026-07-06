@@ -17,6 +17,7 @@ from tracecat.auth.types import Role
 from tracecat.dsl.schemas import RunActionInput
 from tracecat.executor.action_runner import get_action_runner
 from tracecat.executor.backends.base import ExecutorBackend
+from tracecat.executor.backends.registry_helpers import get_registry_artifact_uris
 from tracecat.executor.schemas import (
     ExecutorActionErrorInfo,
     ExecutorResult,
@@ -24,12 +25,7 @@ from tracecat.executor.schemas import (
     ExecutorResultSuccess,
     ResolvedContext,
 )
-from tracecat.executor.service import (
-    RegistryArtifactsContext,
-    get_registry_artifacts_for_lock,
-)
 from tracecat.logger import logger
-from tracecat.registry.constants import DEFAULT_REGISTRY_ORIGIN
 
 
 class EphemeralBackend(ExecutorBackend):
@@ -74,20 +70,20 @@ class EphemeralBackend(ExecutorBackend):
             task_ref=input.task.ref,
         )
 
-        # Get ALL tarball URIs for registry environment (deterministic ordering)
-        tarball_uris = await self._get_tarball_uris(input, role)
+        # Get ALL artifact URIs for registry environment (deterministic ordering)
+        artifact_uris = await self._get_artifact_uris(input, role)
 
-        # Error out early if no tarballs resolved (unless local repository is enabled)
-        if not tarball_uris and not config.TRACECAT__LOCAL_REPOSITORY_ENABLED:
+        # Error out early if no artifacts resolved (unless local repository is enabled)
+        if not artifact_uris and not config.TRACECAT__LOCAL_REPOSITORY_ENABLED:
             logger.error(
-                "No registry tarballs resolved - cannot execute action",
+                "No registry artifacts resolved - cannot execute action",
                 action=action_name,
                 action_origin=resolved_context.action_impl.origin,
             )
             return ExecutorResultFailure(
                 error=ExecutorActionErrorInfo(
                     type="RegistryError",
-                    message="No registry tarballs available for execution. "
+                    message="No registry artifacts available for execution. "
                     "Check that the registry is synced and the registry_lock is valid.",
                     action_name=action_name,
                     filename="<ephemeral>",
@@ -95,10 +91,10 @@ class EphemeralBackend(ExecutorBackend):
                 )
             )
 
-        if tarball_uris:
-            logger.debug("Mounting registry tarballs", count=len(tarball_uris))
+        if artifact_uris:
+            logger.debug("Mounting registry artifacts", count=len(artifact_uris))
         else:
-            logger.debug("Using local repository mode, no tarballs mounted")
+            logger.debug("Using local repository mode, no artifacts mounted")
 
         # Execute using ActionRunner with forced sandbox mode
         runner = get_action_runner()
@@ -106,7 +102,7 @@ class EphemeralBackend(ExecutorBackend):
             input=input,
             role=role,
             resolved_context=resolved_context,
-            tarball_uris=tarball_uris,
+            artifact_uris=artifact_uris,
             timeout=timeout,
             force_sandbox=True,  # Always use nsjail for ephemeral backend
         )
@@ -116,51 +112,10 @@ class EphemeralBackend(ExecutorBackend):
             return ExecutorResultFailure(error=result)
         return ExecutorResultSuccess(result=result)
 
-    async def _get_tarball_uris(
+    async def _get_artifact_uris(
         self,
         input: RunActionInput,
         role: Role,
     ) -> list[str]:
-        """Get tarball URIs for registry environment (deterministic ordering).
-
-        Args:
-            input: The RunActionInput containing task and execution context
-
-        Returns:
-            List of tarball URIs in deterministic order (tracecat_registry first,
-            then lexicographically by origin).
-        """
-        if config.TRACECAT__LOCAL_REPOSITORY_ENABLED:
-            return []
-
-        try:
-            artifacts = await get_registry_artifacts_for_lock(
-                input.registry_lock.origins, role.organization_id
-            )
-            return self._sort_tarball_uris(artifacts)
-        except Exception as e:
-            logger.warning(
-                "Failed to load registry artifacts for ephemeral execution",
-                error=str(e),
-            )
-            return []
-
-    def _sort_tarball_uris(
-        self, artifacts: list[RegistryArtifactsContext]
-    ) -> list[str]:
-        """Sort tarballs: tracecat_registry first, then lexicographically by origin."""
-        builtin_uris: list[str] = []
-        other_uris: list[tuple[str, str]] = []  # (origin, uri)
-
-        for artifact in artifacts:
-            if not artifact.tarball_uri:
-                continue
-            if artifact.origin == DEFAULT_REGISTRY_ORIGIN:
-                builtin_uris.append(artifact.tarball_uri)
-            else:
-                other_uris.append((artifact.origin, artifact.tarball_uri))
-
-        # Sort non-builtin by origin lexicographically
-        other_uris.sort(key=lambda x: x[0])
-
-        return builtin_uris + [uri for _, uri in other_uris]
+        """Get artifact URIs for registry environment (deterministic ordering)."""
+        return await get_registry_artifact_uris(input=input, role=role)

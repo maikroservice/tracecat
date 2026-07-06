@@ -25,6 +25,7 @@ import * as React from "react"
 import { HorizontalRule } from "@/components/tiptap-node/horizontal-rule-node/horizontal-rule-node-extension"
 // --- Tiptap Node ---
 import { ImageUploadNode } from "@/components/tiptap-node/image-upload-node/image-upload-node-extension"
+import { MermaidCodeBlock } from "@/components/tiptap-node/mermaid-code-block-node/mermaid-code-block-node"
 // --- UI Primitives ---
 import { Button, ButtonGroup } from "@/components/tiptap-ui-primitive/button"
 import { Spacer } from "@/components/tiptap-ui-primitive/spacer"
@@ -427,6 +428,11 @@ export interface SimpleEditorProps {
    */
   showToolbar?: boolean
   /**
+   * Keep toolbar layout space reserved while hidden.
+   * @default false
+   */
+  preserveToolbarSpace?: boolean
+  /**
    * Optional wrapper class name for layout overrides.
    */
   className?: string
@@ -455,6 +461,12 @@ export interface SimpleEditorProps {
    */
   toolbarStatus?: React.ReactNode
   /**
+   * Render Mermaid code blocks as diagrams when this editable editor is blurred.
+   * Read-only editors always render Mermaid diagrams.
+   * @default false
+   */
+  renderMermaidWhenBlurred?: boolean
+  /**
    * Auto focus behaviour.
    * @default false
    */
@@ -470,6 +482,7 @@ export function SimpleEditor({
   onChange,
   editable = true,
   showToolbar = true,
+  preserveToolbarSpace = false,
   className,
   placeholder,
   onSave,
@@ -477,6 +490,7 @@ export function SimpleEditor({
   onShortcutFallback,
   onFocus,
   toolbarStatus,
+  renderMermaidWhenBlurred = false,
   autoFocus = false,
   style,
 }: SimpleEditorProps) {
@@ -493,12 +507,16 @@ export function SimpleEditor({
     () => [
       StarterKit.configure({
         horizontalRule: false,
+        codeBlock: false,
         link: {
           openOnClick: false,
           enableClickSelection: true,
         },
       }),
       HorizontalRule,
+      MermaidCodeBlock.configure({
+        renderWhenBlurred: renderMermaidWhenBlurred,
+      }),
       Table.configure({
         resizable: false,
       }),
@@ -534,7 +552,7 @@ export function SimpleEditor({
         },
       }),
     ],
-    []
+    [renderMermaidWhenBlurred]
   )
 
   const editor = useEditor({
@@ -576,8 +594,8 @@ export function SimpleEditor({
     },
   })
 
-  const canRenderToolbar = showToolbar && editable
-  const shouldShowToolbar = canRenderToolbar
+  const shouldShowToolbar = showToolbar && editable
+  const canRenderToolbar = editable && (showToolbar || preserveToolbarSpace)
 
   const rect = useCursorVisibility({
     editor,
@@ -696,8 +714,7 @@ export function SimpleEditor({
   >(() => {
     const next: React.CSSProperties & Record<string, string | number> = {
       paddingBottom: 0,
-      "--tt-toolbar-bg-color":
-        "color-mix(in srgb, hsl(var(--muted)) 20%, hsl(var(--background)) 80%)",
+      "--tt-toolbar-bg-color": "transparent",
     }
 
     if (isMobile) {
@@ -710,7 +727,11 @@ export function SimpleEditor({
 
   return (
     <div
-      className={cn("simple-editor-wrapper", className)}
+      className={cn(
+        "simple-editor-wrapper",
+        !editable && "simple-editor-wrapper--readonly",
+        className
+      )}
       style={wrapperStyle}
     >
       <EditorContext.Provider value={{ editor }}>
@@ -753,7 +774,10 @@ export function SimpleEditor({
         <EditorContent
           editor={editor}
           role="presentation"
-          className="simple-editor-content"
+          className={cn(
+            "simple-editor-content",
+            !editable && "simple-editor-content--readonly"
+          )}
         />
       </EditorContext.Provider>
     </div>

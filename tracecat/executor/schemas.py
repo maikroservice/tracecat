@@ -11,6 +11,7 @@ from pydantic import UUID4, BaseModel, Field
 
 from tracecat import config
 from tracecat.config import TRACECAT__APP_ENV
+from tracecat.executor.secret_preprocessors import SecretEnvProjection
 from tracecat.logger import logger
 
 
@@ -41,13 +42,15 @@ class ExecutorBackendType(StrEnum):
 
     - POOL: Warm nsjail workers (high throughput, single-tenant, untrusted)
     - EPHEMERAL: Cold nsjail subprocess per action (full isolation, multi-tenant, untrusted)
-    - DIRECT: In-process execution (TESTING ONLY - no isolation, no subprocess overhead)
+    - DIRECT: Direct subprocess execution (no warm workers)
+    - TEST: In-process execution for tests only
     - AUTO: Auto-select based on environment
     """
 
     POOL = "pool"
     EPHEMERAL = "ephemeral"
     DIRECT = "direct"
+    TEST = "test"
     AUTO = "auto"
 
 
@@ -110,7 +113,7 @@ class ActionImplementation(BaseModel):
     action_name: str | None = None
     """Registry action name (e.g., 'core.transform.reshape' or 'testing.my_template').
 
-    This is preferred for loading actions in-process (e.g., DirectBackend) because it
+    This is preferred for loading actions in-process (e.g., TestBackend) because it
     allows indexed lookups on (namespace, name) instead of slower JSON implementation
     scans.
     """
@@ -136,7 +139,11 @@ class ResolvedContext(BaseModel):
     """
 
     secrets: dict[str, Any] = {}
-    """Pre-resolved secrets keyed by secret name."""
+    """Pre-resolved secrets keyed by secret name.
+
+    Used for expression evaluation (e.g. ``${{ SECRETS.aws.AWS_ROLE_ARN }}``).
+    Never mutated by host-side credential resolution.
+    """
 
     variables: dict[str, Any] = {}
     """Pre-resolved workspace variables keyed by variable name."""
@@ -162,6 +169,9 @@ class ResolvedContext(BaseModel):
 
     logical_time: datetime | None = None
     """Logical time for deterministic FN.now() during workflow execution."""
+
+    secret_projection: SecretEnvProjection | None = Field(default=None, exclude=True)
+    """Runtime-ready secret env cached for host-side execution reuse."""
 
 
 class ExecutorActionErrorInfo(BaseModel):

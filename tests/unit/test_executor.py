@@ -16,7 +16,8 @@ from tracecat.db.models import RegistryVersion
 from tracecat.dsl.common import create_default_execution_context
 from tracecat.dsl.schemas import ActionStatement, RunActionInput, RunContext
 from tracecat.exceptions import ExecutionError, LoopExecutionError
-from tracecat.executor.backends.direct import DirectBackend
+from tracecat.executor import service as executor_service
+from tracecat.executor.backends.test import TestBackend
 from tracecat.executor.schemas import ActionImplementation, ExecutorActionErrorInfo
 from tracecat.executor.service import (
     dispatch_action,
@@ -50,11 +51,14 @@ async def create_manifest_for_actions(
     session: AsyncSession,
     repo_id: UUID,
     actions: list[BoundRegistryAction],
+    organization_id: UUID | None,
 ) -> RegistryLock:
     """Create a RegistryVersion with manifest for the given actions.
 
     Returns a RegistryLock that can be used in RunActionInput.
     """
+    assert organization_id is not None, "organization_id must be provided"
+
     from sqlalchemy import select
 
     from tracecat.db.models import RegistryRepository
@@ -103,7 +107,7 @@ async def create_manifest_for_actions(
 
     # Create RegistryVersion
     rv = RegistryVersion(
-        organization_id=config.TRACECAT__DEFAULT_ORG_ID,
+        organization_id=organization_id,
         repository_id=repo_id,
         version=TEST_VERSION,
         manifest=manifest,
@@ -142,9 +146,12 @@ async def run_action_test(input: RunActionInput, role: Role) -> Any:
     """
     from tracecat.contexts import ctx_role
 
-    ctx_role.set(role)
-    backend = DirectBackend()
-    return await dispatch_action(backend, input)
+    token = ctx_role.set(role)
+    try:
+        backend = TestBackend()
+        return await dispatch_action(backend, input)
+    finally:
+        ctx_role.reset(token)
 
 
 @pytest.fixture
@@ -236,7 +243,10 @@ async def test_executor_can_run_udf_with_secrets(
 
         # Create manifest for the test actions
         registry_lock = await create_manifest_for_actions(
-            session, db_repo_id, [repo.get("testing.fetch_secret")]
+            session,
+            db_repo_id,
+            [repo.get("testing.fetch_secret")],
+            test_role.organization_id,
         )
 
         input = RunActionInput(
@@ -349,6 +359,7 @@ async def test_executor_can_run_template_action_with_secret(
             session,
             db_repo_id,
             [repo.get("testing.template_action"), repo.get("testing.fetch_secret")],
+            test_role.organization_id,
         )
 
         input = RunActionInput(
@@ -456,7 +467,10 @@ async def test_executor_can_run_template_action_with_oauth(
 
     # Create manifest for the test actions
     registry_lock = await create_manifest_for_actions(
-        session, db_repo_id, [repo.get("testing.oauth.oauth_test")]
+        session,
+        db_repo_id,
+        [repo.get("testing.oauth.oauth_test")],
+        test_role.organization_id,
     )
 
     # 5. Create and run the action
@@ -541,7 +555,10 @@ async def test_executor_can_run_udf_with_oauth(
 
     # Create manifest for the test actions
     registry_lock = await create_manifest_for_actions(
-        session, db_repo_id, [repo.get("testing.fetch_oauth_token")]
+        session,
+        db_repo_id,
+        [repo.get("testing.fetch_oauth_token")],
+        test_role.organization_id,
     )
 
     # 4. Create and run the action
@@ -596,7 +613,9 @@ async def test_executor_can_run_udf_with_oauth_in_secret_expression(
     )
 
     # Create manifest for core actions
-    registry_lock = await create_manifest_for_actions(session, db_repo_id, [])
+    registry_lock = await create_manifest_for_actions(
+        session, db_repo_id, [], test_role.organization_id
+    )
 
     # 4. Create and run the action
     input = RunActionInput(
@@ -633,19 +652,17 @@ async def mock_action(input: Any, role: Any = None):
 async def test_direct_backend_execute(
     test_role: Role, mock_run_context: RunContext, monkeypatch: pytest.MonkeyPatch
 ):
-    """Test that the direct backend properly handles async operations."""
-    from tracecat.executor.backends.direct import DirectBackend
+    """Test that the test backend properly handles async operations."""
+    from tracecat.executor.backends.test import TestBackend
     from tracecat.executor.schemas import ExecutorResultSuccess, ResolvedContext
 
     # Mock _execute_with_context to return a simple result
     async def mock_execute_with_context(self, input, role, resolved_context):
         return {"input": input.task.args}
 
-    monkeypatch.setattr(
-        DirectBackend, "_execute_with_context", mock_execute_with_context
-    )
+    monkeypatch.setattr(TestBackend, "_execute_with_context", mock_execute_with_context)
 
-    backend = DirectBackend()
+    backend = TestBackend()
     resolved_context = ResolvedContext(
         secrets={},
         variables={},
@@ -686,14 +703,14 @@ async def mock_error(*args, **kwargs):
 async def test_direct_backend_returns_wrapped_error(
     test_role: Role, mock_run_context: RunContext, monkeypatch: pytest.MonkeyPatch
 ):
-    """Test that the direct backend properly handles wrapped errors."""
-    from tracecat.executor.backends.direct import DirectBackend
+    """Test that the test backend properly handles wrapped errors."""
+    from tracecat.executor.backends.test import TestBackend
     from tracecat.executor.schemas import ExecutorResultFailure, ResolvedContext
 
     # Create a test input with an action that will raise an error
-    monkeypatch.setattr(DirectBackend, "_execute_with_context", mock_error)
+    monkeypatch.setattr(TestBackend, "_execute_with_context", mock_error)
 
-    backend = DirectBackend()
+    backend = TestBackend()
     resolved_context = ResolvedContext(
         secrets={},
         variables={},
@@ -742,10 +759,10 @@ async def test_dispatcher(
     1. Add mock package with a function that will raise an error
     """
     from tracecat.contexts import ctx_role
-    from tracecat.executor.backends.direct import DirectBackend
+    from tracecat.executor.backends.test import TestBackend
 
     # Set up the role context for dispatch_action
-    ctx_role.set(test_role)
+    token = ctx_role.set(test_role)
 
     session, db_repo_id = db_session_with_repo
     repo = Repository()
@@ -768,6 +785,7 @@ async def test_dispatcher(
         session,
         db_repo_id,
         [repo.get("testing.add_100"), repo.get("testing.add_nums")],
+        test_role.organization_id,
     )
 
     input = RunActionInput(
@@ -784,14 +802,91 @@ async def test_dispatcher(
     )
 
     # Act
-    backend = DirectBackend()
-    result = await dispatch_action(backend, input)
+    backend = TestBackend()
+    try:
+        result = await dispatch_action(backend, input)
 
-    # This should run correctly
-    assert result == [101, 102, 103, 104, 105]
+        # This should run correctly
+        assert result == [101, 102, 103, 104, 105]
 
-    # Now, force a validation error
-    # This fails because the loop variable is None, but it expects an int
+        # Now, force a validation error
+        # This fails because the loop variable is None, but it expects an int
+
+        input = RunActionInput(
+            task=ActionStatement(
+                ref="test",
+                action="testing.add_100",
+                run_if=None,
+                args={"num": "${{ var.x }}"},
+                for_each="${{ for var.x in [1,2,None,4,5] }}",
+            ),
+            exec_context=create_default_execution_context(),
+            run_context=mock_run_context,
+            registry_lock=registry_lock,
+        )
+
+        # Act
+        with pytest.raises(LoopExecutionError) as e:
+            await dispatch_action(backend, input)
+        assert len(e.value.loop_errors) == 1
+        assert e.value.loop_errors[0].info.loop_iteration == 2
+        assert e.value.loop_errors[0].info.loop_vars == {"x": None}
+
+        # Try another dispatch with a different error
+
+        input = RunActionInput(
+            task=ActionStatement(
+                ref="test",
+                action="testing.add_nums",
+                run_if=None,
+                args={"nums": "${{ FN.flatten(var.x) }}"},
+                for_each="${{ for var.x in [[1], None, [3], [4], [5]] }}",
+            ),
+            exec_context=create_default_execution_context(),
+            run_context=mock_run_context,
+            registry_lock=registry_lock,
+        )
+        # Act
+        with pytest.raises(LoopExecutionError) as e:
+            await dispatch_action(backend, input)
+        assert len(e.value.loop_errors) == 1
+        assert e.value.loop_errors[0].info.loop_iteration == 1
+        assert e.value.loop_errors[0].info.loop_vars == {"x": None}
+    finally:
+        ctx_role.reset(token)
+
+
+@pytest.mark.anyio
+async def test_dispatch_action_for_each_uses_configured_worker_limit(
+    monkeypatch,
+    test_role,
+    mock_run_context,
+):
+    monkeypatch.setattr(config, "TRACECAT__EXECUTOR_FOR_EACH_MAX_CONCURRENCY", 2)
+
+    active_iterations = 0
+    max_active_iterations = 0
+
+    async def fake_invoke_once(
+        backend: TestBackend,
+        input: RunActionInput,
+        ctx: Any,
+        iteration: int | None = None,
+    ) -> int:
+        nonlocal active_iterations, max_active_iterations
+
+        assert iteration is not None
+        active_iterations += 1
+        max_active_iterations = max(max_active_iterations, active_iterations)
+        try:
+            await asyncio.sleep(0.01)
+            local_vars = input.exec_context.get("var")
+            assert local_vars is not None
+            return local_vars["x"]
+        finally:
+            active_iterations -= 1
+
+    monkeypatch.setattr(executor_service, "invoke_once", fake_invoke_once)
 
     input = RunActionInput(
         task=ActionStatement(
@@ -799,41 +894,76 @@ async def test_dispatcher(
             action="testing.add_100",
             run_if=None,
             args={"num": "${{ var.x }}"},
-            for_each="${{ for var.x in [1,2,None,4,5] }}",
+            for_each="${{ for var.x in [1,2,3,4,5,6] }}",
         ),
         exec_context=create_default_execution_context(),
         run_context=mock_run_context,
-        registry_lock=registry_lock,
+        registry_lock=make_registry_lock("testing.add_100"),
     )
 
-    # Act
-    with pytest.raises(LoopExecutionError) as e:
-        result = await dispatch_action(backend, input)
-    assert len(e.value.loop_errors) == 1
-    assert e.value.loop_errors[0].info.loop_iteration == 2
-    assert e.value.loop_errors[0].info.loop_vars == {"x": None}
+    result = await dispatch_action(TestBackend(), input)
 
-    # Try another dispatch with a different error
+    assert result == [1, 2, 3, 4, 5, 6]
+    assert max_active_iterations == 2
+
+
+@pytest.mark.anyio
+async def test_dispatch_action_for_each_finishes_after_iteration_error(
+    monkeypatch,
+    test_role,
+    mock_run_context,
+):
+    monkeypatch.setattr(config, "TRACECAT__EXECUTOR_FOR_EACH_MAX_CONCURRENCY", 1)
+
+    seen: list[int] = []
+
+    async def fake_invoke_once(
+        backend: TestBackend,
+        input: RunActionInput,
+        ctx: Any,
+        iteration: int | None = None,
+    ) -> int:
+        assert iteration is not None
+        local_vars = input.exec_context.get("var")
+        assert local_vars is not None
+        value = local_vars["x"]
+        seen.append(value)
+        if value == 2:
+            raise ExecutionError(
+                info=ExecutorActionErrorInfo(
+                    action_name=input.task.action,
+                    type="ValueError",
+                    message="bad loop item",
+                    filename=__file__,
+                    function="fake_invoke_once",
+                    loop_iteration=iteration,
+                    loop_vars=local_vars,
+                )
+            )
+        return value
+
+    monkeypatch.setattr(executor_service, "invoke_once", fake_invoke_once)
 
     input = RunActionInput(
         task=ActionStatement(
             ref="test",
-            action="testing.add_nums",
+            action="testing.add_100",
             run_if=None,
-            args={"nums": "${{ FN.flatten(var.x) }}"},
-            for_each="${{ for var.x in [[1], None, [3], [4], [5]] }}",
+            args={"num": "${{ var.x }}"},
+            for_each="${{ for var.x in [1,2,3] }}",
         ),
         exec_context=create_default_execution_context(),
         run_context=mock_run_context,
-        registry_lock=registry_lock,
+        registry_lock=make_registry_lock("testing.add_100"),
     )
 
-    # Act
     with pytest.raises(LoopExecutionError) as e:
-        result = await dispatch_action(backend, input)
+        await dispatch_action(TestBackend(), input)
+
+    assert seen == [1, 2, 3]
     assert len(e.value.loop_errors) == 1
     assert e.value.loop_errors[0].info.loop_iteration == 1
-    assert e.value.loop_errors[0].info.loop_vars == {"x": None}
+    assert e.value.loop_errors[0].info.loop_vars == {"x": 2}
 
 
 @pytest.fixture

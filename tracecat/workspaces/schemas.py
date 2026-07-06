@@ -1,23 +1,24 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import NotRequired, TypedDict
 
 from pydantic import EmailStr, Field, computed_field, field_validator
 
 from tracecat import config
-from tracecat.auth.schemas import UserRole
-from tracecat.authz.enums import WorkspaceRole
 from tracecat.core.schemas import Schema
-from tracecat.git.constants import GIT_HTTPS_URL_REGEX, GIT_SSH_URL_REGEX
-from tracecat.identifiers import OrganizationID, UserID, WorkspaceID
+from tracecat.git.constants import GIT_SSH_URL_REGEX
+from tracecat.identifiers import InvitationID, OrganizationID, UserID, WorkspaceID
+from tracecat.invitations.enums import InvitationStatus
+from tracecat.workspace_sync.enums import VcsProvider
 
 # === Workspace === #
 
 
 # DTO
 class WorkspaceSettings(TypedDict):
+    git_provider: NotRequired[VcsProvider | None]
     git_repo_url: NotRequired[str | None]
-    git_branch: NotRequired[str | None]
     workflow_unlimited_timeout_enabled: NotRequired[bool | None]
     workflow_default_timeout_seconds: NotRequired[int | None]
     allowed_attachment_extensions: NotRequired[list[str] | None]
@@ -27,8 +28,8 @@ class WorkspaceSettings(TypedDict):
 
 # Schema
 class WorkspaceSettingsRead(Schema):
+    git_provider: VcsProvider | None = None
     git_repo_url: str | None = None
-    git_branch: str | None = None
     workflow_unlimited_timeout_enabled: bool | None = None
     workflow_default_timeout_seconds: int | None = None
     allowed_attachment_extensions: list[str] | None = None
@@ -53,11 +54,8 @@ class WorkspaceSettingsRead(Schema):
 
 
 class WorkspaceSettingsUpdate(Schema):
+    git_provider: VcsProvider | None = None
     git_repo_url: str | None = None
-    git_branch: str | None = Field(
-        default=None,
-        description="Git branch to use for workflow sync (e.g., 'main', 'develop').",
-    )
     workflow_unlimited_timeout_enabled: bool | None = Field(
         default=None,
         description="Allow workflows to run indefinitely without timeout constraints. When enabled, individual workflow timeout settings are ignored.",
@@ -80,17 +78,26 @@ class WorkspaceSettingsUpdate(Schema):
         description="Whether to validate file content matches declared MIME type using magic number detection. Defaults to true for security.",
     )
 
+    @field_validator("git_provider")
+    @classmethod
+    def validate_git_provider(cls, value: VcsProvider | None) -> VcsProvider | None:
+        """Restrict writable workspace sync providers to implemented transports."""
+        if value is VcsProvider.BITBUCKET:
+            raise ValueError(
+                "bitbucket workspace sync is not implemented yet. Use github or gitlab."
+            )
+        return value
+
     @field_validator("git_repo_url", mode="before")
     @classmethod
     def validate_git_repo_url(cls, value: str | None) -> str | None:
-        """Ensure workspace git repo URLs use a valid Git URL format."""
+        """Ensure workspace git repo URLs use the shared Git SSH format."""
         if value is None:
             return value
 
-        # Accept both SSH and HTTPS URLs
-        if not GIT_SSH_URL_REGEX.match(value) and not GIT_HTTPS_URL_REGEX.match(value):
+        if not GIT_SSH_URL_REGEX.match(value):
             raise ValueError(
-                "Must be a valid Git URL (e.g., git+ssh://git@github.com/org/repo.git or https://gitlab.com/org/repo.git)"
+                "Must be a valid Git SSH URL (e.g., git+ssh://<user>@github.com/org/repo.git)"
             )
 
         return value
@@ -123,8 +130,7 @@ class WorkspaceMember(Schema):
     first_name: str | None
     last_name: str | None
     email: EmailStr
-    org_role: UserRole
-    workspace_role: WorkspaceRole
+    role_name: str
 
 
 class WorkspaceRead(Schema):
@@ -141,14 +147,38 @@ WorkspaceSettingsUpdate.model_rebuild()
 # === Membership === #
 class WorkspaceMembershipCreate(Schema):
     user_id: UserID
-    role: WorkspaceRole = WorkspaceRole.EDITOR
-
-
-class WorkspaceMembershipUpdate(Schema):
-    role: WorkspaceRole | None = None
 
 
 class WorkspaceMembershipRead(Schema):
     user_id: UserID
     workspace_id: WorkspaceID
-    role: WorkspaceRole
+
+
+# === Invitation === #
+class WorkspaceInvitationCreate(Schema):
+    """Request schema for creating a workspace invitation."""
+
+    email: EmailStr
+    role_id: str  # UUID as string for API compatibility
+
+
+class WorkspaceInvitationRead(Schema):
+    """Response schema for a workspace invitation."""
+
+    id: InvitationID
+    workspace_id: WorkspaceID
+    email: EmailStr
+    role_id: str
+    role_name: str
+    role_slug: str | None = None
+    status: InvitationStatus
+    invited_by: UserID | None
+    expires_at: datetime
+    accepted_at: datetime | None
+    created_at: datetime
+
+
+class WorkspaceInvitationList(Schema):
+    """Query params for listing workspace invitations."""
+
+    status: InvitationStatus | None = None

@@ -1,1 +1,1 @@
-"""GitLab VCS integration module."""
+"""GitLab VCS integration."""

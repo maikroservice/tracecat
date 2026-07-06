@@ -1,7 +1,22 @@
 import type { QueryClient } from "@tanstack/react-query"
 import * as ai from "ai"
-import type { AgentSessionEntity, UIMessage } from "@/client"
+import type {
+  AgentSessionEntity,
+  AgentSessionRead,
+  AgentSessionReadVercel,
+  ChatReadMinimal,
+  ChatReadVercel,
+  UIMessage,
+} from "@/client"
 import type { ApprovalCard } from "@/hooks/use-chat"
+import { invalidateCaseActivityQueries } from "@/lib/cases/invalidation"
+
+type ServerToolPart = Extract<UIMessage["parts"][number], { state: string }>
+type LegacyToolState =
+  | "approval-requested"
+  | "approval-responded"
+  | "output-denied"
+type ToolState = ai.ToolUIPart["state"] | LegacyToolState
 
 export function isAgentSessionEntity(
   value: unknown
@@ -11,8 +26,32 @@ export function isAgentSessionEntity(
     value === "agent_preset" ||
     value === "agent_preset_builder" ||
     value === "copilot" ||
-    value === "workflow"
+    value === "workflow" ||
+    value === "approval" ||
+    value === "external_channel"
   )
+}
+
+/**
+ * Either arm of a session/chat union, in list (`*Read`) or Vercel
+ * (`*ReadVercel`) shape. Only the AgentSession arms carry `last_error`; the
+ * legacy Chat arms do not, which is what lets `getSessionLastError` narrow.
+ */
+export type SessionOrChat =
+  | AgentSessionRead
+  | AgentSessionReadVercel
+  | ChatReadMinimal
+  | ChatReadVercel
+
+/**
+ * Read the persisted terminal error of a session's most recent run.
+ *
+ * Present iff the last run errored (errors are run-ending and clear on the next
+ * turn). Lives only on the AgentSession arms of the union — legacy Chat rows
+ * have no such field — so this returns null for those arms.
+ */
+export function getSessionLastError(session: SessionOrChat): string | null {
+  return "last_error" in session ? (session.last_error ?? null) : null
 }
 
 /**
@@ -96,6 +135,61 @@ export function toUIMessage(message: UIMessage): ai.UIMessage {
   }
 }
 
+function normalizeToolPartForServer(
+  part: ai.ToolUIPart | ai.DynamicToolUIPart
+): ServerToolPart {
+  const state = part.state as ToolState
+
+  switch (state) {
+    case "input-streaming":
+    case "input-available":
+    case "output-available":
+    case "output-error":
+      return part as unknown as ServerToolPart
+    case "approval-requested":
+    case "approval-responded": {
+      const { approval: _approval, ...rest } = part as ai.DynamicToolUIPart & {
+        approval?: unknown
+      }
+      return { ...rest, state: "input-available" } as unknown as ServerToolPart
+    }
+    case "output-denied": {
+      const { approval, ...rest } = part as ai.DynamicToolUIPart & {
+        approval?: { reason?: string | null }
+      }
+      return {
+        ...rest,
+        state: "output-error",
+        errorText:
+          approval?.reason?.trim() ||
+          "Tool execution was denied by user approval.",
+      } as unknown as ServerToolPart
+    }
+    default: {
+      const _exhaustive: never = state
+      throw new Error(
+        `Unhandled tool part state in server conversion: ${JSON.stringify(_exhaustive)}`
+      )
+    }
+  }
+}
+
+export function toServerUIMessage(message: ai.UIMessage): UIMessage {
+  const parts = message.parts.map((part): UIMessage["parts"][number] => {
+    if (ai.isToolUIPart(part)) {
+      return normalizeToolPartForServer(part)
+    }
+    return part as UIMessage["parts"][number]
+  })
+
+  return {
+    id: message.id,
+    role: message.role,
+    metadata: message.metadata,
+    parts,
+  }
+}
+
 const UPDATE_ON_ACTIONS: Partial<Record<AgentSessionEntity, Array<string>>> = {
   case: ["core.cases.update_case", "core.cases.create_comment"],
   agent_preset_builder: ["internal.builder.update_preset"],
@@ -121,14 +215,9 @@ export const ENTITY_TO_INVALIDATION: Record<
     predicate: (toolName: string) =>
       Boolean(UPDATE_ON_ACTIONS.case?.includes(toolName)),
     handler: (queryClient, workspaceId, entityId) => {
-      // Invalidate specific case query
-      queryClient.invalidateQueries({ queryKey: ["case", entityId] })
       // Invalidate cases list for workspace
       queryClient.invalidateQueries({ queryKey: ["cases", workspaceId] })
-      // Invalidate case events
-      queryClient.invalidateQueries({
-        queryKey: ["case-events", entityId, workspaceId],
-      })
+      invalidateCaseActivityQueries(queryClient, entityId, workspaceId)
       // Invalidate case comments
       queryClient.invalidateQueries({
         queryKey: ["case-comments", entityId, workspaceId],
@@ -152,6 +241,9 @@ export const ENTITY_TO_INVALIDATION: Record<
       queryClient.invalidateQueries({
         queryKey: ["agent-preset", workspaceId, entityId],
       })
+      queryClient.invalidateQueries({
+        queryKey: ["agent-preset-versions", workspaceId, entityId],
+      })
     },
   },
   copilot: {
@@ -172,12 +264,23 @@ export const ENTITY_TO_INVALIDATION: Record<
       // No invalidation logic for approval entity
     },
   },
+  external_channel: {
+    predicate: () => false,
+    handler: (_queryClient, _workspaceId, _entityId) => {
+      // No invalidation logic for external channel entity
+    },
+  },
 }
 
 export type ModelInfo = {
   name: string
   provider: string
   baseUrl?: string | null
+  iconId?: string
+}
+
+type CompactionData = {
+  phase?: "started" | "completed" | "failed"
 }
 
 /**
@@ -229,6 +332,7 @@ export function transformMessages(messages: ai.UIMessage[]): ai.UIMessage[] {
   >()
   // Array positions to ignore (using "msgIndex-partIndex" string format)
   const ignorePos = new Set<string>()
+  let pendingCompactionStartPos: string | null = null
 
   for (const [i, message] of messages.entries()) {
     for (const [j, part] of message.parts.entries()) {
@@ -254,7 +358,8 @@ export function transformMessages(messages: ai.UIMessage[]): ai.UIMessage[] {
               ignorePos.add(currState.approval) // Hide approval state
             }
           } else {
-            console.warn(`Tool call ${toolCallId} not found in states`)
+            states.set(toolCallId, { close: posKey })
+            continue
           }
           // add close state
           states.set(toolCallId, { ...currState, close: posKey })
@@ -282,6 +387,24 @@ export function transformMessages(messages: ai.UIMessage[]): ai.UIMessage[] {
             }
           }
         }
+      } else if (part.type === "data-compaction") {
+        const phase =
+          part.data &&
+          typeof part.data === "object" &&
+          "phase" in part.data &&
+          (part.data as CompactionData).phase
+
+        if (phase === "started") {
+          if (pendingCompactionStartPos) {
+            ignorePos.add(pendingCompactionStartPos)
+          }
+          pendingCompactionStartPos = posKey
+        } else if (phase === "completed" || phase === "failed") {
+          if (pendingCompactionStartPos) {
+            ignorePos.add(pendingCompactionStartPos)
+            pendingCompactionStartPos = null
+          }
+        }
       }
     }
   }
@@ -301,7 +424,10 @@ export function transformMessages(messages: ai.UIMessage[]): ai.UIMessage[] {
         // Handle output parts
         const { toolCallId } = part
         const currState = states.get(toolCallId)
-        const newPart: ai.ToolUIPart = {
+        const newPart: Extract<
+          ai.UIMessagePart<ai.UIDataTypes, ai.UITools>,
+          { state: "output-available" | "output-error" }
+        > = {
           ...part,
         }
         if (currState?.open) {
@@ -326,10 +452,5 @@ export function transformMessages(messages: ai.UIMessage[]): ai.UIMessage[] {
       finalMessages.push({ ...message, parts: newParts })
     }
   }
-  console.log({
-    states,
-    ignorePos,
-    finalMessages,
-  })
   return finalMessages
 }

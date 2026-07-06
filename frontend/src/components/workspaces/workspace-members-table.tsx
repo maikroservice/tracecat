@@ -1,13 +1,10 @@
 "use client"
 
 import { DotsHorizontalIcon } from "@radix-ui/react-icons"
-import { useCallback, useState } from "react"
-import type {
-  WorkspaceMember,
-  WorkspaceMembershipRead,
-  WorkspaceRead,
-  WorkspaceRole,
-} from "@/client"
+import { useQueryClient } from "@tanstack/react-query"
+import { useCallback, useEffect, useMemo, useState } from "react"
+import type { WorkspaceMember, WorkspaceRead } from "@/client"
+import { useScopeCheck } from "@/components/auth/scope-guard"
 import {
   DataTable,
   DataTableColumnHeader,
@@ -48,30 +45,40 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { toast } from "@/components/ui/use-toast"
-import { useAuth } from "@/hooks/use-auth"
 import {
-  useCurrentUserRole,
   useWorkspaceMembers,
   useWorkspaceMutations,
 } from "@/hooks/use-workspace"
-import { WorkspaceRoleEnum } from "@/lib/workspace"
+import { useRbacRoles, useRbacUserAssignments } from "@/lib/hooks"
 
 export function WorkspaceMembersTable({
   workspace,
 }: {
   workspace: WorkspaceRead
 }) {
-  const { user } = useAuth()
+  const queryClient = useQueryClient()
+  const canUpdateMembers = useScopeCheck("workspace:member:update")
+  const canRemoveMembers = useScopeCheck("workspace:member:remove")
   const [selectedUser, setSelectedUser] = useState<WorkspaceMember | null>(null)
   const [isChangeRoleOpen, setIsChangeRoleOpen] = useState(false)
-  const { role } = useCurrentUserRole(workspace.id)
-  const { removeMember, updateMember } = useWorkspaceMutations()
+  const { removeMember } = useWorkspaceMutations()
   const { members, membersLoading, membersError } = useWorkspaceMembers(
     workspace.id
   )
+  const {
+    userAssignments,
+    isLoading: userAssignmentsIsLoading,
+    updateUserAssignment,
+    updateUserAssignmentIsPending,
+    createUserAssignment,
+    createUserAssignmentIsPending,
+  } = useRbacUserAssignments({
+    workspaceId: workspace.id,
+    enabled: isChangeRoleOpen,
+  })
 
   const handleChangeRole = useCallback(
-    async (role: WorkspaceRole) => {
+    async (roleId: string) => {
       try {
         if (!selectedUser) {
           return toast({
@@ -79,17 +86,39 @@ export function WorkspaceMembersTable({
             description: "Please select a user to change role",
           })
         }
-        if (selectedUser.workspace_role === role) {
+        if (!roleId) {
           return toast({
-            title: "No changes made",
-            description: `User ${selectedUser.email} is already a ${role}`,
+            title: "No role selected",
+            description: "Please select a role before continuing.",
           })
         }
-        console.log("Changing role", selectedUser, role)
-        await updateMember({
-          userId: selectedUser.user_id,
-          workspaceId: workspace.id,
-          requestBody: { role },
+        if (userAssignmentsIsLoading) {
+          return toast({
+            title: "Role data is loading",
+            description: "Wait a moment and try changing the role again.",
+          })
+        }
+        // Find the existing RBAC assignment for this user in this workspace
+        const existingAssignment = userAssignments?.find(
+          (a) =>
+            a.user_id === selectedUser.user_id &&
+            a.workspace_id === workspace.id
+        )
+        if (existingAssignment) {
+          await updateUserAssignment({
+            assignmentId: existingAssignment.id,
+            role_id: roleId,
+          })
+        } else {
+          // No existing assignment — create one
+          await createUserAssignment({
+            user_id: selectedUser.user_id,
+            role_id: roleId,
+            workspace_id: workspace.id,
+          })
+        }
+        await queryClient.invalidateQueries({
+          queryKey: ["workspace", workspace.id, "members"],
         })
       } catch (error) {
         console.log("Failed to change role", error)
@@ -98,8 +127,20 @@ export function WorkspaceMembersTable({
         setSelectedUser(null)
       }
     },
-    [selectedUser, updateMember, workspace.id]
+    [
+      selectedUser,
+      userAssignments,
+      workspace.id,
+      updateUserAssignment,
+      createUserAssignment,
+      userAssignmentsIsLoading,
+      queryClient,
+    ]
   )
+
+  const isRoleMutationPending =
+    updateUserAssignmentIsPending || createUserAssignmentIsPending
+
   return (
     <Dialog open={isChangeRoleOpen} onOpenChange={setIsChangeRoleOpen}>
       <AlertDialog
@@ -168,7 +209,7 @@ export function WorkspaceMembersTable({
               enableHiding: false,
             },
             {
-              accessorKey: "workspace_role",
+              accessorKey: "role_name",
               header: ({ column }) => (
                 <DataTableColumnHeader
                   className="text-xs"
@@ -178,9 +219,7 @@ export function WorkspaceMembersTable({
               ),
               cell: ({ row }) => (
                 <div className="text-xs capitalize">
-                  {row.getValue<WorkspaceMember["workspace_role"]>(
-                    "workspace_role"
-                  )}
+                  {row.getValue<string>("role_name")}
                 </div>
               ),
               enableSorting: true,
@@ -208,33 +247,31 @@ export function WorkspaceMembersTable({
                         Copy user ID
                       </DropdownMenuItem>
 
-                      {user?.isPrivileged({
-                        role,
-                      } as WorkspaceMembershipRead) && (
-                        <>
-                          <DialogTrigger asChild>
-                            <DropdownMenuItem
-                              onClick={() => {
-                                setSelectedUser(row.original)
-                                setIsChangeRoleOpen(true)
-                              }}
-                            >
-                              Change role
-                            </DropdownMenuItem>
-                          </DialogTrigger>
+                      {canUpdateMembers && (
+                        <DialogTrigger asChild>
+                          <DropdownMenuItem
+                            onClick={() => {
+                              setSelectedUser(row.original)
+                              setIsChangeRoleOpen(true)
+                            }}
+                          >
+                            Change role
+                          </DropdownMenuItem>
+                        </DialogTrigger>
+                      )}
 
-                          <AlertDialogTrigger asChild>
-                            <DropdownMenuItem
-                              className="text-rose-500 focus:text-rose-600"
-                              onClick={() => {
-                                setSelectedUser(row.original)
-                                console.debug("Selected user", row.original)
-                              }}
-                            >
-                              Remove from workspace
-                            </DropdownMenuItem>
-                          </AlertDialogTrigger>
-                        </>
+                      {canRemoveMembers && (
+                        <AlertDialogTrigger asChild>
+                          <DropdownMenuItem
+                            className="text-rose-500 focus:text-rose-600"
+                            onClick={() => {
+                              setSelectedUser(row.original)
+                              console.debug("Selected user", row.original)
+                            }}
+                          >
+                            Remove from workspace
+                          </DropdownMenuItem>
+                        </AlertDialogTrigger>
                       )}
                     </DropdownMenuContent>
                   </DropdownMenu>
@@ -262,7 +299,16 @@ export function WorkspaceMembersTable({
                   try {
                     await removeMember(selectedUser.user_id)
                   } catch (error) {
-                    console.log("Failed to remove member", error)
+                    const description =
+                      error instanceof Error
+                        ? error.message
+                        : "The request could not be completed."
+                    console.error("Failed to remove member", error)
+                    toast({
+                      title: "Failed to remove member",
+                      description,
+                      variant: "destructive",
+                    })
                   }
                 }
                 setSelectedUser(null)
@@ -274,7 +320,9 @@ export function WorkspaceMembersTable({
         </AlertDialogContent>
       </AlertDialog>
       <ChangeUserRoleDialog
+        open={isChangeRoleOpen}
         selectedUser={selectedUser}
+        isSubmitting={isRoleMutationPending || userAssignmentsIsLoading}
         setOpen={setIsChangeRoleOpen}
         onConfirm={handleChangeRole}
       />
@@ -283,36 +331,55 @@ export function WorkspaceMembersTable({
 }
 
 function ChangeUserRoleDialog({
+  open,
   selectedUser,
+  isSubmitting,
   setOpen,
   onConfirm,
 }: {
+  open: boolean
   selectedUser: WorkspaceMember | null
+  isSubmitting: boolean
   setOpen: (open: boolean) => void
-  onConfirm: (role: WorkspaceRole) => void
+  onConfirm: (roleId: string) => void
 }) {
-  const [newRole, setNewRole] = useState<WorkspaceRole>(
-    selectedUser?.workspace_role || "editor"
+  const { roles, isLoading: rolesIsLoading } = useRbacRoles({
+    enabled: open,
+  })
+  const workspaceRoles = useMemo(
+    () => roles.filter((r) => !r.slug || r.slug.startsWith("workspace-")),
+    [roles]
   )
+  const [selectedRoleId, setSelectedRoleId] = useState<string>("")
+
+  useEffect(() => {
+    if (!open) {
+      setSelectedRoleId("")
+      return
+    }
+    const match = workspaceRoles.find((r) => r.name === selectedUser?.role_name)
+    setSelectedRoleId(match?.id ?? "")
+  }, [open, selectedUser, workspaceRoles])
+
   return (
     <DialogContent>
       <DialogHeader>
-        <DialogTitle>Change User Role</DialogTitle>
+        <DialogTitle>Change user role</DialogTitle>
         <DialogDescription>
           Select a new role for {selectedUser?.email}
         </DialogDescription>
       </DialogHeader>
       <Select
-        value={newRole}
-        onValueChange={(value) => setNewRole(value as WorkspaceRole)}
+        value={selectedRoleId}
+        onValueChange={(value) => setSelectedRoleId(value)}
       >
-        <SelectTrigger>
+        <SelectTrigger disabled={rolesIsLoading}>
           <SelectValue placeholder="Select a role" />
         </SelectTrigger>
         <SelectContent>
-          {WorkspaceRoleEnum.map((role: WorkspaceRole) => (
-            <SelectItem key={role} value={role}>
-              <span className="capitalize">{role}</span>
+          {workspaceRoles.map((role) => (
+            <SelectItem key={role.id} value={role.id}>
+              {role.name}
             </SelectItem>
           ))}
         </SelectContent>
@@ -321,7 +388,12 @@ function ChangeUserRoleDialog({
         <Button variant="outline" onClick={() => setOpen(false)}>
           Cancel
         </Button>
-        <Button onClick={() => onConfirm(newRole)}>Change Role</Button>
+        <Button
+          disabled={!selectedRoleId || rolesIsLoading || isSubmitting}
+          onClick={() => onConfirm(selectedRoleId)}
+        >
+          Change role
+        </Button>
       </DialogFooter>
     </DialogContent>
   )

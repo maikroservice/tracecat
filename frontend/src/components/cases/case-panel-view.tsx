@@ -1,97 +1,98 @@
 "use client"
 
-import { format, intervalToDuration, isValid as isValidDate } from "date-fns"
 import {
   Activity,
   Braces,
-  FlagTriangleRight,
-  Hourglass,
   MessageSquare,
   MoreHorizontal,
   Paperclip,
+  Table2,
   X,
 } from "lucide-react"
 import { useRouter, useSearchParams } from "next/navigation"
 import { useCallback, useEffect, useMemo, useState } from "react"
 import type {
-  CaseDurationDefinitionRead,
-  CaseDurationRead,
+  CaseDropdownDefinitionRead,
   CaseFieldRead,
   CasePriority,
   CaseSeverity,
+  CaseStatus,
   CaseUpdate,
-  SqlType,
-  UserRead,
 } from "@/client"
-import { CaseActivityFeed } from "@/components/cases/case-activity-feed"
 import { CaseAttachmentsSection } from "@/components/cases/case-attachments-section"
+import { CaseClosureDialog } from "@/components/cases/case-closure-dialog"
 import { CommentSection } from "@/components/cases/case-comments-section"
-import { CaseWorkflowTriggerButton } from "@/components/cases/case-panel-common"
+import { CaseLinkedRowsSection } from "@/components/cases/case-linked-rows-section"
 import { CustomField } from "@/components/cases/case-panel-custom-fields"
 import { CasePanelDescription } from "@/components/cases/case-panel-description"
 import {
+  type AssigneeInfo,
   AssigneeSelect,
+  CaseDropdownSelect,
   PrioritySelect,
   SeveritySelect,
+  StatusSelect,
 } from "@/components/cases/case-panel-selectors"
 import { CasePanelSummary } from "@/components/cases/case-panel-summary"
 import { CasePayloadSection } from "@/components/cases/case-payload-section"
 import { CaseTasksSection } from "@/components/cases/case-tasks-section"
 import { CaseWorkflowTrigger } from "@/components/cases/case-workflow-trigger"
+import { CaseFeed } from "@/components/cases/cases-feed"
 import { AlertNotification } from "@/components/notifications"
 import { TagBadge } from "@/components/tag-badge"
-import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import {
-  Command,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList,
-  CommandSeparator,
-} from "@/components/ui/command"
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
-import {
-  HoverCard,
-  HoverCardContent,
-  HoverCardTrigger,
-} from "@/components/ui/hover-card"
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover"
+import { ScrollArea } from "@/components/ui/scroll-area"
 import { Separator } from "@/components/ui/separator"
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+} from "@/components/ui/sidebar"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/components/ui/tooltip"
 import { useToast } from "@/components/ui/use-toast"
-import { useFeatureFlag } from "@/hooks/use-feature-flags"
+import { useEntitlements } from "@/hooks/use-entitlements"
 import { useWorkspaceMembers } from "@/hooks/use-workspace"
 import {
   useAddCaseTag,
+  useCaseDropdownDefinitions,
   useCaseDurationDefinitions,
   useCaseDurations,
+  useCaseFields,
   useCaseTagCatalog,
   useGetCase,
   useRemoveCaseTag,
+  useSetCaseDropdownValue,
   useUpdateCase,
 } from "@/lib/hooks"
-import { parseISODuration } from "@/lib/time"
-import { undoSlugify } from "@/lib/utils"
+import { cn, undoSlugify } from "@/lib/utils"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
-type CasePanelTab = "comments" | "activity" | "attachments" | "payload"
+type CasePanelTab = "comments" | "activity" | "attachments" | "rows" | "payload"
+const CASE_PANEL_TABS = new Set<CasePanelTab>([
+  "comments",
+  "activity",
+  "attachments",
+  "rows",
+  "payload",
+])
+
+function parseCasePanelTab(
+  value: string | null | undefined
+): CasePanelTab | null {
+  if (!value || !CASE_PANEL_TABS.has(value as CasePanelTab)) {
+    return null
+  }
+  return value as CasePanelTab
+}
 
 function isCustomFieldValueEmpty(value: unknown): boolean {
   if (value === null || value === undefined) return true
@@ -104,375 +105,36 @@ function isCustomFieldValueEmpty(value: unknown): boolean {
   return false
 }
 
-function getFormattedDateValue(value: unknown): string | null {
-  if (value instanceof Date) {
-    return isValidDate(value) ? format(value, "MMM d yyyy '·' p") : null
-  }
-  if (typeof value === "string" && value.length > 0) {
-    const parsed = new Date(value)
-    if (isValidDate(parsed)) {
-      return format(parsed, "MMM d yyyy '·' p")
-    }
-  }
-  return null
-}
-
-function getCustomFieldInputWidth(value: unknown, type?: SqlType): string {
-  const baseLength = (() => {
-    const formattedDate = getFormattedDateValue(value)
-    if (formattedDate) return formattedDate.length
-    if (
-      (type === "TIMESTAMP" || type === "TIMESTAMPTZ") &&
-      (value === null ||
-        value === undefined ||
-        (typeof value === "string" && value.trim().length === 0))
-    ) {
-      return "Select date and time".length
-    }
-    if (value === null || value === undefined) return 5
-    if (typeof value === "string")
-      return Math.max(value.trim().length, value.length)
-    if (typeof value === "number" || typeof value === "boolean") {
-      return String(value).length
-    }
-    if (Array.isArray(value)) {
-      return Math.min(JSON.stringify(value).length, 24)
-    }
-    if (typeof value === "object") {
-      return Math.min(JSON.stringify(value).length, 24)
-    }
-    return 5
-  })()
-
-  const min = 8
-  const max = 28
-  const widthInCh = Math.min(Math.max(baseLength + 4, min), max)
-  return `${widthInCh}ch`
-}
-
-function parseCaseTimestamp(value?: string | null): Date | null {
-  if (!value) return null
-  const date = new Date(value)
-  return isValidDate(date) ? date : null
-}
-
-type DurationComponents = {
-  years?: number
-  months?: number
-  weeks?: number
-  days?: number
-  hours?: number
-  minutes?: number
-  seconds?: number
-}
-
-const DURATION_COMPONENT_ORDER: Array<keyof DurationComponents> = [
-  "years",
-  "months",
-  "weeks",
-  "days",
-  "hours",
-  "minutes",
-  "seconds",
-]
-
-const DURATION_SUFFIXES: Record<keyof DurationComponents, string> = {
-  years: "y",
-  months: "mo",
-  weeks: "w",
-  days: "d",
-  hours: "h",
-  minutes: "m",
-  seconds: "s",
-}
-
-function formatDurationComponents(
-  components: Partial<DurationComponents>
-): string {
-  const normalized: Required<DurationComponents> = {
-    years: components.years ?? 0,
-    months: components.months ?? 0,
-    weeks: components.weeks ?? 0,
-    days: components.days ?? 0,
-    hours: components.hours ?? 0,
-    minutes: components.minutes ?? 0,
-    seconds: components.seconds ?? 0,
-  }
-
-  if (normalized.weeks) {
-    normalized.days += normalized.weeks * 7
-    normalized.weeks = 0
-  }
-
-  const parts: string[] = []
-  for (const key of DURATION_COMPONENT_ORDER) {
-    const value = normalized[key]
-    if (!value) continue
-    parts.push(`${value}${DURATION_SUFFIXES[key]}`)
-  }
-  return parts.length > 0 ? parts.join(" ") : "0s"
-}
-
-function formatIsoDurationCompact(duration?: string | null): string | null {
-  if (!duration) return null
-  try {
-    const parsed = parseISODuration(duration)
-    return formatDurationComponents(parsed)
-  } catch (error) {
-    console.error("Failed to parse ISO duration", error)
-    return null
-  }
-}
-
-function formatElapsedDuration(start: Date, end: Date): string {
-  const elapsed = intervalToDuration({ start, end })
-  return formatDurationComponents(elapsed)
-}
-
-function formatLocalDateTime(date: Date): string {
-  return format(date, "MMM d yyyy '·' p")
-}
-
-function formatUtcDateTime(date: Date): string {
-  return `${date.toLocaleString(undefined, {
-    dateStyle: "medium",
-    timeStyle: "short",
-    timeZone: "UTC",
-  })} UTC`
-}
-
-interface CaseDurationMetric {
-  id: string
-  name: string
-  description?: string | null
-  definitionId: string
-  startedAt: Date
-  endedAt: Date | null
-  displayValue: string
-  state: "ongoing" | "done"
-}
-
-interface CaseDurationMetricsProps {
-  durations?: CaseDurationRead[]
-  definitions?: CaseDurationDefinitionRead[]
-  isLoading?: boolean
-  variant?: "default" | "inline"
-}
-
-function CaseDurationMetrics({
-  durations,
-  definitions,
-  isLoading = false,
-  variant = "default",
-}: CaseDurationMetricsProps) {
-  const [now, setNow] = useState(() => new Date())
-  const isInline = variant === "inline"
-
-  const hasOngoingDuration = useMemo(
-    () =>
-      Boolean(
-        durations?.some((duration) => duration.started_at && !duration.ended_at)
-      ),
-    [durations]
-  )
-
-  useEffect(() => {
-    if (!hasOngoingDuration) {
-      return
-    }
-    const interval = window.setInterval(() => {
-      setNow(new Date())
-    }, 1000)
-    return () => window.clearInterval(interval)
-  }, [hasOngoingDuration])
-
-  const definitionById = useMemo(() => {
-    if (!definitions || !definitions.length)
-      return new Map<string, CaseDurationDefinitionRead>()
-    return new Map(definitions.map((definition) => [definition.id, definition]))
-  }, [definitions])
-
-  const metrics = useMemo<CaseDurationMetric[]>(() => {
-    if (!durations || durations.length === 0) return []
-
-    return durations
-      .map<CaseDurationMetric | null>((duration) => {
-        const startedAt = parseCaseTimestamp(duration.started_at)
-        if (!startedAt) return null
-
-        const endedAt = parseCaseTimestamp(duration.ended_at)
-        const definition = definitionById.get(duration.definition_id)
-        const name =
-          definition?.name ??
-          `Duration ${duration.definition_id.slice(0, 8).toUpperCase()}`
-        const description = definition?.description
-        const state: CaseDurationMetric["state"] = endedAt ? "done" : "ongoing"
-
-        const resolvedDuration =
-          state === "done"
-            ? (formatIsoDurationCompact(duration.duration) ??
-              (endedAt ? formatElapsedDuration(startedAt, endedAt) : "—"))
-            : formatElapsedDuration(startedAt, now)
-
-        return {
-          id: duration.id,
-          name,
-          description,
-          definitionId: duration.definition_id,
-          startedAt,
-          endedAt,
-          displayValue: resolvedDuration,
-          state,
-        }
-      })
-      .filter((item): item is CaseDurationMetric => item !== null)
-  }, [definitionById, durations, now])
-
-  if (isLoading && (!durations || durations.length === 0)) {
-    if (isInline) {
-      return <Skeleton className="h-4 w-24" />
-    }
-
-    return (
-      <div className="py-1.5 first:pt-0 last:pb-0">
-        <Skeleton className="h-6 w-32" />
-      </div>
-    )
-  }
-
-  if (metrics.length === 0) return null
-
-  const metricsList = (
-    <div
-      className={`flex items-center gap-2 ${
-        isInline ? "flex-nowrap shrink-0" : "flex-wrap"
-      }`}
-    >
-      {metrics.map((metric) => {
-        const IconComponent =
-          metric.state === "ongoing" ? Hourglass : FlagTriangleRight
-        const tooltipLabel =
-          metric.state === "ongoing" ? "Ongoing" : "Completed"
-
-        return (
-          <HoverCard key={metric.id} openDelay={100} closeDelay={100}>
-            <HoverCardTrigger asChild>
-              <Badge
-                variant="outline"
-                className="min-w-0 gap-2 px-2 py-1 text-xs font-medium bg-background text-foreground"
-              >
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span className="inline-flex text-muted-foreground">
-                      <IconComponent
-                        aria-hidden="true"
-                        className="h-3.5 w-3.5"
-                      />
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent side="top" className="text-xs">
-                    {tooltipLabel}
-                  </TooltipContent>
-                </Tooltip>
-                <span className="max-w-[9rem] truncate">{metric.name}</span>
-                <span className="font-mono text-muted-foreground">
-                  {metric.displayValue}
-                </span>
-              </Badge>
-            </HoverCardTrigger>
-            <HoverCardContent className="w-80">
-              <div className="flex flex-col gap-3">
-                <div>
-                  <p className="text-sm font-semibold text-foreground">
-                    {metric.name}
-                  </p>
-                  {metric.description ? (
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      {metric.description}
-                    </p>
-                  ) : null}
-                </div>
-                <div className="space-y-3 text-xs">
-                  <div>
-                    <p className="font-medium uppercase tracking-wide text-muted-foreground">
-                      Start Event
-                    </p>
-                    <p className="mt-1">
-                      Local: {formatLocalDateTime(metric.startedAt)}
-                    </p>
-                    <p className="text-muted-foreground">
-                      UTC: {formatUtcDateTime(metric.startedAt)}
-                    </p>
-                  </div>
-                  <div>
-                    <p className="font-medium uppercase tracking-wide text-muted-foreground">
-                      End Event
-                    </p>
-                    {metric.endedAt ? (
-                      <>
-                        <p className="mt-1">
-                          Local: {formatLocalDateTime(metric.endedAt)}
-                        </p>
-                        <p className="text-muted-foreground">
-                          UTC: {formatUtcDateTime(metric.endedAt)}
-                        </p>
-                      </>
-                    ) : (
-                      <p className="mt-1 text-muted-foreground">
-                        Not triggered
-                      </p>
-                    )}
-                  </div>
-                </div>
-              </div>
-            </HoverCardContent>
-          </HoverCard>
-        )
-      })}
-    </div>
-  )
-
-  const content = (
-    <TooltipProvider delayDuration={150}>{metricsList}</TooltipProvider>
-  )
-
-  if (isInline) {
-    return content
-  }
-
-  return <div className="py-1.5 first:pt-0 last:pb-0">{content}</div>
-}
-
 interface CasePanelContentProps {
   caseId: string
+  embedded?: boolean
+  initialTab?: string | null
+  onTabChange?: (tab: string) => void
 }
 
-export function CasePanelView({ caseId }: CasePanelContentProps) {
+export function CasePanelView({
+  caseId,
+  embedded = false,
+  initialTab,
+  onTabChange,
+}: CasePanelContentProps) {
   const workspaceId = useWorkspaceId()
   const { members } = useWorkspaceMembers(workspaceId)
   const router = useRouter()
   const searchParams = useSearchParams()
-  const { isFeatureEnabled } = useFeatureFlag()
-  const caseTasksEnabled = isFeatureEnabled("case-tasks")
+  const { hasEntitlement } = useEntitlements()
+  const caseAddonsEnabled = hasEntitlement("case_addons")
 
   const { caseData, caseDataIsLoading, caseDataError } = useGetCase({
     caseId,
     workspaceId,
   })
-  const { caseDurations, caseDurationsIsLoading, caseDurationsError } =
-    useCaseDurations({
-      caseId,
-      workspaceId,
-      enabled: isFeatureEnabled("case-durations"),
-    })
-  const {
-    caseDurationDefinitions,
-    caseDurationDefinitionsIsLoading,
-    caseDurationDefinitionsError,
-  } = useCaseDurationDefinitions(
+  useCaseDurations({
+    caseId,
     workspaceId,
-    isFeatureEnabled("case-durations")
-  )
+    enabled: caseAddonsEnabled,
+  })
+  useCaseDurationDefinitions(workspaceId, caseAddonsEnabled)
   const { updateCase } = useUpdateCase({
     workspaceId,
     caseId,
@@ -480,172 +142,74 @@ export function CasePanelView({ caseId }: CasePanelContentProps) {
   const { addCaseTag } = useAddCaseTag({ caseId, workspaceId })
   const { removeCaseTag } = useRemoveCaseTag({ caseId, workspaceId })
   const { caseTags } = useCaseTagCatalog(workspaceId)
+  const { dropdownDefinitions } = useCaseDropdownDefinitions(
+    workspaceId,
+    caseAddonsEnabled
+  )
+  const setDropdownValue = useSetCaseDropdownValue(workspaceId)
+  const { caseFields: caseFieldDefinitions } = useCaseFields(workspaceId)
   const { toast } = useToast()
+  const [closureDialog, setClosureDialog] = useState<{
+    open: boolean
+    targetStatus: CaseStatus
+  } | null>(null)
   const customFields = useMemo(
     () => (caseData?.fields ?? []).filter((field) => !field.reserved),
     [caseData?.fields]
   )
-  useEffect(() => {
-    if (caseDurationsError) {
-      console.error("Failed to load case durations:", caseDurationsError)
-    }
-  }, [caseDurationsError])
-  useEffect(() => {
-    if (caseDurationDefinitionsError) {
-      console.error(
-        "Failed to load case duration definitions:",
-        caseDurationDefinitionsError
-      )
-    }
-  }, [caseDurationDefinitionsError])
-  const [userAddedCustomFieldIds, setUserAddedCustomFieldIds] = useState<
-    string[]
-  >([])
-  const [customFieldComboboxOpen, setCustomFieldComboboxOpen] = useState(false)
-  const [customFieldSearch, setCustomFieldSearch] = useState("")
-  const [customFieldWidths, setCustomFieldWidths] = useState<
-    Record<string, string>
-  >({})
-  const [clearedCustomFieldIds, setClearedCustomFieldIds] = useState<string[]>(
-    []
+  const [showAllCustomFields, setShowAllCustomFields] = useState(false)
+  const [embeddedTab, setEmbeddedTab] = useState<CasePanelTab>(
+    () => parseCasePanelTab(initialTab) ?? "comments"
   )
-  const nonEmptyCustomFieldIds = useMemo(
-    () =>
-      customFields
-        .filter(
-          (field) =>
-            !isCustomFieldValueEmpty(field.value) &&
-            !clearedCustomFieldIds.includes(field.id)
-        )
-        .map((field) => field.id),
-    [customFields, clearedCustomFieldIds]
-  )
-  useEffect(() => {
-    setUserAddedCustomFieldIds((prev) =>
-      prev.filter((id) => customFields.some((field) => field.id === id))
-    )
-  }, [customFields])
-  useEffect(() => {
-    setCustomFieldWidths((prev) => {
-      const next: Record<string, string> = {}
-      customFields.forEach((field) => {
-        next[field.id] = getCustomFieldInputWidth(field.value, field.type)
-      })
-
-      const changed =
-        Object.keys(next).length !== Object.keys(prev).length ||
-        Object.entries(next).some(([key, value]) => prev[key] !== value)
-
-      return changed ? next : prev
-    })
-  }, [customFields])
-  useEffect(() => {
-    setClearedCustomFieldIds((prev) =>
-      prev.filter((id) => {
-        const field = customFields.find((item) => item.id === id)
-        if (!field) return false
-        return isCustomFieldValueEmpty(field.value)
-      })
-    )
-  }, [customFields])
-  const visibleCustomFieldIds = useMemo(() => {
-    const set = new Set([...nonEmptyCustomFieldIds, ...userAddedCustomFieldIds])
-    return customFields.map((field) => field.id).filter((id) => set.has(id))
-  }, [customFields, nonEmptyCustomFieldIds, userAddedCustomFieldIds])
   const visibleCustomFields = useMemo(
     () =>
-      customFields.filter((field) => visibleCustomFieldIds.includes(field.id)),
-    [customFields, visibleCustomFieldIds]
+      showAllCustomFields
+        ? customFields
+        : customFields.filter((field) => !isCustomFieldValueEmpty(field.value)),
+    [customFields, showAllCustomFields]
   )
-  const availableCustomFields = useMemo(
-    () =>
-      customFields.filter((field) => !visibleCustomFieldIds.includes(field.id)),
-    [customFields, visibleCustomFieldIds]
-  )
-  const handleCustomFieldValueChange = useCallback(
-    (fieldId: string, value: unknown) => {
-      setCustomFieldWidths((prev) => {
-        const fieldType = customFields.find(
-          (field) => field.id === fieldId
-        )?.type
-        return {
-          ...prev,
-          [fieldId]: getCustomFieldInputWidth(value, fieldType),
-        }
-      })
-    },
-    [customFields]
-  )
-  const handleCustomFieldAdd = useCallback(
-    (fieldId: string) => {
-      const targetField = customFields.find((field) => field.id === fieldId)
-      setClearedCustomFieldIds((prev) => prev.filter((id) => id !== fieldId))
-      setUserAddedCustomFieldIds((prev) =>
-        prev.includes(fieldId) ? prev : [...prev, fieldId]
-      )
-      setCustomFieldComboboxOpen(false)
-      setCustomFieldSearch("")
-      setCustomFieldWidths((prev) => ({
-        ...prev,
-        [fieldId]:
-          prev[fieldId] ??
-          getCustomFieldInputWidth(
-            targetField?.value ?? null,
-            targetField?.type
-          ),
-      }))
-    },
-    [customFields]
-  )
-  const handleCustomFieldClearAndHide = useCallback(
+  const handleCustomFieldClear = useCallback(
     async (field: CaseFieldRead) => {
-      setClearedCustomFieldIds((prev) =>
-        prev.includes(field.id) ? prev : [...prev, field.id]
-      )
-      setUserAddedCustomFieldIds((prev) => prev.filter((id) => id !== field.id))
       try {
         await updateCase({
           fields: {
             [field.id]: null,
           },
         })
-        handleCustomFieldValueChange(field.id, null)
       } catch (error) {
         console.error("Failed to clear custom field:", error)
-        setClearedCustomFieldIds((prev) => prev.filter((id) => id !== field.id))
-        setUserAddedCustomFieldIds((prev) =>
-          prev.includes(field.id) ? prev : [...prev, field.id]
-        )
       }
     },
-    [handleCustomFieldValueChange, updateCase]
+    [updateCase]
   )
-  const handleCustomFieldPopoverChange = useCallback((open: boolean) => {
-    setCustomFieldComboboxOpen(open)
-    if (!open) {
-      setCustomFieldSearch("")
-    }
-  }, [])
 
   // Get active tab from URL query params, default to "comments"
-  const activeTab = (
-    searchParams &&
-    ["comments", "activity", "attachments", "payload"].includes(
-      searchParams.get("tab") || ""
-    )
-      ? (searchParams.get("tab") ?? "comments")
-      : "comments"
-  ) as CasePanelTab
+  const routeTab = parseCasePanelTab(searchParams?.get("tab")) ?? "comments"
+  const activeTab = embedded ? embeddedTab : routeTab
+
+  useEffect(() => {
+    if (!embedded) {
+      return
+    }
+    const nextTab = parseCasePanelTab(initialTab) ?? "comments"
+    if (nextTab !== embeddedTab) {
+      setEmbeddedTab(nextTab)
+    }
+  }, [caseId, embedded, embeddedTab, initialTab])
 
   // Function to handle tab changes and update URL
   const handleTabChange = useCallback(
     (tab: string) => {
-      router.push(`/workspaces/${workspaceId}/cases/${caseId}?tab=${tab}`)
+      const nextTab = parseCasePanelTab(tab) ?? "comments"
+      if (embedded) {
+        setEmbeddedTab(nextTab)
+        onTabChange?.(nextTab)
+        return
+      }
+      router.push(`/workspaces/${workspaceId}/cases/${caseId}?tab=${nextTab}`)
     },
-    [router, workspaceId, caseId]
+    [embedded, router, workspaceId, caseId, onTabChange]
   )
-  const durationsAreLoading =
-    caseDurationsIsLoading || caseDurationDefinitionsIsLoading
 
   if (caseDataIsLoading) {
     return (
@@ -678,6 +242,40 @@ export function CasePanelView({ caseId }: CasePanelContentProps) {
     )
   }
 
+  const handleStatusChange = async (newStatus: CaseStatus) => {
+    if (
+      caseAddonsEnabled &&
+      (newStatus === "closed" || newStatus === "resolved")
+    ) {
+      const reqFields =
+        caseFieldDefinitions?.filter(
+          (f) => !f.reserved && f.required_on_closure
+        ) ?? []
+      const reqDropdowns =
+        dropdownDefinitions?.filter((d) => d.required_on_closure) ?? []
+
+      if (reqFields.length > 0 || reqDropdowns.length > 0) {
+        // Check if any required field/dropdown is empty on the current case
+        const hasEmptyField = reqFields.some((f) => {
+          const field = caseData.fields.find((cf) => cf.id === f.id)
+          return isCustomFieldValueEmpty(field?.value)
+        })
+        const hasEmptyDropdown = reqDropdowns.some((d) => {
+          const dv = caseData.dropdown_values.find(
+            (v) => v.definition_id === d.id
+          )
+          return !dv?.option_id
+        })
+
+        if (hasEmptyField || hasEmptyDropdown) {
+          setClosureDialog({ open: true, targetStatus: newStatus })
+          return
+        }
+      }
+    }
+    await updateCase({ status: newStatus })
+  }
+
   const handlePriorityChange = async (newPriority: CasePriority) => {
     const params = {
       priority: newPriority,
@@ -692,7 +290,7 @@ export function CasePanelView({ caseId }: CasePanelContentProps) {
     await updateCase(params)
   }
 
-  const handleAssigneeChange = async (newAssignee?: UserRead | null) => {
+  const handleAssigneeChange = async (newAssignee?: AssigneeInfo | null) => {
     const params: Partial<CaseUpdate> = {
       assignee_id: newAssignee?.id || null,
     }
@@ -718,322 +316,449 @@ export function CasePanelView({ caseId }: CasePanelContentProps) {
     }
   }
 
+  const panelFieldRowClassName = cn(
+    "group -mx-2 flex h-7 w-full min-w-0 max-w-full cursor-pointer items-center gap-2 rounded-sm px-2 transition-colors hover:bg-muted/70 focus-within:bg-muted/70",
+    embedded
+      ? "[@container(max-width:360px)]:h-auto [@container(max-width:360px)]:min-h-12 [@container(max-width:360px)]:flex-col [@container(max-width:360px)]:items-stretch [@container(max-width:360px)]:gap-0.5 [@container(max-width:360px)]:py-1"
+      : undefined
+  )
+  const panelFieldRowInteractiveSelector =
+    "input:not([type='hidden']):not([disabled]), textarea:not([disabled]), [role='combobox']:not([aria-disabled='true']), button:not([disabled])"
+  const panelFieldRowTargetSelector =
+    "button:not([disabled]), input:not([type='hidden']):not([disabled]), textarea:not([disabled]), [role='combobox']:not([aria-disabled='true']), a[href]"
+  const handlePanelFieldRowClick = (
+    event: React.MouseEvent<HTMLDivElement>
+  ) => {
+    const target = event.target as HTMLElement | null
+    if (target?.closest(panelFieldRowTargetSelector)) {
+      return
+    }
+
+    const controlContainer = event.currentTarget.querySelector<HTMLElement>(
+      ".tc-case-panel-row-control"
+    )
+    const control = controlContainer?.querySelector<HTMLElement>(
+      panelFieldRowInteractiveSelector
+    )
+    if (!control) return
+
+    if (
+      control instanceof HTMLInputElement ||
+      control instanceof HTMLTextAreaElement
+    ) {
+      control.focus()
+      return
+    }
+
+    control.click()
+    control.focus()
+  }
+
+  const tabTriggerClassName =
+    "flex h-full shrink-0 items-center justify-center rounded-none py-0 text-xs font-medium data-[state=active]:bg-transparent data-[state=active]:shadow-none"
+  const panelSelectTriggerClassName = cn(
+    "h-7 w-full min-w-0 max-w-full justify-end border-none px-2 text-right text-sm hover:bg-transparent focus:ring-0 focus-visible:ring-0 focus-visible:ring-offset-0 data-[state=open]:border-none data-[state=open]:ring-0 [&>span]:min-w-0 [&>span]:w-full",
+    embedded
+      ? "[@container(max-width:360px)]:justify-start [@container(max-width:360px)]:px-0 [@container(max-width:360px)]:text-left"
+      : undefined
+  )
+  const panelControlClassName = cn(
+    "tc-case-panel-row-control ml-auto min-w-0 max-w-full flex-1",
+    embedded
+      ? "[@container(max-width:360px)]:ml-0 [@container(max-width:360px)]:w-full [@container(max-width:360px)]:flex-none"
+      : undefined
+  )
+  const panelLabelClassName = cn(
+    "min-w-0 truncate text-sm text-muted-foreground",
+    embedded && "[@container(max-width:360px)]:w-full"
+  )
+  const caseDetailsContent = (
+    <>
+      <SidebarGroup>
+        <SidebarGroupLabel>Properties</SidebarGroupLabel>
+        <SidebarGroupContent className="px-2">
+          <div className="flex flex-col gap-2">
+            <div
+              className={panelFieldRowClassName}
+              onClick={handlePanelFieldRowClick}
+            >
+              <span className={panelLabelClassName}>Status</span>
+              <div className={panelControlClassName}>
+                <StatusSelect
+                  status={caseData.status}
+                  onValueChange={handleStatusChange}
+                  showLabel={false}
+                  triggerClassName={panelSelectTriggerClassName}
+                  valueClassName="text-sm"
+                />
+              </div>
+            </div>
+            <div
+              className={panelFieldRowClassName}
+              onClick={handlePanelFieldRowClick}
+            >
+              <span className={panelLabelClassName}>Priority</span>
+              <div className={panelControlClassName}>
+                <PrioritySelect
+                  priority={caseData.priority || "unknown"}
+                  onValueChange={handlePriorityChange}
+                  showLabel={false}
+                  triggerClassName={panelSelectTriggerClassName}
+                  valueClassName="text-sm"
+                />
+              </div>
+            </div>
+            <div
+              className={panelFieldRowClassName}
+              onClick={handlePanelFieldRowClick}
+            >
+              <span className={panelLabelClassName}>Severity</span>
+              <div className={panelControlClassName}>
+                <SeveritySelect
+                  severity={caseData.severity || "unknown"}
+                  onValueChange={handleSeverityChange}
+                  showLabel={false}
+                  triggerClassName={panelSelectTriggerClassName}
+                  valueClassName="text-sm"
+                />
+              </div>
+            </div>
+            <div
+              className={panelFieldRowClassName}
+              onClick={handlePanelFieldRowClick}
+            >
+              <span className={panelLabelClassName}>Assignee</span>
+              <div className={panelControlClassName}>
+                <AssigneeSelect
+                  assignee={caseData.assignee}
+                  workspaceMembers={members ?? []}
+                  onValueChange={handleAssigneeChange}
+                  showLabel={false}
+                  triggerClassName={panelSelectTriggerClassName}
+                  valueClassName="text-sm"
+                />
+              </div>
+            </div>
+            {caseAddonsEnabled &&
+              dropdownDefinitions?.map((def: CaseDropdownDefinitionRead) => {
+                const currentValue = caseData.dropdown_values?.find(
+                  (dv) => dv.definition_id === def.id
+                )
+                return (
+                  <div
+                    key={def.id}
+                    className={panelFieldRowClassName}
+                    onClick={handlePanelFieldRowClick}
+                  >
+                    <span className={panelLabelClassName} title={def.name}>
+                      {def.name}
+                    </span>
+                    <div className={panelControlClassName}>
+                      <CaseDropdownSelect
+                        definition={def}
+                        currentValue={currentValue}
+                        onValueChange={(optionId) =>
+                          setDropdownValue.mutate({
+                            caseId: caseData.id,
+                            definitionId: def.id,
+                            optionId,
+                          })
+                        }
+                        showLabel={false}
+                        triggerClassName={panelSelectTriggerClassName}
+                        valueClassName="text-sm"
+                      />
+                    </div>
+                  </div>
+                )
+              })}
+          </div>
+        </SidebarGroupContent>
+      </SidebarGroup>
+      <SidebarGroup>
+        <SidebarGroupLabel>Fields</SidebarGroupLabel>
+        <SidebarGroupContent className="px-2">
+          <div className="flex flex-col gap-2">
+            {visibleCustomFields.length > 0 ? (
+              visibleCustomFields.map((field) => {
+                const label = undoSlugify(field.id)
+                return (
+                  <div
+                    key={field.id}
+                    className={panelFieldRowClassName}
+                    onClick={handlePanelFieldRowClick}
+                  >
+                    {showAllCustomFields && (
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        type="button"
+                        className="h-7 w-7 shrink-0 text-muted-foreground hover:text-foreground"
+                        onClick={() => handleCustomFieldClear(field)}
+                      >
+                        <X className="h-3.5 w-3.5" />
+                        <span className="sr-only">Clear {label} field</span>
+                      </Button>
+                    )}
+                    <span className={panelLabelClassName} title={label}>
+                      {label}
+                    </span>
+                    <div className={panelControlClassName}>
+                      <div className="flex h-7 w-full items-center gap-2">
+                        <div className="min-w-0 flex-1">
+                          <CustomField
+                            customField={field}
+                            updateCase={updateCase}
+                            formClassName="w-full min-w-0 max-w-full"
+                            inputClassName={cn(
+                              "w-full min-w-0 max-w-full border-none text-sm hover:bg-transparent focus:ring-0 focus-visible:ring-0 focus-visible:ring-offset-0",
+                              embedded &&
+                                "[@container(max-width:360px)]:px-0 [@container(max-width:360px)]:text-left"
+                            )}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )
+              })
+            ) : customFields.length === 0 ? (
+              <span className="text-sm text-muted-foreground">
+                No custom fields configured
+              </span>
+            ) : null}
+            {customFields.length > 0 && (
+              <button
+                type="button"
+                className="h-7 text-left text-sm text-muted-foreground underline-offset-4 hover:underline"
+                onClick={() => setShowAllCustomFields((prev) => !prev)}
+              >
+                {showAllCustomFields ? "Hide empty fields" : "View all fields"}
+              </button>
+            )}
+          </div>
+        </SidebarGroupContent>
+      </SidebarGroup>
+    </>
+  )
+
   return (
     <>
       <CaseWorkflowTrigger caseData={caseData} />
-      <div className="h-full flex w-full">
-        <div className="h-full w-full min-w-0 flex">
-          {/* Main section */}
-          <div className="flex-1 min-w-0">
-            <div className="h-full overflow-auto min-w-0 bg-muted/20">
-              <div className="border-b bg-background">
-                <div className="flex h-11 items-center px-3">
-                  <div className="flex flex-1 justify-center overflow-hidden">
-                    <div className="flex h-full items-center gap-x-4 overflow-x-auto text-sm">
-                      <PrioritySelect
-                        priority={caseData.priority || "unknown"}
-                        onValueChange={handlePriorityChange}
-                      />
-                      <SeveritySelect
-                        severity={caseData.severity || "unknown"}
-                        onValueChange={handleSeverityChange}
-                      />
-                      <AssigneeSelect
-                        assignee={caseData.assignee}
-                        workspaceMembers={members ?? []}
-                        onValueChange={handleAssigneeChange}
-                      />
-                      <CaseDurationMetrics
-                        durations={caseDurations}
-                        definitions={caseDurationDefinitions}
-                        isLoading={durationsAreLoading}
-                        variant="inline"
-                      />
-                    </div>
+      <div
+        className={cn(
+          "tc-case-panel flex h-full w-full min-w-0",
+          embedded && "@container"
+        )}
+      >
+        <div className="min-w-0 flex-1">
+          <ScrollArea
+            className={cn(
+              "h-full min-w-0 bg-muted/20",
+              embedded &&
+                "[&_[data-radix-scroll-area-viewport]>div]:!block [&_[data-radix-scroll-area-viewport]>div]:!w-full [&_[data-radix-scroll-area-viewport]>div]:!min-w-0 [&_[data-radix-scroll-area-viewport]>div]:!max-w-full"
+            )}
+          >
+            <div
+              className={cn(
+                "mx-auto w-full min-w-0 max-w-4xl",
+                embedded
+                  ? "px-4 py-5 pb-12 [@container(max-width:280px)]:px-3 [@container(max-width:360px)]:px-3.5"
+                  : "px-6 py-8 pb-24"
+              )}
+            >
+              <div className="mb-2">
+                <div className="flex flex-col">
+                  <div className="py-1.5 first:pt-0 last:pb-0">
+                    <CasePanelSummary
+                      caseData={caseData}
+                      updateCase={updateCase}
+                      compact={embedded}
+                    />
                   </div>
-                  <CaseWorkflowTriggerButton className="ml-3 shrink-0" />
+                  <div className="flex flex-wrap items-center justify-between gap-3 py-1.5 first:pt-0 last:pb-0">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {caseData.tags?.length ? (
+                        caseData.tags.map((tag) => (
+                          <TagBadge key={tag.id} tag={tag} />
+                        ))
+                      ) : (
+                        <span className="text-xs text-muted-foreground">
+                          No tags
+                        </span>
+                      )}
+                    </div>
+                    {caseTags && caseTags.length > 0 && (
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-6 w-6 p-0"
+                          >
+                            <MoreHorizontal className="h-4 w-4" />
+                            <span className="sr-only">Manage tags</span>
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end" className="text-xs">
+                          {caseTags.map((tag) => {
+                            const hasTag = caseData.tags?.some(
+                              (t) => t.id === tag.id
+                            )
+                            return (
+                              <DropdownMenuCheckboxItem
+                                key={tag.id}
+                                className="text-xs"
+                                checked={hasTag}
+                                onClick={async (e) => {
+                                  e.stopPropagation()
+                                  await handleTagToggle(tag.id, !!hasTag)
+                                }}
+                              >
+                                <div
+                                  className="mr-2 flex size-2 rounded-full"
+                                  style={{
+                                    backgroundColor: tag.color || undefined,
+                                  }}
+                                />
+                                <span>{tag.name}</span>
+                              </DropdownMenuCheckboxItem>
+                            )
+                          })}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    )}
+                  </div>
                 </div>
               </div>
-              <div className="py-8 pb-24 px-6 max-w-4xl mx-auto">
-                {/* Header with Chat Toggle */}
-                <div className="mb-4">
-                  <div className="flex flex-col">
-                    <div className="py-1.5 first:pt-0 last:pb-0">
-                      {/* Case Summary */}
-                      <CasePanelSummary
-                        caseData={caseData}
-                        updateCase={updateCase}
-                      />
-                    </div>
-                    <div className="flex flex-wrap items-center justify-between gap-3 py-1.5 first:pt-0 last:pb-0">
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        {caseData.tags?.length ? (
-                          caseData.tags.map((tag) => (
-                            <TagBadge key={tag.id} tag={tag} />
-                          ))
-                        ) : (
-                          <span className="text-xs text-muted-foreground">
-                            No tags
-                          </span>
-                        )}
-                      </div>
-                      {caseTags && caseTags.length > 0 && (
-                        <DropdownMenu>
-                          <DropdownMenuTrigger asChild>
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              className="h-6 w-6 p-0"
-                            >
-                              <MoreHorizontal className="h-4 w-4" />
-                              <span className="sr-only">Manage tags</span>
-                            </Button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end" className="text-xs">
-                            {caseTags.map((tag) => {
-                              const hasTag = caseData.tags?.some(
-                                (t) => t.id === tag.id
-                              )
-                              return (
-                                <DropdownMenuCheckboxItem
-                                  key={tag.id}
-                                  className="text-xs"
-                                  checked={hasTag}
-                                  onClick={async (e) => {
-                                    e.stopPropagation()
-                                    await handleTagToggle(tag.id, !!hasTag)
-                                  }}
-                                >
-                                  <div
-                                    className="mr-2 flex size-2 rounded-full"
-                                    style={{
-                                      backgroundColor: tag.color || undefined,
-                                    }}
-                                  />
-                                  <span>{tag.name}</span>
-                                </DropdownMenuCheckboxItem>
-                              )
-                            })}
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                      )}
-                    </div>
-                    <div
-                      className={`flex flex-col gap-3 py-1.5 first:pt-0 last:pb-0 sm:flex-row sm:items-start sm:justify-between`}
-                    >
-                      <div className="flex flex-wrap items-center gap-x-6 gap-y-3 sm:flex-1 sm:min-w-0">
-                        {visibleCustomFields.length > 0 ? (
-                          visibleCustomFields.map((field) => {
-                            const label = undoSlugify(field.id)
-                            return (
-                              <div
-                                key={field.id}
-                                className="flex items-center gap-2 text-xs"
-                              >
-                                <span className="text-muted-foreground">
-                                  {label}
-                                </span>
-                                <CustomField
-                                  customField={field}
-                                  updateCase={updateCase}
-                                  formClassName="inline-flex"
-                                  inputClassName="text-xs"
-                                  inputStyle={{
-                                    width:
-                                      customFieldWidths[field.id] ??
-                                      getCustomFieldInputWidth(
-                                        field.value,
-                                        field.type
-                                      ),
-                                  }}
-                                  onValueChange={handleCustomFieldValueChange}
-                                />
-                                <Button
-                                  variant="ghost"
-                                  size="icon"
-                                  className="h-5 w-5 text-muted-foreground hover:text-foreground"
-                                  onClick={() =>
-                                    handleCustomFieldClearAndHide(field)
-                                  }
-                                >
-                                  <X className="h-3.5 w-3.5" />
-                                  <span className="sr-only">
-                                    Remove {label} field
-                                  </span>
-                                </Button>
-                              </div>
-                            )
-                          })
-                        ) : customFields.length === 0 ? (
-                          <span className="text-xs text-muted-foreground">
-                            No custom fields configured
-                          </span>
-                        ) : (
-                          <span className="text-xs text-muted-foreground">
-                            No custom fields selected
-                          </span>
-                        )}
-                      </div>
-                      {customFields.length > 0 && (
-                        <div className="flex shrink-0 items-start sm:self-start">
-                          <Popover
-                            open={customFieldComboboxOpen}
-                            onOpenChange={handleCustomFieldPopoverChange}
-                          >
-                            <PopoverTrigger asChild>
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                className="h-6 w-6 p-0"
-                                aria-expanded={customFieldComboboxOpen}
-                                aria-haspopup="listbox"
-                              >
-                                <MoreHorizontal className="h-4 w-4" />
-                                <span className="sr-only">
-                                  Toggle custom fields menu
-                                </span>
-                              </Button>
-                            </PopoverTrigger>
-                            <PopoverContent
-                              align="end"
-                              className="w-64 p-0"
-                              sideOffset={4}
-                            >
-                              <Command>
-                                <CommandInput
-                                  placeholder="Search fields..."
-                                  value={customFieldSearch}
-                                  onValueChange={setCustomFieldSearch}
-                                />
-                                <CommandList>
-                                  {availableCustomFields.length > 0 ? (
-                                    <CommandGroup heading="Hidden fields">
-                                      {availableCustomFields.map((field) => (
-                                        <CommandItem
-                                          key={field.id}
-                                          value={field.id}
-                                          onSelect={(value) => {
-                                            handleCustomFieldAdd(value)
-                                          }}
-                                        >
-                                          {undoSlugify(field.id)}
-                                        </CommandItem>
-                                      ))}
-                                    </CommandGroup>
-                                  ) : (
-                                    <div className="px-3 py-2 text-xs text-muted-foreground">
-                                      No hidden fields
-                                    </div>
-                                  )}
-                                  <CommandSeparator />
-                                  <CommandGroup>
-                                    <CommandItem
-                                      value="__manage__"
-                                      onSelect={() => {
-                                        router.push(
-                                          `/workspaces/${workspaceId}/cases/custom-fields`
-                                        )
-                                        setCustomFieldComboboxOpen(false)
-                                        setCustomFieldSearch("")
-                                      }}
-                                    >
-                                      Manage fields
-                                    </CommandItem>
-                                  </CommandGroup>
-                                </CommandList>
-                              </Command>
-                            </PopoverContent>
-                          </Popover>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                </div>
 
-                {/* Description */}
-                <div className="mb-4">
-                  <CasePanelDescription
+              <div className="mb-4">
+                <CasePanelDescription
+                  caseData={caseData}
+                  updateCase={updateCase}
+                  compact={embedded}
+                />
+              </div>
+
+              {caseAddonsEnabled && (
+                <div className="mb-6">
+                  <CaseTasksSection
+                    caseId={caseId}
+                    workspaceId={workspaceId}
                     caseData={caseData}
-                    updateCase={updateCase}
                   />
                 </div>
+              )}
 
-                {/* Tasks Section */}
-                {caseTasksEnabled && (
-                  <div className="mb-6">
-                    <CaseTasksSection
-                      caseId={caseId}
-                      workspaceId={workspaceId}
-                      caseData={caseData}
-                    />
-                  </div>
-                )}
+              {embedded && (
+                <div className="mb-6 border-y bg-background/80 py-2">
+                  {caseDetailsContent}
+                </div>
+              )}
 
-                {/* Tabs using shadcn components */}
-                <Tabs
-                  value={activeTab}
-                  onValueChange={handleTabChange}
-                  className="mt-[4.5rem] w-full"
-                >
-                  <TabsList className="h-8 w-full justify-start rounded-none bg-transparent p-0">
-                    <TabsTrigger
-                      className="flex h-full items-center justify-center rounded-none py-0 text-xs font-medium data-[state=active]:bg-transparent data-[state=active]:shadow-none"
-                      value="comments"
-                    >
-                      <MessageSquare className="mr-1.5 h-3.5 w-3.5" />
-                      Comments
-                    </TabsTrigger>
-                    <TabsTrigger
-                      className="ml-6 flex h-full items-center justify-center rounded-none py-0 text-xs font-medium data-[state=active]:bg-transparent data-[state=active]:shadow-none"
-                      value="activity"
-                    >
-                      <Activity className="mr-1.5 h-3.5 w-3.5" />
-                      Activity
-                    </TabsTrigger>
-                    <TabsTrigger
-                      className="ml-6 flex h-full items-center justify-center rounded-none py-0 text-xs font-medium data-[state=active]:bg-transparent data-[state=active]:shadow-none"
-                      value="attachments"
-                    >
-                      <Paperclip className="mr-1.5 h-3.5 w-3.5" />
-                      Attachments
-                    </TabsTrigger>
-                    <TabsTrigger
-                      className="ml-6 flex h-full items-center justify-center rounded-none py-0 text-xs font-medium data-[state=active]:bg-transparent data-[state=active]:shadow-none"
-                      value="payload"
-                    >
-                      <Braces className="mr-1.5 h-3.5 w-3.5" />
-                      Payload
-                    </TabsTrigger>
-                  </TabsList>
-                  <Separator className="mt-0" />
+              <Tabs
+                value={activeTab}
+                onValueChange={handleTabChange}
+                className={cn("w-full", embedded ? "mt-6" : "mt-[4.5rem]")}
+              >
+                <TabsList className="h-8 w-full justify-start gap-6 overflow-x-auto rounded-none bg-transparent p-0">
+                  <TabsTrigger className={tabTriggerClassName} value="comments">
+                    <MessageSquare className="mr-1.5 h-3.5 w-3.5" />
+                    Comments
+                  </TabsTrigger>
+                  <TabsTrigger className={tabTriggerClassName} value="activity">
+                    <Activity className="mr-1.5 h-3.5 w-3.5" />
+                    Activity
+                  </TabsTrigger>
+                  <TabsTrigger
+                    className={tabTriggerClassName}
+                    value="attachments"
+                  >
+                    <Paperclip className="mr-1.5 h-3.5 w-3.5" />
+                    Attachments
+                  </TabsTrigger>
+                  <TabsTrigger className={tabTriggerClassName} value="rows">
+                    <Table2 className="mr-1.5 h-3.5 w-3.5" />
+                    Tables
+                  </TabsTrigger>
+                  <TabsTrigger className={tabTriggerClassName} value="payload">
+                    <Braces className="mr-1.5 h-3.5 w-3.5" />
+                    Payload
+                  </TabsTrigger>
+                </TabsList>
+                <Separator className="mt-0" />
 
-                  <TabsContent value="comments" className="mt-4">
-                    <CommentSection caseId={caseId} workspaceId={workspaceId} />
-                  </TabsContent>
+                <TabsContent value="comments" className="mt-4">
+                  <CommentSection caseId={caseId} workspaceId={workspaceId} />
+                </TabsContent>
 
-                  <TabsContent value="activity" className="mt-4">
-                    <CaseActivityFeed
-                      caseId={caseId}
-                      workspaceId={workspaceId}
-                    />
-                  </TabsContent>
+                <TabsContent value="activity" className="mt-4">
+                  <CaseFeed caseId={caseId} workspaceId={workspaceId} />
+                </TabsContent>
 
-                  <TabsContent value="attachments" className="mt-4">
-                    <CaseAttachmentsSection
-                      caseId={caseId}
-                      workspaceId={workspaceId}
-                    />
-                  </TabsContent>
+                <TabsContent value="attachments" className="mt-4">
+                  <CaseAttachmentsSection
+                    caseId={caseId}
+                    workspaceId={workspaceId}
+                  />
+                </TabsContent>
 
-                  <TabsContent value="payload" className="mt-4">
-                    <CasePayloadSection caseData={caseData} />
-                  </TabsContent>
-                </Tabs>
-              </div>
+                <TabsContent value="rows" className="mt-4">
+                  <CaseLinkedRowsSection caseData={caseData} />
+                </TabsContent>
+
+                <TabsContent value="payload" className="mt-4">
+                  <CasePayloadSection caseData={caseData} />
+                </TabsContent>
+              </Tabs>
             </div>
-          </div>
+          </ScrollArea>
         </div>
+        {!embedded && (
+          <Sidebar
+            side="right"
+            collapsible="none"
+            className="w-[22rem] shrink-0 border-l border-border bg-background text-foreground"
+          >
+            <SidebarContent className="h-full">
+              {caseDetailsContent}
+            </SidebarContent>
+          </Sidebar>
+        )}
       </div>
+      {closureDialog && (
+        <CaseClosureDialog
+          open={closureDialog.open}
+          onOpenChange={(open) => {
+            if (!open) setClosureDialog(null)
+          }}
+          targetStatus={closureDialog.targetStatus as "closed" | "resolved"}
+          requiredFields={
+            caseFieldDefinitions?.filter(
+              (f) => !f.reserved && f.required_on_closure
+            ) ?? []
+          }
+          requiredDropdowns={
+            dropdownDefinitions?.filter((d) => d.required_on_closure) ?? []
+          }
+          currentFieldValues={Object.fromEntries(
+            caseData.fields
+              .filter((f) => !f.reserved)
+              .map((f) => [f.id, f.value])
+          )}
+          currentDropdownValues={caseData.dropdown_values}
+          onSubmit={async (data) => {
+            await updateCase({
+              status: closureDialog.targetStatus,
+              fields: data.fields,
+              dropdown_values: data.dropdown_values.map((dv) => ({
+                definition_id: dv.definition_id,
+                option_id: dv.option_id,
+              })),
+            })
+          }}
+        />
+      )}
     </>
   )
 }

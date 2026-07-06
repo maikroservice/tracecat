@@ -15,10 +15,13 @@ from sqlalchemy.exc import NoResultFound
 
 from tracecat.auth.api_keys import verify_api_key
 from tracecat.auth.types import Role
-from tracecat.authz.enums import WorkspaceRole
+from tracecat.authz.scopes import SERVICE_PRINCIPAL_SCOPES
 from tracecat.contexts import ctx_role
-from tracecat.db.engine import get_async_session_context_manager
-from tracecat.db.models import Webhook, WorkflowDefinition
+from tracecat.db.engine import (
+    get_async_session_bypass_rls_context_manager,
+    get_async_session_context_manager,
+)
+from tracecat.db.models import Webhook, WorkflowDefinition, Workspace
 from tracecat.dsl.schemas import TriggerInputs
 from tracecat.ee.interactions.connectors import parse_slack_interaction_input
 from tracecat.ee.interactions.enums import InteractionCategory
@@ -70,7 +73,7 @@ async def validate_incoming_webhook(
 
     NOte: The webhook ID here is the workflow ID.
     """
-    async with get_async_session_context_manager() as session:
+    async with get_async_session_bypass_rls_context_manager() as session:
         result = await session.execute(
             select(Webhook).where(Webhook.workflow_id == workflow_id)
         )
@@ -105,6 +108,12 @@ async def validate_incoming_webhook(
                 status_code=status.HTTP_405_METHOD_NOT_ALLOWED,
                 detail="Request method not allowed",
             ) from None
+
+        # Stash whether the trigger should receive the full request envelope
+        # (headers + body) instead of just the parsed body. Read as a scalar
+        # bool before the session closes so it stays valid once the ORM object
+        # detaches.
+        request.state.webhook_include_headers = webhook.include_headers
 
         updated = False
 
@@ -173,12 +182,29 @@ async def validate_incoming_webhook(
             session.add(webhook.api_key)
             await session.commit()
 
+        workspace_result = await session.execute(
+            select(Workspace).where(Workspace.id == webhook.workspace_id)
+        )
+        try:
+            workspace = workspace_result.scalar_one()
+        except NoResultFound as e:
+            logger.warning(
+                "Workspace not found for webhook",
+                webhook_id=webhook.id,
+                workspace_id=webhook.workspace_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Unauthorized webhook request",
+            ) from e
+
         ctx_role.set(
             Role(
                 type="service",
                 workspace_id=webhook.workspace_id,
+                organization_id=workspace.organization_id,
                 service_id="tracecat-runner",
-                workspace_role=WorkspaceRole.EDITOR,
+                scopes=SERVICE_PRINCIPAL_SCOPES["tracecat-runner"],
             )
         )
 

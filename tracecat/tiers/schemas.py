@@ -44,10 +44,37 @@ class EffectiveEntitlements(Schema):
     """
 
     custom_registry: bool = Field(
-        False, description="Whether custom registry repositories are enabled"
+        default=False, description="Whether custom registry repositories are enabled"
     )
-    sso: bool = Field(False, description="Whether SSO is enabled")
-    git_sync: bool = Field(False, description="Whether git sync is enabled")
+    git_sync: bool = Field(default=False, description="Whether git sync is enabled")
+    agent_addons: bool = Field(
+        default=False,
+        description="Whether add-on agent capabilities are enabled"
+        " (approvals, presets)",
+    )
+    case_addons: bool = Field(
+        default=False,
+        description="Whether add-on case capabilities are enabled"
+        " (dropdowns, durations, tasks, triggers)",
+    )
+    rbac_addons: bool = Field(
+        default=False,
+        description="Whether RBAC add-ons are enabled"
+        " (custom roles, groups, and assignments)",
+    )
+    service_accounts: bool = Field(
+        default=False,
+        description="Whether service accounts for API key access are enabled",
+    )
+    workspace_chat: bool = Field(
+        default=False,
+        description="Whether Workspace Chat is enabled",
+    )
+    watchtower: bool = Field(
+        default=False,
+        description="Whether Watchtower agent monitoring is enabled"
+        " (agent sessions, tool-call telemetry, and controls)",
+    )
 
 
 class TierRead(Schema):

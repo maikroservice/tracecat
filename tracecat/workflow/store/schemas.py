@@ -1,8 +1,16 @@
+import re
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    model_validator,
+)
 
+from tracecat.cases.enums import CaseEventType
 from tracecat.dsl.common import DSLInput
 from tracecat.identifiers.workflow import WorkflowID, WorkflowIDShort
 from tracecat.store import Source
@@ -11,8 +19,62 @@ from tracecat.store import Source
 WorkflowSource = Source[WorkflowID]
 
 
+_INVALID_GIT_REF_CHARS_RE = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]")
+
+
+def validate_short_branch_name(value: str, *, field_name: str) -> str:
+    """Validate Git-safe short branch names."""
+    if value == "":
+        raise ValueError(f"{field_name} cannot be empty")
+    if value.startswith("refs/"):
+        raise ValueError(
+            f"{field_name} must be a short branch name, not a full ref (refs/...)"
+        )
+    if value in {".", "..", "@", "HEAD"}:
+        raise ValueError(f"{field_name} must be a valid branch name")
+    if value.startswith("/") or value.endswith("/"):
+        raise ValueError(f"{field_name} cannot start or end with '/'")
+    if value.startswith("-"):
+        raise ValueError(f"{field_name} cannot start with '-'")
+    if value.endswith("."):
+        raise ValueError(f"{field_name} cannot end with '.'")
+    if any(part.endswith(".lock") for part in value.split("/")):
+        raise ValueError(
+            f"{field_name} cannot contain path segments ending with '.lock'"
+        )
+    if ".." in value:
+        raise ValueError(f"{field_name} cannot contain '..'")
+    if "//" in value:
+        raise ValueError(f"{field_name} cannot contain '//'")
+    if "@{" in value:
+        raise ValueError(f"{field_name} cannot contain '@{{'")
+    if _INVALID_GIT_REF_CHARS_RE.search(value):
+        raise ValueError(
+            f"{field_name} contains invalid characters for a Git branch name"
+        )
+    if any(part.startswith(".") or part.endswith(".") for part in value.split("/")):
+        raise ValueError(
+            f"{field_name} contains invalid path segments for a Git branch name"
+        )
+    return value
+
+
 class WorkflowDslPublish(BaseModel):
     message: str | None = None
+    branch: str | None = None
+    create_pr: bool = False
+    pr_base_branch: str | None = None
+
+
+class WorkflowDslPublishResult(BaseModel):
+    status: Literal["committed", "no_op"]
+    commit_sha: str | None = None
+    branch: str
+    base_branch: str
+    pr_url: str | None = None
+    pr_number: int | None = None
+    pr_reused: bool = False
+    message: str
 
 
 class WorkflowSyncPullRequest(BaseModel):
@@ -28,6 +90,11 @@ class WorkflowSyncPullRequest(BaseModel):
     dry_run: bool = Field(
         default=False,
         description="Validate only, don't perform actual import",
+    )
+
+    sync_schedules: bool = Field(
+        default=False,
+        description="Apply schedule definitions from Git. Defaults off to preserve destination schedules.",
     )
 
 
@@ -63,6 +130,22 @@ class RemoteWebhook(BaseModel):
     """The methods of the webhook."""
     status: Status = Field(default="online")
     """Status of the webhook, either 'online' or 'offline'."""
+    include_headers: bool = False
+    """Whether TRIGGER receives the full request envelope (headers + body)."""
+
+
+class RemoteCaseTrigger(BaseModel):
+    """Represents a case trigger configuration in a remote store."""
+
+    status: Status = Field(default="offline")
+    event_types: list[CaseEventType] = Field(default_factory=list)
+    tag_filters: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_event_types(self) -> "RemoteCaseTrigger":
+        if self.status == "online" and not self.event_types:
+            raise ValueError("event_types must be non-empty when status is online")
+        return self
 
 
 class RemoteWorkflowSchedule(BaseModel):
@@ -134,6 +217,9 @@ class RemoteWorkflowDefinition(BaseModel):
 
     webhook: RemoteWebhook | None = None
     """Webhook for the workflow."""
+
+    case_trigger: RemoteCaseTrigger | None = None
+    """Case trigger configuration for the workflow."""
 
     definition: DSLInput
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from tracecat_registry import types
 from tracecat_registry.sdk.types import UNSET, Unset, is_set
@@ -50,6 +50,46 @@ class TablesClient:
     async def get_table_metadata(self, name: str) -> types.TableRead:
         """Get table metadata and columns by name."""
         return await self._client.get(f"/tables/{name}/metadata")
+
+    async def update_table(
+        self,
+        *,
+        name: str,
+        new_name: str,
+    ) -> types.TableRead:
+        """Rename a table by name."""
+        return await self._client.patch(f"/tables/{name}", json={"name": new_name})
+
+    async def create_column(
+        self,
+        *,
+        table: str,
+        column: dict[str, Any],
+    ) -> types.TableRead:
+        """Create a column on a table by name."""
+        return await self._client.post(f"/tables/{table}/columns", json=column)
+
+    async def update_column(
+        self,
+        *,
+        table: str,
+        column: str,
+        update: dict[str, Any],
+    ) -> types.TableRead:
+        """Update a column on a table by table and column name."""
+        return await self._client.patch(
+            f"/tables/{table}/columns/{column}",
+            json=update,
+        )
+
+    async def delete_column(
+        self,
+        *,
+        table: str,
+        column: str,
+    ) -> types.TableRead:
+        """Delete a column from a table by table and column name."""
+        return await self._client.delete(f"/tables/{table}/columns/{column}")
 
     async def lookup(
         self,
@@ -106,9 +146,10 @@ class TablesClient:
         end_time: datetime | str | Unset = UNSET,
         updated_before: datetime | str | Unset = UNSET,
         updated_after: datetime | str | Unset = UNSET,
-        offset: int | Unset = UNSET,
+        cursor: str | Unset = UNSET,
+        reverse: bool | Unset = UNSET,
         limit: int | Unset = UNSET,
-    ) -> list[dict[str, Any]]:
+    ) -> types.TableSearchResponse | list[dict[str, Any]]:
         """Search rows with optional filters."""
         data: dict[str, Any] = {}
         if is_set(search_term):
@@ -135,14 +176,37 @@ class TablesClient:
                 if isinstance(updated_after, datetime)
                 else updated_after
             )
-        if is_set(offset):
-            data["offset"] = offset
+        if is_set(cursor):
+            data["cursor"] = cursor
+        if is_set(reverse):
+            data["reverse"] = reverse
         if is_set(limit):
             data["limit"] = limit
-        rows = await self._client.post(f"/tables/{table}/search", json=data)
-        if not isinstance(rows, list):
+        response = await self._client.post(f"/tables/{table}/search", json=data)
+        if isinstance(response, list):
+            return cast(list[dict[str, Any]], response)
+        if not isinstance(response, dict):
             raise ValueError("Unexpected search response")
-        return rows
+        if isinstance(response.get("items"), list):
+            return cast(types.TableSearchResponse, response)
+
+        # Backward compatibility for historical payloads that used "rows"
+        # instead of "items" for paginated search responses.
+        if isinstance(response.get("rows"), list):
+            normalized_response: types.TableSearchResponse = {
+                "items": cast(list[dict[str, Any]], response["rows"]),
+                "next_cursor": cast(str | None, response.get("next_cursor")),
+                "prev_cursor": cast(str | None, response.get("prev_cursor")),
+                "has_more": bool(response.get("has_more", False)),
+                "has_previous": bool(response.get("has_previous", False)),
+            }
+            if "total_estimate" in response:
+                normalized_response["total_estimate"] = cast(
+                    int | None, response.get("total_estimate")
+                )
+            return normalized_response
+
+        raise ValueError("Unexpected search response")
 
     async def insert_row(
         self,

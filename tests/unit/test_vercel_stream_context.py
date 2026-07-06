@@ -5,6 +5,7 @@ into Vercel AI SDK SSE frames.
 """
 
 import json
+from typing import cast
 
 import pytest
 
@@ -24,7 +25,12 @@ from tracecat.agent.adapter.vercel import (
     VercelStreamContext,
     format_sse,
 )
-from tracecat.agent.common.stream_types import StreamEventType, UnifiedStreamEvent
+from tracecat.agent.common.stream_types import (
+    StreamEventType,
+    ToolCallContent,
+    UnifiedStreamEvent,
+)
+from tracecat.artifacts.schemas import ARTIFACT_DATA_PART_TYPE
 
 
 async def collect_frames(
@@ -47,6 +53,40 @@ async def collect_frames(
 # ==============================================================================
 # Basic Text Streaming Tests
 # ==============================================================================
+
+
+@pytest.mark.anyio
+async def test_artifact_event_maps_to_data_part():
+    """Test semantic artifact events emit Vercel data-artifact payloads."""
+    ctx = VercelStreamContext(message_id="msg_test")
+
+    frames = await collect_frames(
+        ctx,
+        [
+            UnifiedStreamEvent.artifact_event(
+                op="upsert",
+                artifact={
+                    "type": "generic",
+                    "id": "g1",
+                    "title": "Result",
+                },
+            )
+        ],
+    )
+
+    assert frames == [
+        DataEventPayload(
+            type=ARTIFACT_DATA_PART_TYPE,
+            data={
+                "op": "upsert",
+                "artifact": {
+                    "type": "generic",
+                    "id": "g1",
+                    "title": "Result",
+                },
+            },
+        )
+    ]
 
 
 @pytest.mark.anyio
@@ -346,6 +386,42 @@ async def test_data_event_emitted_before_tool_parts():
 
 
 @pytest.mark.anyio
+async def test_approval_request_strips_proxy_metadata_from_streamed_args():
+    """Ensure approval request events do not expose Tracecat proxy metadata."""
+    ctx = VercelStreamContext(message_id="msg_test")
+
+    events = [
+        UnifiedStreamEvent(
+            type=StreamEventType.APPROVAL_REQUEST,
+            approval_items=[
+                ToolCallContent(
+                    id="call_approve",
+                    name="mcp__tracecat_registry__core__cases__create_case",
+                    input={
+                        "summary": "hello",
+                        "__tracecat": {"tool_call_id": "toolu_123"},
+                    },
+                )
+            ],
+        )
+    ]
+
+    frames = await collect_frames(ctx, events)
+
+    assert len(frames) == 1
+    assert isinstance(frames[0], DataEventPayload)
+    assert frames[0].type == "data-approval-request"
+    assert frames[0].data == [
+        {
+            "tool_call_id": "call_approve",
+            "tool_name": "mcp__tracecat_registry__core__cases__create_case",
+            "args": {"summary": "hello"},
+        }
+    ]
+    assert ctx.approval_input["call_approve"] == {"summary": "hello"}
+
+
+@pytest.mark.anyio
 async def test_tool_execution_failure():
     """Test tool execution failure with is_error=True."""
     ctx = VercelStreamContext(message_id="msg_test")
@@ -413,6 +489,47 @@ async def test_tool_result_without_tracked_tool_call_id():
     assert output_frame.toolCallId == "untracked_call_id"
     assert "errorText" in output_frame.output
     assert "General error message" in output_frame.output["errorText"]
+
+
+@pytest.mark.anyio
+async def test_tool_result_without_tool_metadata_is_skipped():
+    """Uncorrelated Claude tool results should not render as generic `tool`."""
+    ctx = VercelStreamContext(message_id="msg_test")
+
+    events = [
+        UnifiedStreamEvent(
+            type=StreamEventType.TOOL_RESULT,
+            tool_call_id="nested_subagent_call",
+            tool_output="Nested tool output",
+            is_error=False,
+        ),
+    ]
+
+    frames = await collect_frames(ctx, events)
+
+    assert frames == []
+
+
+@pytest.mark.anyio
+async def test_correlated_tool_result_without_tool_metadata_uses_tool_fallback():
+    """Correlated tool results should never emit the literal string `None`."""
+    ctx = VercelStreamContext(message_id="msg_test")
+    ctx.approval_tool_name["toolu_123"] = cast(str, None)
+
+    events = [
+        UnifiedStreamEvent(
+            type=StreamEventType.TOOL_RESULT,
+            tool_call_id="toolu_123",
+            tool_output="Tool output",
+            is_error=False,
+        ),
+    ]
+
+    frames = await collect_frames(ctx, events)
+
+    assert isinstance(frames[0], ToolInputAvailableEventPayload)
+    assert frames[0].toolName == "tool"
+    assert isinstance(frames[1], ToolOutputAvailableEventPayload)
 
 
 @pytest.mark.anyio
@@ -650,19 +767,33 @@ async def test_multiple_tools_concurrent():
 
 
 @pytest.mark.anyio
-async def test_delta_for_unknown_part_index():
-    """Test delta for unknown part index logs warning but doesn't crash."""
+async def test_delta_for_unknown_part_index_self_heals():
+    """A delta for an unopened part lazily opens one (resume self-heal).
+
+    On reconnect, a TEXT_DELTA can arrive without its TEXT_START (the start was
+    emitted before the cursor). Instead of dropping it, the adapter opens a fresh
+    text part so the tail renders. The synthesized start is flagged as a repair
+    frame so sse_vercel doesn't count it toward the composite frame index.
+    """
     ctx = VercelStreamContext(message_id="msg_test")
 
-    # Send delta without starting a part
     events = [
         UnifiedStreamEvent(type=StreamEventType.TEXT_DELTA, part_id=99, text="orphan"),
     ]
 
     frames = await collect_frames(ctx, events)
 
-    # Should handle gracefully with no frames
-    assert len(frames) == 0
+    # A start + the delta are emitted under one fresh part id (collect_frames
+    # also finalizes the open part at the end -> trailing text-end).
+    assert len(frames) == 3
+    start, delta, end = frames
+    assert isinstance(start, TextStartEventPayload)
+    assert isinstance(delta, TextDeltaEventPayload)
+    assert isinstance(end, TextEndEventPayload)
+    assert start.id == delta.id == end.id
+    assert delta.delta == "orphan"
+    # The synthesized start is marked as a repair frame for sse_vercel.
+    assert ctx.repair_frames == 1
 
 
 @pytest.mark.anyio

@@ -16,6 +16,7 @@ from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import DeferredToolResults
 
+from tracecat.agent.subagents import AgentSubagentsConfig
 from tracecat.agent.types import AgentConfig
 from tracecat.auth.types import Role
 from tracecat.chat.schemas import ChatMessage
@@ -27,15 +28,46 @@ class ModelInfo(BaseModel):
     base_url: str | None
 
 
+class DefaultModelSelection(BaseModel):
+    """Canonical default-model selection for an organization."""
+
+    catalog_id: uuid.UUID
+    model_name: str = Field(..., min_length=1, max_length=500)
+    model_provider: str = Field(..., min_length=1, max_length=120)
+    custom_provider_id: uuid.UUID | None = Field(default=None)
+
+
+class DefaultModelSelectionUpdate(BaseModel):
+    """Payload for updating the organization's default model selection."""
+
+    catalog_id: uuid.UUID
+
+
 class RunAgentArgs(BaseModel):
+    # extra="ignore" keeps in-flight workflow history replayable after the
+    # legacy ``use_workspace_credentials`` field was removed: Temporal
+    # stores the old shape in history and Pydantic will silently drop the
+    # stale key during deserialization.
+    model_config = ConfigDict(extra="ignore")
+
     user_prompt: str
     """User prompt for the agent."""
     session_id: uuid.UUID
     """Session ID for the agent execution."""
+    active_stream_id: uuid.UUID | None = None
+    """Per-turn stream id (Redis key suffix). Minted at the HTTP layer at turn
+    start and pinned here so the worker producer writes to the same per-turn key
+    the reader joins. None for legacy executions that predate per-turn keys."""
+    curr_run_id: uuid.UUID | None = None
+    """Workflow run id for this turn. Pinned here so the producer tags persisted
+    history rows with it, letting mid-turn loads hide the active run's partial
+    rows. None for legacy executions."""
     config: AgentConfig | None = None
     """Configuration for the agent. Required if preset_slug is not provided."""
     preset_slug: str | None = None
     """Slug for the preset configuration (if using a preset)."""
+    preset_version: int | None = None
+    """Optional preset version number to pin for this execution."""
     max_requests: int | None = None
     """Maximum number of requests for the agent."""
     max_tool_calls: int | None = None
@@ -44,14 +76,14 @@ class RunAgentArgs(BaseModel):
     """Results for deferred tool calls from a previous run (CE handshake)."""
     is_continuation: bool = False
     """If True, do not emit a new user message; continue prior run with deferred results."""
-    use_workspace_credentials: bool = True
-    """Credential scope for LiteLLM gateway."""
 
     @model_validator(mode="after")
     def validate_config_or_preset(self) -> RunAgentArgs:
         """Ensure either config or preset_slug is provided."""
         if self.config is None and self.preset_slug is None:
             raise ValueError("Either 'config' or 'preset_slug' must be provided")
+        if self.preset_version is not None and self.preset_slug is None:
+            raise ValueError("'preset_version' requires 'preset_slug'")
         return self
 
 
@@ -69,6 +101,15 @@ class ModelConfig(BaseModel):
         "organization secret to use for this model.",
         min_length=1,
         max_length=100,
+    )
+    catalog_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "Optional catalog row backing this model selection. Populated "
+            "for v2 org-scoped cloud/custom catalog rows; left ``None`` for "
+            "platform (built-in) models that resolve credentials via "
+            "``agent-{provider}-credentials``."
+        ),
     )
     org_secret_name: str = Field(
         ...,
@@ -207,3 +248,115 @@ class ModelRequestResult(BaseModel):
 class ToolFilters(BaseModel):
     actions: list[str] | None = None
     namespaces: list[str] | None = None
+
+
+# ============================================================================
+# Internal Request Schemas (for SDK/UDF use via internal router)
+# ============================================================================
+
+
+class MCPHttpServerConfigSchema(TypedDict):
+    """HTTP/SSE MCP server configuration for request validation."""
+
+    type: NotRequired[Literal["http"]]
+    name: str
+    url: str
+    headers: NotRequired[dict[str, str]]
+    transport: NotRequired[Literal["http", "sse"]]
+    timeout: NotRequired[int]
+
+
+class MCPStdioServerConfigSchema(TypedDict):
+    """Stdio MCP server configuration for request validation."""
+
+    type: Literal["stdio"]
+    name: str
+    command: str
+    args: NotRequired[list[str]]
+    env: NotRequired[dict[str, str]]
+    timeout: NotRequired[int]
+
+
+type MCPServerConfigSchema = MCPHttpServerConfigSchema | MCPStdioServerConfigSchema
+
+
+class AgentConfigSchema(BaseModel):
+    """Agent configuration for request validation."""
+
+    model_name: str
+    model_provider: str
+    catalog_id: uuid.UUID | None = None
+    base_url: str | None = None
+    instructions: str | None = None
+    output_type: Any | None = None
+    actions: list[str] | None = None
+    namespaces: list[str] | None = None
+    tool_approvals: dict[str, bool] | None = None
+    model_settings: dict[str, Any] | None = None
+    mcp_servers: list[MCPServerConfigSchema] | None = None
+    agents: AgentSubagentsConfig = Field(default_factory=AgentSubagentsConfig)
+    retries: int = Field(default=20)
+    enable_thinking: bool = Field(default=True)
+
+
+class RankableItemSchema(TypedDict):
+    """Item that can be ranked."""
+
+    id: str | int
+    text: str
+
+
+class InternalRunAgentRequest(BaseModel):
+    """Request body for /internal/agent/run endpoint."""
+
+    user_prompt: str
+    config: AgentConfigSchema | None = None
+    preset_slug: str | None = None
+    preset_version: int | None = None
+    max_requests: int = Field(default=120, le=120)
+    max_tool_calls: int | None = Field(default=None, le=40)
+
+    @model_validator(mode="after")
+    def validate_config_or_preset(self) -> InternalRunAgentRequest:
+        """Ensure either config or preset_slug is provided."""
+        if self.config is None and self.preset_slug is None:
+            raise ValueError("Either 'config' or 'preset_slug' must be provided")
+        if self.preset_version is not None and self.preset_slug is None:
+            raise ValueError("'preset_version' requires 'preset_slug'")
+        return self
+
+
+class InternalRankItemsRequest(BaseModel):
+    """Request body for /internal/agent/rank endpoint."""
+
+    items: list[RankableItemSchema]
+    criteria_prompt: str
+    model_name: str
+    model_provider: str
+    catalog_id: uuid.UUID | None = None
+    model_settings: dict[str, Any] | None = None
+    max_requests: int = 5
+    retries: int = 3
+    base_url: str | None = None
+    min_items: int | None = None
+    max_items: int | None = None
+
+
+class InternalRankItemsPairwiseRequest(BaseModel):
+    """Request body for /internal/agent/rank-pairwise endpoint."""
+
+    items: list[RankableItemSchema]
+    criteria_prompt: str
+    model_name: str
+    model_provider: str
+    catalog_id: uuid.UUID | None = None
+    id_field: str = "id"
+    batch_size: int = 10
+    num_passes: int = 10
+    refinement_ratio: float = 0.5
+    model_settings: dict[str, Any] | None = None
+    max_requests: int = 5
+    retries: int = 3
+    base_url: str | None = None
+    min_items: int | None = None
+    max_items: int | None = None

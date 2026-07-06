@@ -1,109 +1,366 @@
 import asyncio
 import functools
+import inspect
+import re
 from collections.abc import Callable, Coroutine
-from typing import Any, TypeVar, cast
+from fnmatch import fnmatch
+from typing import Any, Protocol, TypeVar, cast, runtime_checkable
 
-from tracecat.auth.types import AccessLevel, Role
-from tracecat.authz.enums import WorkspaceRole
-from tracecat.exceptions import TracecatAuthorizationError
+from tracecat.auth.types import Role
+from tracecat.contexts import ctx_role
+from tracecat.exceptions import ScopeDeniedError
 from tracecat.logger import logger
-from tracecat.service import BaseService
 
 T = TypeVar("T", bound=Callable[..., Coroutine[Any, Any, Any] | Any])
 
+# Regex for validating scope strings: lowercase alphanumeric with : _ . - and *
+# Only * is allowed as wildcard, no ? or [] patterns
+SCOPE_PATTERN = re.compile(r"^[a-z0-9:_.*-]+$")
 
-def require_access_level(level: AccessLevel) -> Callable[[T], T]:
-    """Decorator that protects a `Service` method with a minimum access level requirement.
+# Scope implication: an "update" grant implicitly satisfies a "read" requirement
+# on the same resource. This reflects the logical invariant that you cannot update
+# a resource without being able to read it. No other actions imply each other.
+_ACTION_IMPLIES: dict[str, frozenset[str]] = {
+    "update": frozenset({"read"}),
+}
 
-    If the caller does not have at least the required access level, a TracecatAuthorizationError is raised.
+
+def _attach_wrapped_signature(
+    wrapper: Callable[..., Any], wrapped: Callable[..., Any]
+) -> None:
+    """Attach a concrete signature so FastAPI can resolve endpoint annotations."""
+    try:
+        signature = inspect.signature(wrapped, eval_str=True)
+    except (NameError, TypeError, ValueError):
+        signature = inspect.signature(wrapped)
+    cast(Any, wrapper).__signature__ = signature
+
+
+def validate_scope_string(scope: str) -> bool:
+    """Validate that a scope string follows the allowed format.
+
+    Rules:
+    - Lowercase alphanumeric characters
+    - Allowed special characters: : _ . - *
+    - Only * is allowed as wildcard (no ? or [] patterns)
     """
-
-    def check(self: BaseService):
-        if not hasattr(self, "role"):
-            raise AttributeError("Service must have a 'role' attribute")
-
-        if not isinstance(self.role, Role):
-            raise ValueError("Invalid role type")
-
-        user_role = self.role
-        if user_role.access_level < level:
-            raise TracecatAuthorizationError(
-                f"User does not have required access level: {level.name}"
-            )
-        logger.debug("Access level ok", user_id=user_role.user_id, level=level.name)
-
-    def decorator(fn: T) -> T:
-        if asyncio.iscoroutinefunction(fn):
-
-            @functools.wraps(fn)
-            async def async_wrapper(self: BaseService, *args, **kwargs):
-                check(self)
-                return await fn(self, *args, **kwargs)
-
-            return cast(T, async_wrapper)
-
-        else:
-
-            @functools.wraps(fn)
-            def wrapper(self: BaseService, *args, **kwargs):
-                check(self)
-                return fn(self, *args, **kwargs)
-
-            return cast(T, wrapper)
-
-    return decorator
+    return bool(SCOPE_PATTERN.match(scope))
 
 
-def require_workspace_role(*roles: WorkspaceRole) -> Callable[[T], T]:
-    """Decorator that protects a `Service` method with a minimum access level requirement.
+def _implied_scopes(granted_scope: str) -> list[str]:
+    """Derive additional scopes implied by a granted scope.
 
-    If the caller does not have at least the required access level, a TracecatAuthorizationError is raised.
+    For example, "integration:update" implies "integration:read" because
+    you cannot update a resource without reading it.
+
+    Only applies to scopes without wildcards whose final segment has an
+    entry in _ACTION_IMPLIES.
     """
+    if "*" in granted_scope:
+        return []
+    parts = granted_scope.rsplit(":", maxsplit=1)
+    if len(parts) != 2:
+        return []
+    prefix, action = parts
+    implied_actions = _ACTION_IMPLIES.get(action)
+    if not implied_actions:
+        return []
+    return [f"{prefix}:{implied}" for implied in implied_actions]
 
-    def check(self: BaseService):
-        self.logger.debug("Checking workspace role", role=self.role)
-        if not hasattr(self, "role"):
-            raise AttributeError("Service must have a 'role' attribute")
 
-        if not isinstance(self.role, Role):
-            raise ValueError("Invalid role type")
+def scope_matches(granted_scope: str, required_scope: str) -> bool:
+    """Check if a granted scope (potentially with wildcards) matches a required scope.
 
-        user_role = self.role
-        if user_role.access_level == AccessLevel.ADMIN:
-            logger.info(
-                "Org admin can access all workspace roles",
-                user_id=user_role.user_id,
-                workspace_role=user_role.workspace_role,
-            )
-            return
+    Uses fnmatch-style matching with only * as the wildcard character.
+    * matches any sequence of characters.
 
-        if user_role.workspace_role not in roles:
-            raise TracecatAuthorizationError(
-                f"User does not have required workspace role: {roles}"
-            )
-        logger.debug(
-            "Workspace role check ok",
-            user_id=user_role.user_id,
-            workspace_role=user_role.workspace_role,
+    Scope implication: ``update`` on a resource implicitly satisfies a ``read``
+    requirement on the same resource (e.g. ``workflow:update`` satisfies
+    ``workflow:read``).
+
+    Args:
+        granted_scope: A scope that was granted (may contain wildcards)
+        required_scope: A scope that is required (should be exact, no wildcards)
+
+    Returns:
+        True if the granted scope matches the required scope
+
+    Examples:
+        scope_matches("workflow:*", "workflow:read") -> True
+        scope_matches("workflow:read", "workflow:read") -> True
+        scope_matches("workflow:update", "workflow:read") -> True
+        scope_matches("action:core.*:execute", "action:core.http_request:execute") -> True
+        scope_matches("action:*:execute", "action:tools.okta.list_users:execute") -> True
+        scope_matches("*", "anything:here") -> True
+    """
+    if granted_scope == "*":
+        # Global wildcard matches everything
+        return True
+
+    if "*" not in granted_scope:
+        # Exact match or implication check
+        if granted_scope == required_scope:
+            return True
+        return required_scope in _implied_scopes(granted_scope)
+
+    # Use fnmatch for wildcard matching (avoids regex backtracking issues)
+    return fnmatch(required_scope, granted_scope)
+
+
+def has_scope(user_scopes: frozenset[str], required_scope: str) -> bool:
+    """Check if a user has a required scope.
+
+    Args:
+        user_scopes: The set of scopes granted to the user
+        required_scope: The scope required for the operation
+
+    Returns:
+        True if any granted scope matches the required scope
+    """
+    return any(scope_matches(granted, required_scope) for granted in user_scopes)
+
+
+def has_all_scopes(user_scopes: frozenset[str], required_scopes: set[str]) -> bool:
+    """Check if a user has all required scopes.
+
+    Args:
+        user_scopes: The set of scopes granted to the user
+        required_scopes: The scopes required for the operation
+
+    Returns:
+        True if all required scopes are satisfied
+    """
+    return all(has_scope(user_scopes, scope) for scope in required_scopes)
+
+
+def has_any_scope(user_scopes: frozenset[str], required_scopes: set[str]) -> bool:
+    """Check if a user has any of the required scopes.
+
+    Args:
+        user_scopes: The set of scopes granted to the user
+        required_scopes: The scopes, any of which satisfies the requirement
+
+    Returns:
+        True if at least one required scope is satisfied
+    """
+    return any(has_scope(user_scopes, scope) for scope in required_scopes)
+
+
+def get_missing_scopes(
+    user_scopes: frozenset[str], required_scopes: set[str]
+) -> set[str]:
+    """Get the scopes that are required but not granted.
+
+    Args:
+        user_scopes: The set of scopes granted to the user
+        required_scopes: The scopes required for the operation
+
+    Returns:
+        Set of scopes that are not satisfied
+    """
+    return {scope for scope in required_scopes if not has_scope(user_scopes, scope)}
+
+
+@runtime_checkable
+class HasRole(Protocol):
+    """Protocol for services that have a role attribute."""
+
+    role: Role
+
+
+def check_scopes(
+    role: Role | None,
+    *scopes: str,
+    require_all: bool = True,
+) -> None:
+    """Assert that ``role`` holds the required scope(s), or raise.
+
+    Shared scope-enforcement used both by the ``require_scope`` decorator and by
+    imperative call sites where the role is only available at call time (e.g. an
+    MCP tool that resolves a workspace role before invoking a shared service
+    method that is intentionally left unscoped).
+
+    When ``role`` is ``None`` the role is taken from the current request context
+    (``ctx_role``), matching the decorator's implicit behavior.
+
+    Platform superusers (``"*"`` scope) bypass all checks.
+
+    Args:
+        role: The role to check. If ``None``, falls back to ``ctx_role.get()``.
+        *scopes: The scope(s) required for access.
+        require_all: If True (default), all scopes must be present. If False,
+            any one of the scopes is sufficient.
+
+    Raises:
+        ScopeDeniedError: If the role doesn't have the required scope(s).
+    """
+    required = set(scopes)
+    if not required:
+        return
+
+    role = role or ctx_role.get()
+    if role is None:
+        raise ScopeDeniedError(
+            required_scopes=list(required), missing_scopes=list(required)
         )
 
+    user_scopes = role.scopes
+    if user_scopes is None:
+        raise ScopeDeniedError(
+            required_scopes=list(required), missing_scopes=list(required)
+        )
+
+    # Platform superuser has "*" scope - bypass all checks
+    if "*" in user_scopes:
+        return
+
+    if require_all:
+        missing = get_missing_scopes(user_scopes, required)
+        if missing:
+            logger.warning(
+                "Scope check failed - missing required scopes",
+                required_scopes=list(required),
+                missing_scopes=list(missing),
+            )
+            raise ScopeDeniedError(
+                required_scopes=list(required),
+                missing_scopes=list(missing),
+            )
+    else:
+        if not has_any_scope(user_scopes, required):
+            logger.warning(
+                "Scope check failed - none of required scopes present",
+                required_scopes=list(required),
+            )
+            raise ScopeDeniedError(
+                required_scopes=list(required),
+                missing_scopes=list(required),
+            )
+
+    logger.debug("Scope check passed", required_scopes=list(required))
+
+
+# =============================================================================
+# Scope-based Authorization Decorator
+# =============================================================================
+
+
+def require_action_scope(action_key: str) -> None:
+    """Check if the current user has permission to execute a specific action.
+
+    This function checks the context scopes against the required action scope.
+    The required scope is `action:{action_key}:execute`.
+
+    Scope matching supports wildcards:
+    - `action:*:execute` → any action (Admin)
+    - `action:core.*:execute` → core actions (Editor)
+    - `action:tools.okta.*:execute` → okta actions (custom role)
+    - `action:tools.okta.list_users:execute` → specific action
+
+    Args:
+        action_key: The action key (e.g., "core.http_request", "tools.okta.list_users")
+
+    Raises:
+        ScopeDeniedError: If the user doesn't have permission to execute the action
+    """
+    role = ctx_role.get()
+    if role is None:
+        raise ScopeDeniedError(
+            required_scopes=[f"action:{action_key}:execute"],
+            missing_scopes=[f"action:{action_key}:execute"],
+        )
+    user_scopes = role.scopes
+    if user_scopes is None:
+        raise ScopeDeniedError(
+            required_scopes=[f"action:{action_key}:execute"],
+            missing_scopes=[f"action:{action_key}:execute"],
+        )
+
+    # Platform superuser has "*" scope - bypass all checks
+    if "*" in user_scopes:
+        return
+
+    required_scope = f"action:{action_key}:execute"
+
+    if not has_scope(user_scopes, required_scope):
+        logger.warning(
+            "Action scope check failed",
+            action_key=action_key,
+            required_scope=required_scope,
+        )
+        raise ScopeDeniedError(
+            required_scopes=[required_scope],
+            missing_scopes=[required_scope],
+        )
+
+    logger.debug(
+        "Action scope check passed",
+        action_key=action_key,
+        required_scope=required_scope,
+    )
+
+
+def require_scope(*scopes: str, require_all: bool = True) -> Callable[[T], T]:
+    """Decorator that requires specific scopes to access an endpoint or method.
+
+    This decorator checks the current request's scopes (from ctx_role.get().scopes)
+    against the required scopes. Platform superusers with the "*" scope bypass all checks.
+
+    Args:
+        *scopes: The scope(s) required for access (e.g., "workflow:read", "org:member:invite")
+        require_all: If True (default), all scopes must be present.
+                    If False, any one of the scopes is sufficient.
+
+    Raises:
+        ScopeDeniedError: If the user doesn't have the required scope(s)
+
+    Examples:
+        # Single scope required
+        @require_scope("workflow:create")
+        async def create_workflow(...):
+            ...
+
+        # Multiple scopes, all required
+        @require_scope("workflow:read", "workflow:execute")
+        async def execute_workflow(...):
+            ...
+
+        # Multiple scopes, any one sufficient
+        @require_scope("org:admin", "workspace:admin", require_all=False)
+        async def admin_operation(...):
+            ...
+    """
+    required = set(scopes)
+
     def decorator(fn: T) -> T:
         if asyncio.iscoroutinefunction(fn):
 
             @functools.wraps(fn)
-            async def async_wrapper(self, *args, **kwargs):
-                check(self)
-                return await fn(self, *args, **kwargs)
+            async def async_wrapper(*args, **kwargs):
+                method_role = (
+                    args[0].role if args and isinstance(args[0], HasRole) else None
+                )
+                if method_role is None and isinstance(role := kwargs.get("role"), Role):
+                    method_role = role
+                check_scopes(method_role, *required, require_all=require_all)
+                return await fn(*args, **kwargs)
 
+            _attach_wrapped_signature(async_wrapper, fn)
             return cast(T, async_wrapper)
 
         else:
 
             @functools.wraps(fn)
-            def wrapper(self, *args, **kwargs):
-                check(self)
-                return fn(self, *args, **kwargs)
+            def wrapper(*args, **kwargs):
+                method_role = (
+                    args[0].role if args and isinstance(args[0], HasRole) else None
+                )
+                if method_role is None and isinstance(role := kwargs.get("role"), Role):
+                    method_role = role
+                check_scopes(method_role, *required, require_all=require_all)
+                return fn(*args, **kwargs)
 
+            _attach_wrapped_signature(wrapper, fn)
             return cast(T, wrapper)
 
     return decorator

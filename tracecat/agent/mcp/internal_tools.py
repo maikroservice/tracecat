@@ -13,25 +13,34 @@ configure agent presets through natural language.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Awaitable, Callable
-from typing import Any, TypedDict
+from collections.abc import Awaitable, Callable, Sequence
+from typing import Any, Literal, TypedDict, cast
 
 from pydantic import BaseModel, Field
+from tracecat_registry import RegistryOAuthSecret, RegistrySecret
 
+from tracecat import config
 from tracecat.agent.common.types import MCPToolDefinition
-from tracecat.agent.preset.schemas import AgentPresetRead, AgentPresetUpdate
+from tracecat.agent.preset.schemas import AgentPresetUpdate
 from tracecat.agent.session.schemas import (
     AgentSessionRead,
     AgentSessionReadWithMessages,
 )
+from tracecat.agent.session.types import AgentSessionEntity
+from tracecat.agent.subagents import ResolvedAgentsConfig
 from tracecat.agent.tokens import InternalToolContext, MCPTokenClaims
 from tracecat.auth.types import Role
+from tracecat.authz.scopes import SERVICE_PRINCIPAL_SCOPES
 from tracecat.contexts import ctx_role
 from tracecat.exceptions import (
     TracecatValidationError,
 )
+from tracecat.integrations.enums import OAuthGrantType
+from tracecat.integrations.schemas import ProviderKey
+from tracecat.integrations.service import IntegrationService
 from tracecat.logger import logger
 from tracecat.registry.actions.service import RegistryActionsService
+from tracecat.secrets.constants import DEFAULT_SECRETS_ENVIRONMENT
 
 # Tool name constants - these are the canonical names for internal tools
 BUILDER_INTERNAL_TOOL_NAMES = [
@@ -49,10 +58,6 @@ BUILDER_BUNDLED_ACTIONS = [
     "core.table.get_table_metadata",
     "core.table.list_tables",
     "core.table.search_rows",
-    "tools.exa.get_contents",
-    "tools.exa.get_research",
-    "tools.exa.list_research",
-    "tools.exa.research",
 ]
 
 
@@ -67,10 +72,138 @@ class AgentToolSummary(TypedDict):
 
     action_id: str
     description: str
+    configured: bool
+    missing_requirements: list[str]
+    already_in_preset: bool
 
 
 class InternalToolError(Exception):
     """Raised when an internal tool execution fails."""
+
+
+class SecretRequirement(TypedDict):
+    """Configuration requirement for a regular secret."""
+
+    type: Literal["secret"]
+    name: str
+    required_keys: list[str]
+    optional: bool
+
+
+class OAuthRequirement(TypedDict):
+    """Configuration requirement for a workspace OAuth integration."""
+
+    type: Literal["oauth"]
+    provider_id: str
+    grant_type: str
+    optional: bool
+
+
+Requirement = SecretRequirement | OAuthRequirement
+
+
+def _secrets_to_requirements(secrets: list[Any]) -> list[Requirement]:
+    """Convert registry secret objects to simple requirement metadata."""
+    requirements: list[Requirement] = []
+    for secret in secrets:
+        if isinstance(secret, RegistrySecret):
+            requirements.append(
+                {
+                    "type": "secret",
+                    "name": secret.name,
+                    "required_keys": list(secret.keys or []),
+                    "optional": secret.optional,
+                }
+            )
+        elif isinstance(secret, RegistryOAuthSecret):
+            requirements.append(
+                {
+                    "type": "oauth",
+                    "provider_id": secret.provider_id,
+                    "grant_type": secret.grant_type,
+                    "optional": secret.optional,
+                }
+            )
+    return requirements
+
+
+def _evaluate_configuration(
+    requirements: Sequence[Requirement | dict[str, Any]],
+    workspace_inventory: dict[str, set[str]],
+    org_inventory: dict[str, set[str]],
+    oauth_inventory: set[ProviderKey],
+) -> tuple[bool, list[str]]:
+    """Evaluate whether required secret names/keys are configured."""
+    missing: list[str] = []
+    for requirement in requirements:
+        if requirement.get("optional", False):
+            continue
+        requirement_type = requirement.get("type", "secret")
+        if requirement_type == "oauth":
+            oauth_requirement = cast(OAuthRequirement | dict[str, Any], requirement)
+            provider_key = ProviderKey(
+                id=cast(str, oauth_requirement["provider_id"]),
+                grant_type=OAuthGrantType(cast(str, oauth_requirement["grant_type"])),
+            )
+            if provider_key not in oauth_inventory:
+                missing.append(
+                    "missing oauth integration: "
+                    f"{provider_key.id} ({provider_key.grant_type.value})"
+                )
+            continue
+
+        secret_requirement = cast(SecretRequirement | dict[str, Any], requirement)
+        secret_name = cast(str, secret_requirement["name"])
+        required_keys = set(cast(list[str], secret_requirement["required_keys"]))
+        keys = workspace_inventory.get(secret_name)
+        if keys is None:
+            keys = org_inventory.get(secret_name)
+        if keys is None:
+            missing.append(f"missing secret: {secret_name}")
+            continue
+        for key in sorted(required_keys):
+            if key not in keys:
+                missing.append(f"missing key: {secret_name}.{key}")
+    return len(missing) == 0, missing
+
+
+async def _load_secret_inventory(
+    role: Role,
+) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """Load workspace/org secret key inventories from default environment."""
+    from tracecat.secrets.service import SecretsService
+
+    async with SecretsService.with_session(role=role) as svc:
+        workspace_inventory: dict[str, set[str]] = {}
+        org_inventory: dict[str, set[str]] = {}
+
+        workspace_secrets = await svc.list_secrets()
+        for secret in workspace_secrets:
+            if secret.environment != DEFAULT_SECRETS_ENVIRONMENT:
+                continue
+            workspace_inventory[secret.name] = {
+                kv.key for kv in svc.decrypt_keys(secret.encrypted_keys)
+            }
+
+        org_secrets = await svc.list_org_secrets()
+        for secret in org_secrets:
+            if secret.environment != DEFAULT_SECRETS_ENVIRONMENT:
+                continue
+            org_inventory[secret.name] = {
+                kv.key for kv in svc.decrypt_keys(secret.encrypted_keys)
+            }
+
+    return workspace_inventory, org_inventory
+
+
+async def _load_oauth_inventory(role: Role) -> set[ProviderKey]:
+    """Load configured workspace OAuth integrations."""
+    async with IntegrationService.with_session(role=role) as svc:
+        integrations = await svc.list_integrations()
+    return {
+        ProviderKey(id=integration.provider_id, grant_type=integration.grant_type)
+        for integration in integrations
+    }
 
 
 def _get_preset_id(context: InternalToolContext | None) -> uuid.UUID:
@@ -86,7 +219,31 @@ def _build_role(claims: MCPTokenClaims) -> Role:
         type="service",
         service_id="tracecat-mcp",
         workspace_id=claims.workspace_id,
+        organization_id=claims.organization_id,
         user_id=claims.user_id,
+        scopes=SERVICE_PRINCIPAL_SCOPES["tracecat-mcp"],
+    )
+
+
+async def _get_action_configuration(
+    svc: RegistryActionsService,
+    action_name: str,
+    workspace_inventory: dict[str, set[str]],
+    org_inventory: dict[str, set[str]],
+    oauth_inventory: set[ProviderKey],
+) -> tuple[bool, list[str]]:
+    """Return (configured, missing_requirements) for an action."""
+    indexed = await svc.get_action_from_index(action_name)
+    if indexed is None:
+        return False, [f"action not found: {action_name}"]
+
+    secrets = svc.aggregate_secrets_from_manifest(indexed.manifest, action_name)
+    requirements = _secrets_to_requirements(secrets)
+    return _evaluate_configuration(
+        requirements,
+        workspace_inventory,
+        org_inventory,
+        oauth_inventory,
     )
 
 
@@ -109,22 +266,34 @@ async def get_preset_summary(
         preset = await service.get_preset(preset_id)
         if not preset:
             raise InternalToolError(f"Agent preset with ID '{preset_id}' not found")
+        preset_read = await service.build_preset_read(preset)
 
-    return AgentPresetRead.model_validate(preset).model_dump(mode="json")
+    return preset_read.model_dump(mode="json")
 
 
 async def list_available_tools(
     args: dict[str, Any], claims: MCPTokenClaims
 ) -> dict[str, Any]:
     """Return the list of available actions in the registry index."""
+    from tracecat.agent.preset.service import AgentPresetService
+
     query = args.get("query", "")
     if not query or len(query) < 1:
         raise InternalToolError("query parameter is required (1-100 characters)")
     if len(query) > 100:
         raise InternalToolError("query parameter must be at most 100 characters")
 
+    preset_id = _get_preset_id(claims.internal_tool_context)
     role = _build_role(claims)
     ctx_role.set(role)
+    workspace_inventory, org_inventory = await _load_secret_inventory(role)
+    oauth_inventory = await _load_oauth_inventory(role)
+    preset_action_set: set[str] = set()
+
+    async with AgentPresetService.with_session(role=role) as preset_service:
+        preset = await preset_service.get_preset(preset_id)
+        if preset:
+            preset_action_set = set(preset.actions or [])
 
     # Search using registry index instead of RegistryAction table
     async with RegistryActionsService.with_session(role=role) as svc:
@@ -134,15 +303,26 @@ async def list_available_tools(
             query_term=query,
             count=len(entries),
         )
-        return {
-            "tools": [
+        tools: list[AgentToolSummary] = []
+        for entry, _ in entries:
+            action_name = f"{entry.namespace}.{entry.name}"
+            configured, missing_requirements = await _get_action_configuration(
+                svc,
+                action_name,
+                workspace_inventory,
+                org_inventory,
+                oauth_inventory,
+            )
+            tools.append(
                 AgentToolSummary(
-                    action_id=f"{entry.namespace}.{entry.name}",
+                    action_id=action_name,
                     description=entry.description,
+                    configured=configured,
+                    missing_requirements=missing_requirements,
+                    already_in_preset=action_name in preset_action_set,
                 )
-                for entry, _ in entries
-            ]
-        }
+            )
+        return {"tools": tools}
 
 
 async def update_preset(args: dict[str, Any], claims: MCPTokenClaims) -> dict[str, Any]:
@@ -174,19 +354,51 @@ async def update_preset(args: dict[str, Any], claims: MCPTokenClaims) -> dict[st
         preset = await service.get_preset(preset_id)
         if not preset:
             raise InternalToolError(f"Agent preset with ID '{preset_id}' not found")
+
+        if params.actions is not None:
+            current_actions = set(preset.actions or [])
+            proposed_actions = set(params.actions)
+            added_actions = sorted(proposed_actions - current_actions)
+            if added_actions:
+                workspace_inventory, org_inventory = await _load_secret_inventory(role)
+                oauth_inventory = await _load_oauth_inventory(role)
+                async with RegistryActionsService.with_session(
+                    role=role
+                ) as registry_svc:
+                    unconfigured: list[dict[str, Any]] = []
+                    for action_name in added_actions:
+                        configured, missing = await _get_action_configuration(
+                            registry_svc,
+                            action_name,
+                            workspace_inventory,
+                            org_inventory,
+                            oauth_inventory,
+                        )
+                        if not configured:
+                            unconfigured.append(
+                                {"action": action_name, "missing_requirements": missing}
+                            )
+                if unconfigured:
+                    raise InternalToolError(
+                        "Cannot add unconfigured tools. Missing requirements: "
+                        + ", ".join(
+                            f"{item['action']} ({'; '.join(item['missing_requirements'])})"
+                            for item in unconfigured
+                        )
+                    )
         try:
             updated = await service.update_preset(preset, params)
         except TracecatValidationError as error:
             # Surface builder validation issues as errors that the agent can retry
             raise InternalToolError(str(error)) from error
+        updated_read = await service.build_preset_read(updated)
 
-    return AgentPresetRead.model_validate(updated).model_dump(mode="json")
+    return updated_read.model_dump(mode="json")
 
 
 async def list_sessions(args: dict[str, Any], claims: MCPTokenClaims) -> dict[str, Any]:
     """List agent sessions where this agent preset is being used by end users."""
     from tracecat.agent.session.service import AgentSessionService
-    from tracecat.agent.session.types import AgentSessionEntity
 
     preset_id = _get_preset_id(claims.internal_tool_context)
     role = _build_role(claims)
@@ -247,16 +459,25 @@ async def get_session(args: dict[str, Any], claims: MCPTokenClaims) -> dict[str,
                 raise InternalToolError(f"Session {session_id} not found.")
 
             messages = await service.list_messages(session.id)
+            agents_binding = (
+                ResolvedAgentsConfig.model_validate(session.agents_binding)
+                if session.agents_binding is not None
+                else None
+            )
 
             return AgentSessionReadWithMessages(
                 id=session.id,
                 workspace_id=session.workspace_id,
                 title=session.title,
                 created_by=session.created_by,
-                entity_type=session.entity_type,
+                entity_type=AgentSessionEntity(session.entity_type),
                 entity_id=session.entity_id,
+                channel_context=session.channel_context,
                 tools=session.tools,
+                mcp_integrations=session.mcp_integrations,
                 agent_preset_id=session.agent_preset_id,
+                agent_preset_version_id=session.agent_preset_version_id,
+                agents_binding=agents_binding,
                 harness_type=session.harness_type,
                 created_at=session.created_at,
                 updated_at=session.updated_at,
@@ -303,10 +524,10 @@ class _ListSessionsParams(BaseModel):
     """Parameters for list_sessions."""
 
     limit: int = Field(
-        default=50,
+        default=config.TRACECAT__LIMIT_AGENT_SESSIONS_DEFAULT,
         description="Maximum number of sessions to return.",
-        ge=1,
-        le=100,
+        ge=config.TRACECAT__LIMIT_MIN,
+        le=config.TRACECAT__LIMIT_CURSOR_MAX,
     )
 
 
@@ -337,7 +558,7 @@ def get_builder_internal_tool_definitions() -> dict[str, MCPToolDefinition]:
         ),
         "internal.builder.list_available_tools": MCPToolDefinition(
             name="internal.builder.list_available_tools",
-            description="Return the list of available actions in the registry. Use this to search for tools to add to the preset.",
+            description="Return available actions with configuration readiness metadata. Use this to suggest useful tools and only add configured ones.",
             parameters_json_schema=_ListAvailableToolsParams.model_json_schema(),
         ),
         "internal.builder.update_preset": MCPToolDefinition(
@@ -346,7 +567,10 @@ def get_builder_internal_tool_definitions() -> dict[str, MCPToolDefinition]:
                 "Patch selected fields on the agent preset and return the updated record. "
                 "Only include fields you want to change. "
                 "Supported fields: instructions (system prompt), actions (list of tool identifiers), "
-                "namespaces (scope for tool discovery), tool_approvals (map of tool_name to bool for auto-run)."
+                "namespaces (scope for tool discovery), tool_approvals"
+                " (map of tool_name to bool. If true, require human-in-the-loop approval. "
+                "If false, auto-run tool without approval). "
+                "New actions can only be added when they are configured (required secrets/keys available)."
             ),
             parameters_json_schema=AgentPresetUpdate.model_json_schema(),
         ),

@@ -15,6 +15,7 @@ from tracecat_registry import (
     RegistrySecret,
 )
 
+from tracecat.auth.types import Role
 from tracecat.concurrency import GatheringTaskGroup
 from tracecat.db.engine import get_async_session_context_manager
 from tracecat.dsl.common import DSLInput, ExecuteSubflowArgs
@@ -29,7 +30,6 @@ from tracecat.expressions.validator.validator import (
     ExprValidationContext,
     ExprValidator,
 )
-from tracecat.feature_flags import FeatureFlag, is_feature_enabled
 from tracecat.integrations.enums import OAuthGrantType
 from tracecat.integrations.schemas import ProviderKey
 from tracecat.integrations.service import IntegrationService
@@ -38,6 +38,8 @@ from tracecat.logger import logger
 from tracecat.registry.actions.service import RegistryActionsService
 from tracecat.registry.versions.schemas import RegistryVersionManifest
 from tracecat.secrets.service import SecretsService
+from tracecat.tiers.entitlements import Entitlement, EntitlementService
+from tracecat.tiers.service import TierService
 from tracecat.validation.common import json_schema_to_pydantic
 from tracecat.validation.schemas import (
     ActionValidationResult,
@@ -237,6 +239,8 @@ class ActionEnvPair:
 
 async def validate_actions_have_defined_secrets(
     dsl: DSLInput,
+    *,
+    role: Role,
 ) -> list[SecretValidationResult]:
     """Validate that all actions in the DSL have their required secrets defined."""
     checked_keys: set[str] = set()
@@ -249,10 +253,10 @@ async def validate_actions_have_defined_secrets(
         )
 
     async with get_async_session_context_manager() as session:
-        secrets_service = SecretsService(session)
+        secrets_service = SecretsService(session, role=role)
 
         # Get all actions that need validation from index/manifest
-        registry_service = RegistryActionsService(session)
+        registry_service = RegistryActionsService(session, role=role)
         action_names = [a.action for a in dsl.actions]
         actions_data = await registry_service.get_actions_from_index(action_names)
 
@@ -280,6 +284,7 @@ async def validate_actions_have_defined_secrets(
 async def validate_registry_action_args(
     *,
     session: AsyncSession,
+    role: Role,
     action_name: str,
     action_ref: str,
     args: Mapping[str, Any],
@@ -293,7 +298,7 @@ async def validate_registry_action_args(
             if action_name == PlatformAction.CHILD_WORKFLOW_EXECUTE:
                 validated = ExecuteSubflowArgs.model_validate(args)
             else:
-                service = RegistryActionsService(session)
+                service = RegistryActionsService(session, role=role)
                 action_data = await service.get_action_from_index(action_name)
                 if action_data is None:
                     raise KeyError(f"Action {action_name} not found in registry index")
@@ -362,6 +367,7 @@ async def validate_registry_action_args(
 async def validate_dsl_actions(
     *,
     session: AsyncSession,
+    role: Role,
     dsl: DSLInput,
 ) -> list[ActionValidationResult]:
     """Validate arguemnts to the DSLInput.
@@ -370,6 +376,7 @@ async def validate_dsl_actions(
     """
     val_res: list[ActionValidationResult] = []
     # Validate the actions
+    agent_addons_entitled: bool | None = None
     for act_stmt in dsl.actions:
         details: list[ValidationDetail] = []
         # We validate the action args, but keep them as is
@@ -377,6 +384,7 @@ async def validate_dsl_actions(
         # We store the DSL as is to ensure compatibility with with string reprs
         result = await validate_registry_action_args(
             session=session,
+            role=role,
             action_name=act_stmt.action,
             args=act_stmt.args,
             action_ref=act_stmt.ref,
@@ -384,23 +392,31 @@ async def validate_dsl_actions(
         if result.status == "error" and result.detail:
             details.extend(result.detail)
 
-        # Feature flag gate: tool approvals are an enterprise feature
-        # NOTE: This should be paywalled, instead of being a feature flag
+        # Entitlement gate: tool approvals are an enterprise feature
         if (
             act_stmt.action == "ai.agent"
             and act_stmt.args.get("tool_approvals") is not None
-            and not is_feature_enabled(FeatureFlag.AGENT_APPROVALS)
         ):
-            details.append(
-                ValidationDetail(
-                    type="action",
-                    msg=(
-                        "`tool_approvals` requires the 'agent-approvals' feature flag. "
-                        "Remove the field or enable the flag."
-                    ),
-                    loc=(act_stmt.ref, "tool_approvals"),
+            if agent_addons_entitled is None:
+                if role.organization_id is None:
+                    raise ValueError(
+                        "Role must have organization_id to validate entitlements"
+                    )
+                entitlement_svc = EntitlementService(TierService(session))
+                agent_addons_entitled = await entitlement_svc.is_entitled(
+                    role.organization_id, Entitlement.AGENT_ADDONS
                 )
-            )
+            if not agent_addons_entitled:
+                details.append(
+                    ValidationDetail(
+                        type="action",
+                        msg=(
+                            "`tool_approvals` requires the 'agent_addons' entitlement. "
+                            "Remove the field or upgrade your plan."
+                        ),
+                        loc=(act_stmt.ref, "tool_approvals"),
+                    )
+                )
         # Validate `run_if`
         if act_stmt.run_if and not is_template_only(act_stmt.run_if):
             details.append(
@@ -638,6 +654,7 @@ async def validate_dsl(
     session: AsyncSession,
     dsl: DSLInput,
     *,
+    role: Role,
     validate_entrypoint: bool = True,
     validate_args: bool = True,
     validate_expressions: bool = True,
@@ -666,7 +683,7 @@ async def validate_dsl(
 
     # Tier 2: Action Args validation
     if validate_args:
-        dsl_args_errs = await validate_dsl_actions(session=session, dsl=dsl)
+        dsl_args_errs = await validate_dsl_actions(session=session, role=role, dsl=dsl)
         logger.debug(
             f"{len(dsl_args_errs)} DSL args validation errors", errs=dsl_args_errs
         )
@@ -687,7 +704,9 @@ async def validate_dsl(
 
     # For secrets we also need to check if any used actions have undefined secrets
     if validate_secrets:
-        udf_missing_secrets = await validate_actions_have_defined_secrets(dsl)
+        udf_missing_secrets = await validate_actions_have_defined_secrets(
+            dsl, role=role
+        )
         logger.debug(
             f"{len(udf_missing_secrets)} DSL secret validation errors",
             errs=udf_missing_secrets,

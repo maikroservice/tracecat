@@ -8,6 +8,7 @@ import {
   CopyIcon,
   DownloadIcon,
   GitBranchIcon,
+  GitPullRequestIcon,
   LayersPlusIcon,
   MoreHorizontal,
   PlayIcon,
@@ -21,12 +22,12 @@ import React from "react"
 import { useForm } from "react-hook-form"
 import { z } from "zod"
 import type {
-  DSLValidationResult,
   ValidationDetail,
   ValidationResult,
+  VcsProvider,
+  WorkflowDslPublish,
 } from "@/client"
 import { ApiError } from "@/client"
-import { CodeEditor } from "@/components/editor/codemirror/code-editor"
 import { ExportMenuItem } from "@/components/export-workflow-dropdown-item"
 import { Spinner } from "@/components/loading/spinner"
 import {
@@ -61,26 +62,50 @@ import {
   FormControl,
   FormField,
   FormItem,
+  FormLabel,
   FormMessage,
 } from "@/components/ui/form"
 import { Input } from "@/components/ui/input"
+import { Kbd } from "@/components/ui/kbd"
 import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/components/ui/popover"
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectSeparator,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import { Skeleton } from "@/components/ui/skeleton"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
 import { ValidationErrorView } from "@/components/validation-errors"
-import { useFeatureFlag } from "@/hooks/use-feature-flags"
+import {
+  buildRandomSyncBranchName,
+  getWorkspaceSyncPushButtonLabel,
+  getWorkspaceSyncPushOutcome,
+  getWorkspaceSyncPushWarning,
+  type WorkspaceSyncPushMode,
+  WorkspaceSyncPushModeTabs,
+  WorkspaceSyncPushWarning,
+} from "@/components/workspace-sync/push-target-policy"
+import { useEntitlements } from "@/hooks/use-entitlements"
 import { useWorkspaceDetails } from "@/hooks/use-workspace"
+import { useRepositoryBranches } from "@/hooks/use-workspace-sync"
 import type { TracecatApiError } from "@/lib/errors"
 import {
   useCreateDraftWorkflowExecution,
-  useGitLabCredentialsStatus,
   useOrgAppSettings,
   useWorkflowManager,
 } from "@/lib/hooks"
 import { cn, copyToClipboard } from "@/lib/utils"
+import {
+  parseTriggerPayload,
+  validateTriggerPayload,
+} from "@/lib/workflow-trigger-payload"
 import { useWorkflowBuilder } from "@/providers/builder"
 import { useWorkflow } from "@/providers/workflow"
 import { useWorkspaceId } from "@/providers/workspace-id"
@@ -115,8 +140,6 @@ export function BuilderNav() {
 
   const workspaceId = useWorkspaceId()
   const { workspace, workspaceLoading } = useWorkspaceDetails()
-  const { credentialsStatus: gitLabCredentialsStatus } =
-    useGitLabCredentialsStatus()
   const workflowTitle = workflow?.title ?? "Untitled workflow"
 
   // Track if there are pending workflow updates (e.g., title/description changes)
@@ -142,15 +165,6 @@ export function BuilderNav() {
         setValidationErrors(errors || null)
       } else {
         setValidationErrors(null)
-        // If GitLab credentials are configured, also publish to Git
-        if (gitLabCredentialsStatus?.exists) {
-          console.log("Publishing to Git...")
-          try {
-            await publishWorkflow({})
-          } catch (publishError) {
-            console.error("Failed to publish workflow to Git:", publishError)
-          }
-        }
       }
     } catch (error) {
       console.error("Failed to save workflow:", error)
@@ -228,6 +242,9 @@ export function BuilderNav() {
         {/* Save button */}
         <WorkflowSaveActions
           workflow={workflow}
+          workspaceId={workspaceId}
+          provider={workspace.settings?.git_provider ?? "github"}
+          gitRepoUrl={workspace.settings?.git_repo_url || undefined}
           validationErrors={validationErrors}
           onSave={handleCommit}
           onPublish={publishWorkflow}
@@ -243,13 +260,89 @@ export function BuilderNav() {
 
 function TabSwitcher({ workflowId }: { workflowId: string }) {
   const pathname = usePathname()
+  const router = useRouter()
   const workspaceId = useWorkspaceId()
+  const pendingNavKeyRef = React.useRef<"w" | "r" | null>(null)
+  const pendingNavAtRef = React.useRef<number | null>(null)
   let leafRoute: string = "workflow"
   if (pathname && pathname.includes("executions")) {
     leafRoute = "executions"
   }
 
   const builderPath = `/workspaces/${workspaceId}/workflows/${workflowId}`
+  const executionsPath = `${builderPath}/executions`
+  const keyOnlyTooltipClassName = "border-0 bg-transparent p-0 shadow-none"
+
+  React.useEffect(() => {
+    const DOUBLE_TAP_WINDOW_MS = 1200
+    const isEditableTarget = (target: EventTarget | null) => {
+      if (!(target instanceof HTMLElement)) {
+        return false
+      }
+      const tagName = target.tagName
+      return (
+        target.isContentEditable ||
+        tagName === "INPUT" ||
+        tagName === "TEXTAREA" ||
+        tagName === "SELECT" ||
+        target.getAttribute("role") === "textbox"
+      )
+    }
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.repeat ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.altKey ||
+        isEditableTarget(event.target)
+      ) {
+        return
+      }
+
+      const key = event.key.toLowerCase()
+      const now = Date.now()
+      const pendingKey = pendingNavKeyRef.current
+      const pendingAt = pendingNavAtRef.current
+      const isWithinWindow =
+        pendingKey !== null &&
+        pendingAt !== null &&
+        now - pendingAt <= DOUBLE_TAP_WINDOW_MS
+
+      if (key !== "w" && key !== "r") {
+        pendingNavKeyRef.current = null
+        pendingNavAtRef.current = null
+        return
+      }
+
+      if (!isWithinWindow || pendingKey !== key) {
+        pendingNavKeyRef.current = key
+        pendingNavAtRef.current = now
+        return
+      }
+
+      pendingNavKeyRef.current = null
+      pendingNavAtRef.current = null
+
+      if (key === "w") {
+        event.preventDefault()
+        if (leafRoute !== "workflow") {
+          router.push(builderPath)
+        }
+        return
+      }
+
+      if (key === "r") {
+        event.preventDefault()
+        if (leafRoute !== "executions") {
+          router.push(executionsPath)
+        }
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown)
+    return () => window.removeEventListener("keydown", handleKeyDown)
+  }, [builderPath, executionsPath, leafRoute, router])
 
   return (
     <Tabs value={leafRoute}>
@@ -260,8 +353,27 @@ function TabSwitcher({ workflowId }: { workflowId: string }) {
           asChild
         >
           <Link href={builderPath} className="size-full text-xs" passHref>
-            <WorkflowIcon className="mr-2 size-4" />
-            <span>Workflow</span>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="flex size-full items-center justify-center">
+                  <WorkflowIcon className="mr-2 size-4" />
+                  <span>Workflow</span>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent
+                side="bottom"
+                className={keyOnlyTooltipClassName}
+                sideOffset={8}
+              >
+                <span className="inline-flex items-center gap-1">
+                  <Kbd>W</Kbd>
+                  <span className="inline-flex h-5 items-center rounded border bg-muted px-1.5 text-[10px] font-medium text-muted-foreground">
+                    then
+                  </span>
+                  <Kbd>W</Kbd>
+                </span>
+              </TooltipContent>
+            </Tooltip>
           </Link>
         </TabsTrigger>
         <TabsTrigger
@@ -269,13 +381,28 @@ function TabSwitcher({ workflowId }: { workflowId: string }) {
           value="executions"
           asChild
         >
-          <Link
-            href={`${builderPath}/executions`}
-            className="size-full text-xs"
-            passHref
-          >
-            <SquarePlay className="mr-2 size-4" />
-            <span>Runs</span>
+          <Link href={executionsPath} className="size-full text-xs" passHref>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <span className="flex size-full items-center justify-center">
+                  <SquarePlay className="mr-2 size-4" />
+                  <span>Runs</span>
+                </span>
+              </TooltipTrigger>
+              <TooltipContent
+                side="bottom"
+                className={keyOnlyTooltipClassName}
+                sideOffset={8}
+              >
+                <span className="inline-flex items-center gap-1">
+                  <Kbd>R</Kbd>
+                  <span className="inline-flex h-5 items-center rounded border bg-muted px-1.5 text-[10px] font-medium text-muted-foreground">
+                    then
+                  </span>
+                  <Kbd>R</Kbd>
+                </span>
+              </TooltipContent>
+            </Tooltip>
           </Link>
         </TabsTrigger>
       </TabsList>
@@ -283,70 +410,161 @@ function TabSwitcher({ workflowId }: { workflowId: string }) {
   )
 }
 
-const workflowControlsFormSchema = z.object({
-  payload: z.string().superRefine((val, ctx) => {
-    try {
-      JSON.parse(val)
-    } catch (error) {
-      if (error instanceof Error) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: `Invalid JSON format: ${error.message}`,
-        })
-      } else {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: "Invalid JSON format: Unknown error occurred",
-        })
-      }
-    }
-  }),
-})
-type TWorkflowControlsForm = z.infer<typeof workflowControlsFormSchema>
-
 const publishFormSchema = z.object({
   message: z.string().optional(),
+  branch: z.string().trim().min(1, "Target branch is required"),
 })
 type TPublishForm = z.infer<typeof publishFormSchema>
+const CREATE_NEW_BRANCH_VALUE = "__create_new_branch__"
 
-function WorkflowManualTrigger({
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
+}
+
+function isValidationDetail(value: unknown): value is ValidationDetail {
+  if (!isRecord(value)) {
+    return false
+  }
+  if (typeof value.type !== "string" || typeof value.msg !== "string") {
+    return false
+  }
+  if ("loc" in value && value.loc !== null && !Array.isArray(value.loc)) {
+    return false
+  }
+  return true
+}
+
+function isValidationResult(value: unknown): value is ValidationResult {
+  if (!isRecord(value)) {
+    return false
+  }
+  if (value.status !== "success" && value.status !== "error") {
+    return false
+  }
+  return typeof value.type === "string"
+}
+
+function toDslApiErrorResult(message: string): ValidationResult {
+  return {
+    type: "dsl",
+    status: "error",
+    msg: message,
+    ref: null,
+    detail: [{ type: "api_error", msg: message }],
+  }
+}
+
+function normalizeRunValidationErrors(
+  detail: unknown
+): ValidationResult[] | null {
+  if (
+    Array.isArray(detail) &&
+    detail.length > 0 &&
+    detail.every(isValidationResult)
+  ) {
+    return detail
+  }
+  if (
+    Array.isArray(detail) &&
+    detail.length > 0 &&
+    detail.every(isValidationDetail)
+  ) {
+    return [
+      {
+        type: "dsl",
+        status: "error",
+        msg: "Workflow validation failed",
+        ref: null,
+        detail,
+      },
+    ]
+  }
+
+  let message: string | undefined
+  let nestedDetail: unknown
+
+  if (typeof detail === "string") {
+    message = detail
+  } else if (isRecord(detail)) {
+    if (typeof detail.message === "string") {
+      message = detail.message
+    }
+    nestedDetail = detail.detail
+  } else if (detail) {
+    try {
+      message = JSON.stringify(detail)
+    } catch {
+      message = undefined
+    }
+  }
+
+  if (
+    Array.isArray(nestedDetail) &&
+    nestedDetail.length > 0 &&
+    nestedDetail.every(isValidationResult)
+  ) {
+    return nestedDetail
+  }
+  if (
+    Array.isArray(nestedDetail) &&
+    nestedDetail.length > 0 &&
+    nestedDetail.every(isValidationDetail)
+  ) {
+    return [
+      {
+        type: "dsl",
+        status: "error",
+        msg: message || "Workflow validation failed",
+        ref: null,
+        detail: nestedDetail,
+      },
+    ]
+  }
+
+  if (!message) {
+    return null
+  }
+  return [toDslApiErrorResult(message)]
+}
+
+export function WorkflowManualTrigger({
   disabled = true,
   workflowId,
+  onAfterTrigger,
 }: {
   disabled: boolean
   workflowId: string
+  /** Invoked after a run is successfully started (e.g. to reveal events). */
+  onAfterTrigger?: () => void
 }) {
-  const { expandSidebarAndFocusEvents, setCurrentExecutionId } =
+  const { expandSidebarAndFocusEvents, setCurrentExecutionId, triggerPayload } =
     useWorkflowBuilder()
   // Always use draft execution endpoint - runs the current draft workflow graph
   const { createDraftExecution, createDraftExecutionIsPending } =
     useCreateDraftWorkflowExecution(workflowId)
-  const [open, setOpen] = React.useState(false)
-  const [lastTriggerInput, setLastTriggerInput] = React.useState<string | null>(
-    null
-  )
   const [manualTriggerErrors, setManualTriggerErrors] = React.useState<
     ValidationResult[] | null
   >(null)
   const [isTriggering, setIsTriggering] = React.useState(false)
-  const form = useForm<TWorkflowControlsForm>({
-    resolver: zodResolver(workflowControlsFormSchema),
-    defaultValues: {
-      payload:
-        lastTriggerInput ||
-        JSON.stringify({ sampleWebhookParam: "sampleValue" }, null, 2),
-    },
-  })
 
-  const runWorkflow = async ({ payload }: Partial<TWorkflowControlsForm>) => {
+  React.useEffect(() => {
+    setManualTriggerErrors(null)
+  }, [triggerPayload])
+
+  const runWorkflow = async () => {
     if (disabled || createDraftExecutionIsPending) return
+    const payloadError = validateTriggerPayload(triggerPayload)
+    if (payloadError) {
+      setManualTriggerErrors([toDslApiErrorResult(payloadError)])
+      return
+    }
     setIsTriggering(true)
     setTimeout(() => setIsTriggering(false), 1000)
     setManualTriggerErrors(null)
     try {
       const result = await createDraftExecution({
         workflow_id: workflowId,
-        inputs: payload ? JSON.parse(payload) : undefined,
+        inputs: parseTriggerPayload(triggerPayload),
       })
 
       // Store the execution ID directly
@@ -356,6 +574,7 @@ function WorkflowManualTrigger({
 
       // Expand sidebar immediately
       expandSidebarAndFocusEvents()
+      onAfterTrigger?.()
     } catch (error) {
       if (error instanceof ApiError) {
         const tracecatError = error as TracecatApiError<{
@@ -364,200 +583,189 @@ function WorkflowManualTrigger({
           detail?: unknown
         }>
         console.error("Error details", tracecatError.body)
-        const detail = tracecatError.body.detail
-        let detailMessage: string | undefined
-        if (typeof detail === "string") {
-          detailMessage = detail
-        } else if (
-          detail &&
-          typeof detail === "object" &&
-          "message" in detail &&
-          typeof (detail as { message?: unknown }).message === "string"
-        ) {
-          detailMessage = (detail as { message?: string }).message
-        } else if (detail) {
-          try {
-            detailMessage = JSON.stringify(detail)
-          } catch {
-            detailMessage = undefined
-          }
+        const validationErrors = normalizeRunValidationErrors(
+          tracecatError.body.detail
+        )
+        if (validationErrors && validationErrors.length > 0) {
+          setManualTriggerErrors(validationErrors)
+        } else {
+          setManualTriggerErrors([
+            toDslApiErrorResult("Failed to start workflow"),
+          ])
         }
-        const details =
-          Array.isArray(detail) && detail.every((d) => "msg" in (d as object))
-            ? (detail as ValidationDetail[])
-            : detailMessage
-              ? [{ type: "api_error", msg: detailMessage }]
-              : null
-        // Convert API error to ValidationResult format for consistent display
-        const validationError: DSLValidationResult = {
-          type: "dsl",
-          status: "error",
-          msg: detailMessage || "Failed to start workflow",
-          ref: null,
-          detail: details,
-        }
-        setManualTriggerErrors([validationError])
       }
-    }
-  }
-
-  const runWithPayload = async ({ payload }: TWorkflowControlsForm) => {
-    // Make the API call to start the workflow
-    setLastTriggerInput(payload)
-    try {
-      await runWorkflow({ payload })
-    } finally {
-      setOpen(false)
     }
   }
 
   const executionPending = createDraftExecutionIsPending || isTriggering
   return (
-    <Form {...form}>
-      <ValidationErrorView
-        side="bottom"
-        validationErrors={manualTriggerErrors || []}
-        noErrorTooltip={
-          <span>
-            {disabled
-              ? "Cannot run workflow."
-              : executionPending
-                ? "Starting workflow execution..."
-                : "Run the current draft workflow with trigger inputs."}
-          </span>
-        }
+    <ValidationErrorView
+      side="bottom"
+      validationErrors={manualTriggerErrors || []}
+      noErrorTooltip={
+        <span>
+          {disabled
+            ? "Cannot run workflow."
+            : executionPending
+              ? "Starting workflow execution..."
+              : "Run the current draft workflow with the trigger payload from the trigger node."}
+        </span>
+      }
+    >
+      <Button
+        type="button"
+        variant={manualTriggerErrors ? "destructive" : "default"}
+        className="h-7 justify-center gap-2 rounded-lg px-5 py-0 text-xs font-medium"
+        disabled={disabled || executionPending}
+        onClick={runWorkflow}
       >
-        <div
-          className={cn(
-            "flex h-7 divide-x rounded-lg border border-input overflow-hidden",
-            manualTriggerErrors
-              ? "divide-white/30 dark:divide-black/30"
-              : "divide-white/20 dark:divide-black/40"
-          )}
-        >
-          {/* Main Button */}
-          <Button
-            type="button"
-            variant={manualTriggerErrors ? "destructive" : "default"}
-            className="h-full gap-2 rounded-r-none border-none px-3 py-0 text-xs"
-            disabled={disabled || executionPending}
-            onClick={() => runWorkflow({ payload: undefined })}
-          >
-            {executionPending ? (
-              <Spinner className="size-3" segmentColor="currentColor" />
-            ) : manualTriggerErrors ? (
-              <AlertTriangleIcon className="size-3" />
-            ) : (
-              <PlayIcon className="size-3" />
-            )}
-            <span>Run</span>
-          </Button>
-          {/* Dropdown Button */}
-          <Popover
-            open={open && !disabled}
-            onOpenChange={(newOpen) => !disabled && setOpen(newOpen)}
-          >
-            <PopoverTrigger asChild>
-              <Button
-                type="button"
-                variant={manualTriggerErrors ? "destructive" : "default"}
-                className="h-full w-7 rounded-l-none border-none px-1 py-0 text-xs font-bold"
-                disabled={disabled || executionPending}
-              >
-                <ChevronDownIcon className="size-3" />
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent className="w-fit max-w-xl p-3 sm:max-w-2xl">
-              <form onSubmit={form.handleSubmit(runWithPayload)}>
-                <div className="flex h-fit flex-col">
-                  <span className="mb-2 text-xs text-muted-foreground">
-                    Edit the JSON payload below.
-                  </span>
-                  <FormField
-                    control={form.control}
-                    name="payload"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormControl>
-                          <CodeEditor
-                            value={field.value}
-                            language="json"
-                            onChange={field.onChange}
-                            className="[&_.cm-editor]:!border [&_.cm-editor]:!border-input [&_.cm-editor]:!bg-background [&_.cm-editor]:rounded-md [&_.cm-scroller]:max-h-96 [&_.cm-scroller]:overflow-auto [&_.cm-scroller]:h-auto sm:[&_.cm-scroller]:max-h-[500px]"
-                          />
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-                  <Button
-                    type="submit"
-                    variant="default"
-                    disabled={executionPending}
-                    className="group mt-2 flex h-7 items-center px-3 py-0 text-xs"
-                  >
-                    {executionPending ? (
-                      <Spinner
-                        className="mr-2 size-3.5"
-                        segmentColor="currentColor"
-                      />
-                    ) : (
-                      <PlayIcon className="mr-2 size-3.5" />
-                    )}
-                    <span>{executionPending ? "Starting..." : "Run"}</span>
-                  </Button>
-                </div>
-              </form>
-            </PopoverContent>
-          </Popover>
-        </div>
-      </ValidationErrorView>
-    </Form>
+        {executionPending ? (
+          <Spinner className="size-3.5" segmentColor="currentColor" />
+        ) : manualTriggerErrors ? (
+          <AlertTriangleIcon className="size-3.5" />
+        ) : (
+          <PlayIcon className="size-3.5" />
+        )}
+        <span>Run</span>
+      </Button>
+    </ValidationErrorView>
   )
 }
 
 function WorkflowSaveActions({
   workflow,
+  workspaceId,
+  provider,
+  gitRepoUrl,
   validationErrors,
   onSave,
   onPublish,
   hasPendingUpdates = false,
 }: {
-  workflow: { version?: number | null }
+  workflow: { version?: number | null; git_sync_branch?: string | null }
+  workspaceId: string
+  provider: VcsProvider
+  gitRepoUrl?: string
   validationErrors: ValidationResult[] | null
   onSave: () => Promise<void>
-  onPublish: (params: { message?: string }) => Promise<void>
+  onPublish: (params: WorkflowDslPublish) => Promise<unknown>
   hasPendingUpdates?: boolean
 }) {
-  const { isFeatureEnabled } = useFeatureFlag()
-  const { credentialsStatus: gitLabCredentialsStatus } =
-    useGitLabCredentialsStatus()
+  const { hasEntitlement } = useEntitlements()
+  const isGitSyncEnabled = hasEntitlement("git_sync")
   const [publishOpen, setPublishOpen] = React.useState(false)
   const [isPublishing, setIsPublishing] = React.useState(false)
+  const [isCreatingBranch, setIsCreatingBranch] = React.useState(true)
+  const [pushMode, setPushMode] =
+    React.useState<WorkspaceSyncPushMode>("pull-request")
+  const initialPublishBranch = React.useMemo(
+    () => buildRandomSyncBranchName("sync/workflow"),
+    []
+  )
+  const { branches: repoBranches, branchesIsLoading: branchesLoading } =
+    useRepositoryBranches(workspaceId, {
+      enabled: isGitSyncEnabled && publishOpen,
+      gitRepoUrl,
+      provider,
+      limit: 200,
+    })
+  const hasBranches = (repoBranches?.length ?? 0) > 0
 
   const publishForm = useForm<TPublishForm>({
     resolver: zodResolver(publishFormSchema),
     defaultValues: {
       message: "",
+      branch: initialPublishBranch,
     },
   })
+
+  const resetPublishForm = React.useCallback(() => {
+    setIsCreatingBranch(true)
+    setPushMode("pull-request")
+    publishForm.reset({
+      message: "",
+      branch: buildRandomSyncBranchName("sync/workflow"),
+    })
+  }, [publishForm])
+
+  React.useEffect(() => {
+    if (!publishOpen) {
+      return
+    }
+    resetPublishForm()
+  }, [publishOpen, resetPublishForm])
+
+  React.useEffect(() => {
+    if (
+      !publishOpen ||
+      !repoBranches ||
+      repoBranches.length === 0 ||
+      isCreatingBranch
+    ) {
+      return
+    }
+
+    const branchNames = new Set(repoBranches.map((branch) => branch.name))
+    const currentBranch = publishForm.getValues("branch")
+    if (currentBranch && branchNames.has(currentBranch)) {
+      return
+    }
+
+    const preferredBranch = workflow.git_sync_branch
+    const defaultBranch =
+      (preferredBranch && branchNames.has(preferredBranch)
+        ? preferredBranch
+        : undefined) ??
+      repoBranches.find((branch) => branch.is_default)?.name ??
+      repoBranches[0]?.name
+
+    if (defaultBranch) {
+      publishForm.setValue("branch", defaultBranch, { shouldValidate: true })
+    }
+  }, [
+    isCreatingBranch,
+    publishForm,
+    publishOpen,
+    repoBranches,
+    workflow.git_sync_branch,
+  ])
+
+  const selectedBranch = publishForm.watch("branch").trim()
+  const defaultBranch =
+    repoBranches?.find((branch) => branch.is_default)?.name ??
+    repoBranches?.[0]?.name
+  const pushOutcome = getWorkspaceSyncPushOutcome({
+    mode: pushMode,
+    targetBranch: selectedBranch,
+    defaultBranch,
+    isCreatingBranch,
+  })
+  const pushWarning = getWorkspaceSyncPushWarning({
+    outcome: pushOutcome,
+    defaultBranch,
+    provider,
+  })
+  const publishDisabled =
+    isPublishing ||
+    branchesLoading ||
+    (!hasBranches && !isCreatingBranch) ||
+    selectedBranch === "" ||
+    pushOutcome.isPullRequestBlocked
 
   const handlePublish = async (data: TPublishForm) => {
     setIsPublishing(true)
     try {
-      await onPublish({ message: data.message || undefined })
+      await onPublish({
+        message: data.message || undefined,
+        branch: data.branch,
+        create_pr: pushOutcome.createPr,
+      })
     } finally {
       setIsPublishing(false)
       setPublishOpen(false)
-      publishForm.reset()
+      resetPublishForm()
     }
   }
-
-  // Show Git publish dropdown if either:
-  // - GitHub git-sync feature is enabled (enterprise feature), OR
-  // - GitLab credentials are configured (always available)
-  const isGitSyncEnabled =
-    isFeatureEnabled("git-sync") || gitLabCredentialsStatus?.exists === true
 
   return (
     <div className="flex items-center space-x-2">
@@ -612,13 +820,112 @@ function WorkflowSaveActions({
                   className="flex flex-col"
                 >
                   <span className="mb-2 text-xs text-muted-foreground">
-                    Commit workflow
+                    Version control
                   </span>
+                  <FormField
+                    control={publishForm.control}
+                    name="branch"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel className="text-xs text-muted-foreground">
+                          Target branch
+                        </FormLabel>
+                        <Select
+                          value={
+                            isCreatingBranch ||
+                            !repoBranches?.some(
+                              (branch) => branch.name === field.value
+                            )
+                              ? CREATE_NEW_BRANCH_VALUE
+                              : field.value
+                          }
+                          onValueChange={(value) => {
+                            if (value === CREATE_NEW_BRANCH_VALUE) {
+                              setIsCreatingBranch(true)
+                              field.onChange(
+                                buildRandomSyncBranchName("sync/workflow")
+                              )
+                              return
+                            }
+                            setIsCreatingBranch(false)
+                            field.onChange(value)
+                          }}
+                          disabled={branchesLoading || !hasBranches}
+                        >
+                          <FormControl>
+                            <SelectTrigger className="h-7 px-3 text-xs">
+                              {branchesLoading ? (
+                                <Skeleton className="h-3.5 w-full rounded-sm" />
+                              ) : (
+                                <SelectValue placeholder="Select branch" />
+                              )}
+                            </SelectTrigger>
+                          </FormControl>
+                          <SelectContent>
+                            {hasBranches ? (
+                              <>
+                                <SelectItem value={CREATE_NEW_BRANCH_VALUE}>
+                                  Create new branch...
+                                </SelectItem>
+                                <SelectSeparator />
+                                {(repoBranches ?? []).map((branch) => (
+                                  <SelectItem
+                                    key={branch.name}
+                                    value={branch.name}
+                                  >
+                                    <div className="flex items-center gap-2">
+                                      <span>{branch.name}</span>
+                                      {branch.is_default && (
+                                        <Badge
+                                          variant="secondary"
+                                          className="h-4 rounded-sm px-1 text-[10px] font-normal"
+                                        >
+                                          default
+                                        </Badge>
+                                      )}
+                                    </div>
+                                  </SelectItem>
+                                ))}
+                              </>
+                            ) : (
+                              <SelectItem value="__no_branches" disabled>
+                                No branches found
+                              </SelectItem>
+                            )}
+                          </SelectContent>
+                        </Select>
+                        {isCreatingBranch && (
+                          <div className="mt-2">
+                            <Input
+                              value={field.value}
+                              onChange={field.onChange}
+                              placeholder="feature/my-workflow"
+                              className="h-7 px-3 text-xs"
+                            />
+                            <p className="mt-1 text-[11px] text-muted-foreground">
+                              The branch will be created from the repository
+                              default branch if it does not exist.
+                            </p>
+                          </div>
+                        )}
+                        {!branchesLoading && !hasBranches && (
+                          <p className="text-[11px] text-muted-foreground">
+                            No branches available from the configured
+                            repository.
+                          </p>
+                        )}
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
                   <FormField
                     control={publishForm.control}
                     name="message"
                     render={({ field }) => (
-                      <FormItem>
+                      <FormItem className="mt-2">
+                        <FormLabel className="text-xs text-muted-foreground">
+                          Commit message
+                        </FormLabel>
                         <FormControl>
                           <Input
                             {...field}
@@ -630,20 +937,42 @@ function WorkflowSaveActions({
                       </FormItem>
                     )}
                   />
+                  <div className="mt-2 space-y-1.5">
+                    <p className="text-xs text-muted-foreground">Push mode</p>
+                    <WorkspaceSyncPushModeTabs
+                      value={pushMode}
+                      onValueChange={setPushMode}
+                      provider={provider}
+                    />
+                  </div>
+                  <WorkspaceSyncPushWarning
+                    warning={pushWarning}
+                    blocked={pushOutcome.isPullRequestBlocked}
+                    className="mt-2"
+                  />
                   <Button
                     type="submit"
-                    disabled={isPublishing}
+                    disabled={publishDisabled}
                     className="mt-2 flex h-7 w-full items-center justify-center gap-2 bg-primary px-3 py-0 text-xs text-white hover:bg-primary/80"
                   >
                     {isPublishing ? (
                       <>
                         <Spinner className="size-3" />
-                        Publishing changes...
+                        Pushing changes...
                       </>
                     ) : (
                       <>
-                        <GitBranchIcon className="size-3" />
-                        Publish changes
+                        {pushOutcome.createPr ? (
+                          <GitPullRequestIcon className="size-3" />
+                        ) : (
+                          <GitBranchIcon className="size-3" />
+                        )}
+                        {getWorkspaceSyncPushButtonLabel({
+                          outcome: pushOutcome,
+                          isCreatingBranch,
+                          isPending: false,
+                          provider,
+                        })}
                       </>
                     )}
                   </Button>
@@ -673,7 +1002,9 @@ function BuilderNavOptions({
 }) {
   const router = useRouter()
   const { appSettings } = useOrgAppSettings()
-  const { deleteWorkflow } = useWorkflowManager()
+  const { deleteWorkflow } = useWorkflowManager(undefined, {
+    listEnabled: false,
+  })
   const enabledExport = appSettings?.app_workflow_export_enabled
 
   const handleDelete = async () => {

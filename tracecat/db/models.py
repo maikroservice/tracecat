@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -18,9 +17,12 @@ from pydantic_core import CoreSchema, core_schema, to_json
 from sqlalchemy import (
     TIMESTAMP,
     Boolean,
+    CheckConstraint,
     Enum,
+    FetchedValue,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Identity,
     Index,
     Integer,
@@ -36,6 +38,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.ext.hybrid import hybrid_property
+from sqlalchemy.ext.mutable import MutableList
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -46,7 +49,8 @@ from sqlalchemy.orm import (
 from tracecat import config
 from tracecat.agent.approvals.enums import ApprovalStatus
 from tracecat.auth.schemas import UserRole
-from tracecat.authz.enums import OrgRole, WorkspaceRole
+from tracecat.auth.secrets import get_signing_secret
+from tracecat.authz.enums import ScopeSource
 from tracecat.cases.durations.schemas import CaseDurationAnchorSelection
 from tracecat.cases.enums import (
     CaseEventType,
@@ -78,8 +82,6 @@ CASE_TASK_STATUS_ENUM = Enum(CaseTaskStatus, name="casetaskstatus")
 INTERACTION_STATUS_ENUM = Enum(InteractionStatus, name="interactionstatus")
 APPROVAL_STATUS_ENUM = Enum(ApprovalStatus, name="approvalstatus")
 INVITATION_STATUS_ENUM = Enum(InvitationStatus, name="invitationstatus")
-
-
 # Naming convention for constraints so Alembic can generate deterministic names
 # See: https://alembic.sqlalchemy.org/en/latest/naming.html
 NAMING_CONVENTION: dict[str, str] = {
@@ -125,6 +127,11 @@ class InvitationMixin:
         UUID,
         ForeignKey("user.id", ondelete="SET NULL"),
         doc="User who created the invitation",
+    )
+    role_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("role.id", ondelete="RESTRICT"),
+        doc="RBAC role to assign upon acceptance",
     )
     token: Mapped[str] = mapped_column(
         String(64), unique=True, doc="Unique token for magic link acceptance"
@@ -213,18 +220,85 @@ class Organization(Base, TimestampMixin):
         back_populates="organization",
         uselist=False,
     )
+    domains: Mapped[list[OrganizationDomain]] = relationship(
+        "OrganizationDomain",
+        back_populates="organization",
+        cascade="all, delete-orphan",
+        lazy="select",
+    )
+
+
+class OrganizationDomain(Base, TimestampMixin):
+    """A verified or assigned domain owned by an organization."""
+
+    __tablename__ = "organization_domain"
+    __table_args__ = (
+        # Active domains must be globally unique across all organizations.
+        Index(
+            "ix_org_domain_normalized_domain_active_unique",
+            "normalized_domain",
+            unique=True,
+            postgresql_where=text("is_active IS TRUE"),
+        ),
+        # At most one active primary domain per organization.
+        Index(
+            "ix_org_domain_org_primary_active_unique",
+            "organization_id",
+            unique=True,
+            postgresql_where=text("is_active IS TRUE AND is_primary IS TRUE"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID, primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("organization.id", ondelete="CASCADE"),
+        index=True,
+    )
+    domain: Mapped[str] = mapped_column(String(255))
+    normalized_domain: Mapped[str] = mapped_column(String(255), index=True)
+    is_primary: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=text("false"),
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default=text("true"),
+    )
+    verified_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
+    verification_method: Mapped[str] = mapped_column(
+        String(64),
+        default="platform_admin",
+        server_default=text("'platform_admin'"),
+    )
+    verification_token: Mapped[str | None] = mapped_column(String(255))
+    verification_record_name: Mapped[str | None] = mapped_column(String(255))
+
+    organization: Mapped[Organization] = relationship(
+        "Organization",
+        back_populates="domains",
+    )
 
 
 class OrganizationModel(RecordModel):
     """Base class for organization-scoped resources.
 
     Used for resources that belong to an organization (e.g., Workspace, OrganizationSecret).
-    The organization_id references the organization's sentinel UUID.
+    The organization_id is a foreign key to the organization table.
+
+    Default ondelete is RESTRICT to prevent accidental data loss when deleting
+    organizations. Override in subclasses to use CASCADE where appropriate.
     """
 
     __abstract__ = True
 
-    organization_id: Mapped[OrganizationID] = mapped_column(UUID, nullable=False)
+    organization_id: Mapped[OrganizationID] = mapped_column(
+        UUID,
+        ForeignKey("organization.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
 
 
 class PlatformModel(RecordModel):
@@ -277,13 +351,8 @@ class Membership(Base):
     )
     workspace_id: Mapped[uuid.UUID] = mapped_column(
         UUID,
-        ForeignKey("workspace.id"),
+        ForeignKey("workspace.id", ondelete="CASCADE"),
         primary_key=True,
-    )
-    role: Mapped[WorkspaceRole] = mapped_column(
-        Enum(WorkspaceRole, name="workspacerole"),
-        nullable=False,
-        default=WorkspaceRole.EDITOR,
     )
 
 
@@ -306,11 +375,6 @@ class OrganizationMembership(Base, TimestampMixin):
         UUID,
         ForeignKey("organization.id", ondelete="CASCADE"),
         primary_key=True,
-    )
-    role: Mapped[OrgRole] = mapped_column(
-        Enum(OrgRole, name="orgrole"),
-        nullable=False,
-        default=OrgRole.MEMBER,
     )
 
 
@@ -350,6 +414,13 @@ class Workspace(OrganizationModel):
         unique=True,
     )
     name: Mapped[str] = mapped_column(String, index=True, nullable=False)
+    last_case_number: Mapped[int] = mapped_column(
+        Integer,
+        default=0,
+        server_default=text("0"),
+        nullable=False,
+        doc="Last allocated workspace-scoped case number.",
+    )
     settings: Mapped[WorkspaceSettings] = mapped_column(
         JSONB,
         default=WorkspaceSettings(workflow_unlimited_timeout_enabled=True),
@@ -380,8 +451,8 @@ class Workspace(OrganizationModel):
         back_populates="workspace",
         cascade="all, delete",
     )
-    workflow_tags: Mapped[list[Tag]] = relationship(
-        "Tag",
+    workflow_tags: Mapped[list[WorkflowTag]] = relationship(
+        "WorkflowTag",
         back_populates="workspace",
         cascade="all, delete",
     )
@@ -394,6 +465,31 @@ class Workspace(OrganizationModel):
         "AgentPreset",
         back_populates="workspace",
         cascade="all, delete",
+    )
+    agent_folders: Mapped[list[AgentFolder]] = relationship(
+        "AgentFolder",
+        back_populates="workspace",
+        cascade="all, delete",
+    )
+    agent_tags: Mapped[list[AgentTag]] = relationship(
+        "AgentTag",
+        back_populates="workspace",
+        cascade="all, delete",
+    )
+    skills: Mapped[list[Skill]] = relationship(
+        "Skill",
+        back_populates="workspace",
+        cascade="all, delete",
+    )
+    skill_blobs: Mapped[list[SkillBlob]] = relationship(
+        "SkillBlob",
+        back_populates="workspace",
+        cascade="all, delete",
+    )
+    case_dropdown_definitions: Mapped[list[CaseDropdownDefinition]] = relationship(
+        "CaseDropdownDefinition",
+        back_populates="workspace",
+        cascade="all, delete-orphan",
     )
     case_duration_definitions: Mapped[list[CaseDurationDefinition]] = relationship(
         "CaseDurationDefinition",
@@ -415,6 +511,46 @@ class Workspace(OrganizationModel):
         back_populates="workspace",
         cascade="all, delete",
     )
+    sync_resource_mappings: Mapped[list[WorkspaceSyncResourceMapping]] = relationship(
+        "WorkspaceSyncResourceMapping",
+        back_populates="workspace",
+        cascade="all, delete",
+    )
+
+
+class WorkspaceSyncResourceMapping(WorkspaceModel):
+    """Maps portable sync source identities to workspace-local resource UUIDs."""
+
+    __tablename__ = "workspace_sync_resource_mapping"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "provider",
+            "resource_type",
+            "source_id",
+            name="uq_workspace_sync_mapping_source",
+        ),
+        UniqueConstraint(
+            "workspace_id",
+            "provider",
+            "resource_type",
+            "local_id",
+            name="uq_workspace_sync_mapping_local",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID, default=uuid.uuid4, nullable=False, unique=True, index=True
+    )
+    provider: Mapped[str] = mapped_column(
+        String(32), default="github", server_default=text("'github'"), nullable=False
+    )
+    resource_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_id: Mapped[str] = mapped_column(String, nullable=False)
+    source_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    local_id: Mapped[uuid.UUID] = mapped_column(UUID, nullable=False)
+
+    workspace: Mapped[Workspace] = relationship(back_populates="sync_resource_mappings")
 
 
 class User(SQLAlchemyBaseUserTableUUID, Base):
@@ -452,17 +588,27 @@ class User(SQLAlchemyBaseUserTableUUID, Base):
         "AccessToken",
         back_populates="user",
         lazy="select",
+        passive_deletes=True,
     )
     chats: Mapped[list[Chat]] = relationship(
         "Chat",
         back_populates="user",
         lazy="select",
+        passive_deletes=True,
+    )
+    role_assignments: Mapped[list[UserRoleAssignment]] = relationship(
+        "UserRoleAssignment",
+        back_populates="user",
+        foreign_keys="UserRoleAssignment.user_id",
+        lazy="select",
+        passive_deletes=True,
     )
     organizations: Mapped[list[Organization]] = relationship(
         "Organization",
         secondary=OrganizationMembership.__table__,
         back_populates="members",
         lazy="select",
+        passive_deletes=True,
     )
 
 
@@ -592,6 +738,16 @@ class WorkflowDefinition(WorkspaceModel):
     """
 
     __tablename__ = "workflow_definition"
+    __table_args__ = (
+        # Serves the hot definition lookup (workspace_id, workflow_id) ordered
+        # or filtered by version, plus workspace-scoped scans and RLS predicates.
+        Index(
+            "ix_workflow_definition_workspace_id_workflow_id_version",
+            "workspace_id",
+            "workflow_id",
+            "version",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID,
@@ -672,15 +828,15 @@ class WorkflowFolder(WorkspaceModel):
         return self.path.count("/") <= 2  # "/foldername/" has two slashes
 
 
-class WorkflowTag(Base):
-    """Link table for workflows and tags with optional metadata."""
+class WorkflowTagLink(Base):
+    """Link table for workflows and workflow tags."""
 
-    __tablename__ = "workflow_tag"
+    __tablename__ = "workflow_tag_link"
     __table_args__ = (PrimaryKeyConstraint("tag_id", "workflow_id"),)
 
     tag_id: Mapped[uuid.UUID] = mapped_column(
         UUID,
-        ForeignKey("tag.id", ondelete="CASCADE"),
+        ForeignKey("workflow_tag.id", ondelete="CASCADE"),
         nullable=False,
     )
     workflow_id: Mapped[uuid.UUID] = mapped_column(
@@ -782,6 +938,11 @@ class Workflow(WorkspaceModel):
     alias: Mapped[str | None] = mapped_column(
         String, nullable=True, index=True, doc="Alias for the workflow"
     )
+    git_sync_branch: Mapped[str | None] = mapped_column(
+        String,
+        nullable=True,
+        doc="Shared preferred branch for workflow publish operations",
+    )
     error_handler: Mapped[str | None] = mapped_column(
         String,
         nullable=True,
@@ -827,15 +988,22 @@ class Workflow(WorkspaceModel):
         lazy="selectin",
         uselist=False,
     )
+    case_trigger: Mapped[CaseTrigger] = relationship(
+        "CaseTrigger",
+        back_populates="workflow",
+        cascade="all, delete",
+        lazy="selectin",
+        uselist=False,
+    )
     schedules: Mapped[list[Schedule]] = relationship(
         "Schedule",
         back_populates="workflow",
         cascade="all, delete",
         lazy="selectin",
     )
-    tags: Mapped[list[Tag]] = relationship(
-        "Tag",
-        secondary=WorkflowTag.__table__,
+    tags: Mapped[list[WorkflowTag]] = relationship(
+        "WorkflowTag",
+        secondary=WorkflowTagLink.__table__,
         back_populates="workflows",
     )
 
@@ -870,6 +1038,174 @@ class WebhookApiKey(WorkspaceModel):
     webhook: Mapped[Webhook | None] = relationship(back_populates="api_key")
 
 
+class ServiceAccount(OrganizationModel):
+    """A machine identity scoped to an organization or workspace."""
+
+    __tablename__ = "service_account"
+    __table_args__ = (
+        CheckConstraint(
+            "workspace_id IS NULL OR organization_id IS NOT NULL",
+            name="service_account_workspace_requires_org",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    organization_id: Mapped[OrganizationID] = mapped_column(
+        UUID,
+        ForeignKey("organization.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("workspace.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    owner_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    disabled_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+
+    scopes: Mapped[list[Scope]] = relationship(
+        "Scope",
+        secondary="service_account_scope",
+        lazy="select",
+    )
+    api_keys: Mapped[list[ServiceAccountApiKey]] = relationship(
+        "ServiceAccountApiKey",
+        back_populates="service_account",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
+
+class ServiceAccountApiKey(RecordModel):
+    """Credential material for a service account."""
+
+    __tablename__ = "service_account_api_key"
+    __table_args__ = (
+        Index(
+            "ix_service_account_api_key_active_unique",
+            "service_account_id",
+            unique=True,
+            postgresql_where=text("revoked_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    service_account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("service_account.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    key_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, unique=True, index=True
+    )
+    hashed: Mapped[str] = mapped_column(String(128), nullable=False)
+    salt: Mapped[str] = mapped_column(String(64), nullable=False)
+    preview: Mapped[str] = mapped_column(String(32), nullable=False)
+    last_used_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    revoked_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    service_account: Mapped[ServiceAccount] = relationship(
+        "ServiceAccount",
+        back_populates="api_keys",
+    )
+
+
+class MCPPersonalAccessToken(RecordModel):
+    """Credential material for MCP-only personal access tokens."""
+
+    __tablename__ = "mcp_personal_access_token"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    organization_id: Mapped[OrganizationID] = mapped_column(
+        UUID,
+        ForeignKey("organization.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    workspace_id: Mapped[WorkspaceID | None] = mapped_column(
+        UUID,
+        ForeignKey("workspace.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    key_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, unique=True, index=True
+    )
+    hashed: Mapped[str] = mapped_column(String(128), nullable=False)
+    salt: Mapped[str] = mapped_column(String(64), nullable=False)
+    preview: Mapped[str] = mapped_column(String(32), nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    last_used_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    revoked_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+
 class Webhook(WorkspaceModel):
     __tablename__ = "webhook"
 
@@ -899,6 +1235,12 @@ class Webhook(WorkspaceModel):
         nullable=False,
         server_default=text("'[]'::jsonb"),
     )
+    include_headers: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
+        server_default=text("false"),
+    )
 
     workflow: Mapped[Workflow] = relationship(back_populates="webhook")
     api_key: Mapped[WebhookApiKey | None] = relationship(
@@ -911,15 +1253,9 @@ class Webhook(WorkspaceModel):
 
     @property
     def secret(self) -> str:
-        secret = (
-            os.environ.get("TRACECAT__SIGNING_SECRET")
-            or config.TRACECAT__SIGNING_SECRET
-        )
-        if not secret:
-            raise ValueError("TRACECAT__SIGNING_SECRET is not set")
         # Using legacy format to prevent webhook url changes
         id_part = f"wh-{self.id.hex}"
-        return hashlib.sha256(f"{id_part}{secret}".encode()).hexdigest()
+        return hashlib.sha256(f"{id_part}{get_signing_secret()}".encode()).hexdigest()
 
     @property
     def url(self) -> str:
@@ -949,6 +1285,42 @@ class Webhook(WorkspaceModel):
     @property
     def api_key_revoked_at(self) -> datetime | None:
         return self.api_key.revoked_at if self.api_key else None
+
+
+class CaseTrigger(WorkspaceModel):
+    """Configuration for case event triggers per workflow."""
+
+    __tablename__ = "case_trigger"
+    __table_args__ = (UniqueConstraint("workflow_id"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    status: Mapped[str] = mapped_column(String(16), default="offline", nullable=False)
+    event_types: Mapped[list[str]] = mapped_column(
+        JSONB,
+        default=list,
+        nullable=False,
+        server_default=text("'[]'::jsonb"),
+    )
+    tag_filters: Mapped[list[str]] = mapped_column(
+        JSONB,
+        default=list,
+        nullable=False,
+        server_default=text("'[]'::jsonb"),
+    )
+    workflow_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("workflow.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+
+    workflow: Mapped[Workflow] = relationship(back_populates="case_trigger")
 
 
 class Schedule(WorkspaceModel):
@@ -1420,6 +1792,12 @@ class OrganizationSetting(OrganizationModel):
 
     __tablename__ = "organization_settings"
     __table_args__ = (UniqueConstraint("organization_id", "key"),)
+    # Override to CASCADE - settings are meaningless without the org
+    organization_id: Mapped[OrganizationID] = mapped_column(
+        UUID,
+        ForeignKey("organization.id", ondelete="CASCADE"),
+        nullable=False,
+    )
     id: Mapped[uuid.UUID] = mapped_column(
         UUID,
         default=uuid.uuid4,
@@ -1587,6 +1965,147 @@ class CaseTag(WorkspaceModel):
     )
 
 
+class CaseDropdownDefinition(WorkspaceModel):
+    """A workspace-scoped custom dropdown definition for cases."""
+
+    __tablename__ = "case_dropdown_definition"
+    __table_args__ = (
+        UniqueConstraint(
+            "ref",
+            "workspace_id",
+            name="uq_case_dropdown_definition_ref_workspace",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    ref: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    is_ordered: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
+        doc="Whether options have a meaningful order (enables sorting)",
+    )
+    icon_name: Mapped[str | None] = mapped_column(
+        String(100), nullable=True, doc="Lucide icon name for display"
+    )
+    position: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False, doc="Display order among dropdowns"
+    )
+    required_on_closure: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        nullable=False,
+        doc="Whether this dropdown must have a value when closing/resolving a case",
+    )
+
+    workspace: Mapped[Workspace] = relationship(
+        back_populates="case_dropdown_definitions"
+    )
+    options: Mapped[list[CaseDropdownOption]] = relationship(
+        "CaseDropdownOption",
+        back_populates="definition",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        order_by="CaseDropdownOption.position",
+    )
+
+
+class CaseDropdownOption(Base):
+    """An option within a case dropdown definition."""
+
+    __tablename__ = "case_dropdown_option"
+    __table_args__ = (
+        UniqueConstraint(
+            "ref",
+            "definition_id",
+            name="uq_case_dropdown_option_ref_definition",
+        ),
+    )
+
+    surrogate_id: Mapped[int] = mapped_column(
+        Integer,
+        Identity(),
+        primary_key=True,
+    )
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    definition_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("case_dropdown_definition.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    label: Mapped[str] = mapped_column(String(255), nullable=False)
+    ref: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    icon_name: Mapped[str | None] = mapped_column(
+        String(100), nullable=True, doc="Lucide icon name"
+    )
+    color: Mapped[str | None] = mapped_column(
+        String(50), nullable=True, doc="Display color"
+    )
+    position: Mapped[int] = mapped_column(
+        Integer, default=0, nullable=False, doc="Display order within dropdown"
+    )
+
+    definition: Mapped[CaseDropdownDefinition] = relationship(back_populates="options")
+
+
+class CaseDropdownValue(Base):
+    """Per-case selected value for a custom dropdown (single-select)."""
+
+    __tablename__ = "case_dropdown_value"
+    __table_args__ = (
+        UniqueConstraint(
+            "case_id",
+            "definition_id",
+            name="uq_case_dropdown_value_case_definition",
+        ),
+    )
+
+    surrogate_id: Mapped[int] = mapped_column(
+        Integer,
+        Identity(),
+        primary_key=True,
+    )
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    case_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("case.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    definition_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("case_dropdown_definition.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    option_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("case_dropdown_option.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    case: Mapped[Case] = relationship(back_populates="dropdown_values")
+    definition: Mapped[CaseDropdownDefinition] = relationship(lazy="selectin")
+    option: Mapped[CaseDropdownOption | None] = relationship(lazy="selectin")
+
+
 class CaseDurationDefinition(WorkspaceModel):
     """Workspace-defined case duration metric anchored on case events."""
 
@@ -1699,11 +2218,55 @@ class CaseDuration(WorkspaceModel):
     )
 
 
+class CaseTableRow(WorkspaceModel):
+    """Link table rows to cases."""
+
+    __tablename__ = "case_table_row"
+    __table_args__ = (
+        UniqueConstraint(
+            "case_id", "table_id", "row_id", name="uq_case_table_row_link"
+        ),
+        Index("ix_case_table_row_case_id", "case_id"),
+        Index("ix_case_table_row_table_id", "table_id"),
+        Index("ix_case_table_row_row_id", "row_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    case_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("case.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    table_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("tables.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    row_id: Mapped[uuid.UUID] = mapped_column(UUID, nullable=False)
+
+    case: Mapped[Case] = relationship(
+        "Case",
+        back_populates="table_rows",
+        lazy="selectin",
+    )
+
+
 class Case(WorkspaceModel):
     """A case represents an incident or issue that needs to be tracked and resolved."""
 
     __tablename__ = "case"
     __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "case_number",
+            name="uq_case_workspace_case_number",
+        ),
         Index("ix_case_cursor_pagination", "workspace_id", "created_at", "id"),
     )
 
@@ -1716,11 +2279,9 @@ class Case(WorkspaceModel):
     )
     case_number: Mapped[int] = mapped_column(
         Integer,
-        Identity(start=1, increment=1),
-        unique=True,
+        server_default=FetchedValue(),
         nullable=False,
-        index=True,
-        doc="Auto-incrementing case number for human readable IDs like CASE-1234",
+        doc="Server-generated workspace-scoped case number for human readable IDs like CASE-1234",
     )
     summary: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str] = mapped_column(String(5000), nullable=False)
@@ -1769,6 +2330,12 @@ class Case(WorkspaceModel):
         back_populates="case",
         cascade="all, delete",
     )
+    table_rows: Mapped[list[CaseTableRow]] = relationship(
+        "CaseTableRow",
+        back_populates="case",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
     assignee: Mapped[User | None] = relationship(
         "User",
         back_populates="assigned_cases",
@@ -1786,6 +2353,12 @@ class Case(WorkspaceModel):
         back_populates="case",
         cascade="all, delete",
     )
+    dropdown_values: Mapped[list[CaseDropdownValue]] = relationship(
+        "CaseDropdownValue",
+        back_populates="case",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
 
     @property
     def short_id(self) -> str:
@@ -1796,6 +2369,31 @@ class CaseComment(WorkspaceModel):
     """A comment on a case."""
 
     __tablename__ = "case_comment"
+    __table_args__ = (
+        UniqueConstraint("case_id", "id"),
+        ForeignKeyConstraint(
+            ["case_id", "parent_id"],
+            ["case_comment.case_id", "case_comment.id"],
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "parent_id IS NULL OR parent_id <> id",
+            name="case_comment_parent_not_self",
+        ),
+        Index(
+            "ix_case_comment_case_id_created_at_surrogate_id",
+            "case_id",
+            "created_at",
+            "surrogate_id",
+        ),
+        Index(
+            "ix_case_comment_case_id_parent_id_created_at_surrogate_id",
+            "case_id",
+            "parent_id",
+            "created_at",
+            "surrogate_id",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID,
@@ -1804,11 +2402,36 @@ class CaseComment(WorkspaceModel):
         unique=True,
         index=True,
     )
-    content: Mapped[str] = mapped_column(String(5000), nullable=False)
+    content: Mapped[str] = mapped_column(String(25000), nullable=False)
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID,
         nullable=True,
         doc="The ID of the user who made the comment. If null, the comment is system generated.",
+    )
+    workflow_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        nullable=True,
+        doc="Workflow ID snapshot captured when the comment was created.",
+    )
+    workflow_title: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        doc="Workflow title snapshot captured when the comment was created.",
+    )
+    workflow_alias: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        doc="Workflow alias snapshot captured when the comment was created.",
+    )
+    workflow_wf_exec_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        doc="Workflow execution ID started from this comment, if any.",
+    )
+    workflow_status: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        doc="Fallback workflow status for workflow-backed comments.",
     )
     parent_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID,
@@ -1818,6 +2441,11 @@ class CaseComment(WorkspaceModel):
     last_edited_at: Mapped[datetime | None] = mapped_column(
         TIMESTAMP(timezone=True), nullable=True
     )
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=True,
+        doc="Timestamp for soft deletion when a thread starter still has replies.",
+    )
     case_id: Mapped[uuid.UUID] = mapped_column(
         UUID,
         ForeignKey("case.id", ondelete="CASCADE"),
@@ -1825,6 +2453,11 @@ class CaseComment(WorkspaceModel):
     )
 
     case: Mapped[Case] = relationship("Case", back_populates="comments")
+
+    @hybrid_property
+    def is_deleted(self) -> bool:
+        """Check if comment is soft deleted."""
+        return self.deleted_at is not None
 
 
 class CaseEvent(WorkspaceModel):
@@ -1835,6 +2468,16 @@ class CaseEvent(WorkspaceModel):
     """
 
     __tablename__ = "case_event"
+    __table_args__ = (
+        Index(
+            "ix_case_event_anchor_lookup",
+            "workspace_id",
+            "case_id",
+            "type",
+            "created_at",
+            "surrogate_id",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID,
@@ -2034,6 +2677,146 @@ class Approval(WorkspaceModel):
     )
 
 
+class AgentCustomProvider(OrganizationModel):
+    """Organization-scoped custom LLM provider configuration."""
+
+    __tablename__ = "agent_custom_provider"
+    __table_args__ = (UniqueConstraint("organization_id", "id"),)
+
+    organization_id: Mapped[OrganizationID] = mapped_column(
+        UUID,
+        ForeignKey("organization.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    display_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    base_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    passthrough: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    encrypted_config: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    api_key_header: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+
+    catalog_rows: Mapped[list[AgentCatalog]] = relationship(
+        "AgentCatalog",
+        back_populates="custom_provider",
+        cascade="all, delete-orphan",
+        foreign_keys="[AgentCatalog.organization_id, AgentCatalog.custom_provider_id]",
+    )
+
+
+class AgentCatalog(Base, TimestampMixin):
+    """Normalized agent catalog entries."""
+
+    __tablename__ = "agent_catalog"
+    __table_args__ = (
+        CheckConstraint(
+            "custom_provider_id IS NULL OR organization_id IS NOT NULL",
+            name="custom_provider_requires_org",
+        ),
+        ForeignKeyConstraint(
+            ["organization_id", "custom_provider_id"],
+            ["agent_custom_provider.organization_id", "agent_custom_provider.id"],
+            name="fk_agent_catalog_org_custom_provider",
+            ondelete="CASCADE",
+        ),
+        Index(
+            "ix_agent_catalog_organization_id_custom_provider_id",
+            "organization_id",
+            "custom_provider_id",
+        ),
+        Index(
+            "uq_agent_catalog_custom_provider_model_provider_model_name",
+            "organization_id",
+            "custom_provider_id",
+            "model_provider",
+            "model_name",
+            unique=True,
+            postgresql_nulls_not_distinct=True,
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID, primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[OrganizationID | None] = mapped_column(
+        UUID,
+        ForeignKey("organization.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    custom_provider_id: Mapped[uuid.UUID | None] = mapped_column(UUID, nullable=True)
+    model_provider: Mapped[str] = mapped_column(String(120), nullable=False)
+    model_name: Mapped[str] = mapped_column(String(500), nullable=False)
+    model_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    encrypted_config: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    last_refreshed_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True
+    )
+
+    custom_provider: Mapped[AgentCustomProvider | None] = relationship(
+        "AgentCustomProvider",
+        back_populates="catalog_rows",
+        foreign_keys=[organization_id, custom_provider_id],
+    )
+    model_access: Mapped[list[AgentModelAccess]] = relationship(
+        "AgentModelAccess",
+        back_populates="catalog",
+        cascade="all, delete-orphan",
+    )
+
+
+class AgentModelAccess(OrganizationModel):
+    """Organization- and workspace-scoped access to catalog models."""
+
+    __tablename__ = "agent_model_access"
+    __table_args__ = (
+        Index("ix_agent_model_access_workspace_id", "workspace_id"),
+        Index("ix_agent_model_access_catalog_id", "catalog_id"),
+        Index(
+            "uq_agent_model_access_organization_workspace_catalog",
+            "organization_id",
+            "workspace_id",
+            "catalog_id",
+            unique=True,
+            postgresql_nulls_not_distinct=True,
+        ),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    organization_id: Mapped[OrganizationID] = mapped_column(
+        UUID,
+        ForeignKey("organization.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    workspace_id: Mapped[WorkspaceID | None] = mapped_column(
+        UUID,
+        ForeignKey("workspace.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    catalog_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("agent_catalog.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    catalog: Mapped[AgentCatalog] = relationship(
+        "AgentCatalog",
+        back_populates="model_access",
+    )
+
+
 class AgentSession(WorkspaceModel):
     """Generic agent session/thread entity (harness-agnostic).
 
@@ -2076,17 +2859,39 @@ class AgentSession(WorkspaceModel):
         nullable=False,
         doc="The ID of the associated entity",
     )
+    channel_context: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        doc="External channel metadata used for session resolution and routing",
+    )
     tools: Mapped[list[str] | None] = mapped_column(
         JSONB,
         default=None,
         nullable=True,
         doc="The tools available to the agent for this session",
     )
+    mcp_integrations: Mapped[list[str] | None] = mapped_column(
+        JSONB,
+        default=None,
+        nullable=True,
+        doc="MCP integration IDs attached to this session",
+    )
     agent_preset_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID,
         ForeignKey("agent_preset.id", ondelete="SET NULL"),
         nullable=True,
         doc="Agent preset used for this session (if any)",
+    )
+    agent_preset_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("agent_preset_version.id", ondelete="SET NULL"),
+        nullable=True,
+        doc="Pinned agent preset version used for this session (if any)",
+    )
+    agents_binding: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        doc="Normalized subagent bindings for this session",
     )
     # Agent harness fields
     harness_type: Mapped[str | None] = mapped_column(
@@ -2112,6 +2917,38 @@ class AgentSession(WorkspaceModel):
         String(128),
         nullable=True,
         doc="Last processed Redis stream ID - used to resume streaming from correct position",
+    )
+    # Per-turn stream pivot (UUID we mint at turn start, names the Redis stream).
+    # Distinct id-space from last_stream_id (a Redis entry id, position-in-stream).
+    # Null = no live turn. Used as the per-turn Redis key suffix and to cross-check
+    # that a reconnecting client's cursor belongs to the current turn.
+    active_stream_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        nullable=True,
+        index=True,
+        doc="Per-turn stream id - Redis key suffix for the active turn's stream",
+    )
+    # Terminal error summary for the most recent run
+    last_error: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        doc="Terminal error summary for the most recent run (cleared on next turn)",
+    )
+    work_dir_snapshot: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        doc=(
+            "Current durable agent work-dir snapshot pointer. Stores blob bucket/key, "
+            "archive hash, state hash, sizes, and entry counts for hydrating the "
+            "latest filesystem state."
+        ),
+    )
+    artifacts: Mapped[list[dict[str, Any]]] = mapped_column(
+        MutableList.as_mutable(JSONB),
+        nullable=False,
+        default=list,
+        server_default=text("'[]'::jsonb"),
+        doc="Durable artifact panel projection for artifact-capable sessions",
     )
     # Parent session for forked sessions (approval continuations)
     parent_session_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -2170,10 +3007,481 @@ class AgentSessionHistory(WorkspaceModel):
         index=True,
         doc="Message kind for filtering (chat-message, internal). Default to internal - only user/assistant messages explicitly marked visible.",
     )
+    curr_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        nullable=True,
+        index=True,
+        doc="Workflow run that produced this row; used to hide active-turn rows mid-stream",
+    )
 
     session: Mapped[AgentSession] = relationship(
         "AgentSession",
         back_populates="history",
+    )
+
+
+class WatchtowerAgent(OrganizationModel):
+    """Organization-scoped local agent identity for Watchtower monitoring."""
+
+    __tablename__ = "watchtower_agent"
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id",
+            "fingerprint_hash",
+            name="uq_watchtower_agent_organization_id_fingerprint_hash",
+        ),
+        Index(
+            "ix_wt_agent_org_seen",
+            "organization_id",
+            "last_seen_at",
+        ),
+        Index(
+            "ix_wt_agent_org_blocked",
+            "organization_id",
+            "blocked_at",
+        ),
+        Index(
+            "ix_wt_agent_org_type",
+            "organization_id",
+            "agent_type",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+        doc="Watchtower agent identifier",
+    )
+    fingerprint_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        doc="Stable hash for the observed local agent identity",
+    )
+    agent_type: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="unknown",
+        doc="Normalized local agent type (claude_code, codex, opencode, etc.)",
+    )
+    agent_source: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="unknown",
+        doc="Source used to classify agent type (client_info, user_agent, mixed, unknown)",
+    )
+    agent_icon_key: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        doc="Frontend icon key for agent rendering",
+    )
+    raw_user_agent: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        doc="Raw user-agent value from the local agent transport",
+    )
+    raw_client_info: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        doc="Raw MCP initialize clientInfo payload",
+    )
+    auth_client_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        doc="OAuth client identifier used by the local agent",
+    )
+    last_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+        doc="Most recently observed user ID for this agent",
+    )
+    last_user_email: Mapped[str | None] = mapped_column(
+        String(320),
+        nullable=True,
+        doc="Most recently observed user email for this agent",
+    )
+    last_user_name: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        doc="Most recently observed user display name for this agent",
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        doc="When this agent was first seen",
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        doc="Most recent activity timestamp for this agent",
+    )
+    blocked_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=True,
+        doc="When this agent was disabled in Watchtower",
+    )
+    blocked_reason: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        doc="Optional reason for disabling this agent",
+    )
+    blocked_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+        doc="User who disabled this agent",
+    )
+
+    last_user: Mapped[User | None] = relationship(
+        "User",
+        foreign_keys=[last_user_id],
+    )
+    blocked_by: Mapped[User | None] = relationship(
+        "User",
+        foreign_keys=[blocked_by_user_id],
+    )
+
+
+class WatchtowerAgentSession(OrganizationModel):
+    """Organization-scoped local agent session lifecycle for Watchtower."""
+
+    __tablename__ = "watchtower_agent_session"
+    __table_args__ = (
+        Index(
+            "ix_wt_agent_sess_org_session_id_uq",
+            "organization_id",
+            "agent_session_id",
+            unique=True,
+            postgresql_where=text("agent_session_id IS NOT NULL"),
+        ),
+        Index(
+            "ix_wt_agent_sess_org_state_seen",
+            "organization_id",
+            "session_state",
+            "last_seen_at",
+        ),
+        Index(
+            "ix_wt_agent_sess_org_auth_cb_seen",
+            "organization_id",
+            "auth_client_id",
+            "oauth_callback_seen_at",
+        ),
+        Index(
+            "ix_wt_agent_sess_org_user_seen",
+            "organization_id",
+            "user_id",
+            "last_seen_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+        doc="Watchtower agent session identifier",
+    )
+    agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("watchtower_agent.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        doc="Associated Watchtower agent record",
+    )
+    session_state: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="awaiting_initialize",
+        doc="Session lifecycle state (awaiting_initialize, connected, revoked)",
+    )
+    auth_transaction_id: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+        doc="OAuth transaction ID when captured during callback flow",
+    )
+    auth_client_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        doc="OAuth client identifier observed for this session",
+    )
+    oauth_callback_seen_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=True,
+        doc="Timestamp observed at OAuth callback stage",
+    )
+    agent_session_id: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        doc="Session ID from the local MCP transport",
+    )
+    initialize_seen_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=True,
+        doc="Timestamp observed at MCP initialize stage",
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+        doc="User associated with this local agent session",
+    )
+    user_email: Mapped[str | None] = mapped_column(
+        String(320),
+        nullable=True,
+        doc="Snapshot of associated user email",
+    )
+    user_name: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        doc="Snapshot of associated user display name",
+    )
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("workspace.id", ondelete="SET NULL"),
+        nullable=True,
+        doc="Most recent workspace observed for this session",
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        doc="When this session was first seen",
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        doc="Most recent activity timestamp for this session",
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=True,
+        doc="When this session was revoked",
+    )
+    revoked_reason: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        doc="Optional reason for session revocation",
+    )
+    revoked_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+        doc="User who revoked this session",
+    )
+
+    agent: Mapped[WatchtowerAgent | None] = relationship("WatchtowerAgent")
+    user: Mapped[User | None] = relationship("User", foreign_keys=[user_id])
+    revoked_by: Mapped[User | None] = relationship(
+        "User",
+        foreign_keys=[revoked_by_user_id],
+    )
+
+
+class WatchtowerAgentToolCall(OrganizationModel):
+    """Tool-call telemetry for Watchtower local agent sessions."""
+
+    __tablename__ = "watchtower_agent_tool_call"
+    __table_args__ = (
+        Index(
+            "ix_wt_call_org_called",
+            "organization_id",
+            "called_at",
+        ),
+        Index(
+            "ix_wt_call_org_session_called",
+            "organization_id",
+            "agent_session_id",
+            "called_at",
+        ),
+        Index(
+            "ix_wt_call_org_agent_called",
+            "organization_id",
+            "agent_id",
+            "called_at",
+        ),
+        Index(
+            "ix_wt_call_org_ws_called",
+            "organization_id",
+            "workspace_id",
+            "called_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+        doc="Watchtower tool-call identifier",
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("watchtower_agent.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        doc="Associated Watchtower agent",
+    )
+    agent_session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("watchtower_agent_session.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        doc="Associated Watchtower agent session row ID",
+    )
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("workspace.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        doc="Workspace observed for this tool call",
+    )
+    tool_name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        doc="Name of the invoked tool",
+    )
+    call_status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        doc="Call result status (success, error, timeout, rejected, blocked)",
+    )
+    latency_ms: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        doc="Tool execution latency in milliseconds",
+    )
+    args_redacted: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        doc="Redacted structural summary of tool-call arguments",
+    )
+    error_redacted: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        doc="Redacted summary for tool-call errors",
+    )
+    called_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        doc="When the tool call was observed",
+    )
+
+    agent: Mapped[WatchtowerAgent] = relationship("WatchtowerAgent")
+    session: Mapped[WatchtowerAgentSession] = relationship("WatchtowerAgentSession")
+
+
+class AgentChannelToken(WorkspaceModel):
+    """Token-backed external channel configuration for an agent preset."""
+
+    __tablename__ = "agent_channel_token"
+    __table_args__ = (
+        Index(
+            "ix_agent_channel_token_workspace_id_channel_type",
+            "workspace_id",
+            "channel_type",
+        ),
+        Index(
+            "ix_agent_channel_token_agent_preset_id_channel_type_active",
+            "agent_preset_id",
+            "channel_type",
+            unique=True,
+            postgresql_where=text("is_active IS TRUE"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    agent_preset_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("agent_preset.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    channel_type: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        doc="External channel type, e.g. slack",
+    )
+    config: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        default=dict,
+        nullable=False,
+        doc="Channel-specific configuration payload",
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default=text("true"),
+        nullable=False,
+        doc="Whether this token is active and can receive events",
+    )
+
+
+class AgentFolder(WorkspaceModel):
+    """Folder for organizing agent presets.
+
+    Uses materialized path pattern for hierarchical structure.
+    Path format: "/parent/child/" where each segment is the folder name.
+    Root folders have path "/foldername/".
+    """
+
+    __tablename__ = "agent_folder"
+    __table_args__ = (
+        UniqueConstraint("path", "workspace_id", name="uq_agent_folder_path_workspace"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    path: Mapped[str] = mapped_column(
+        String,
+        index=True,
+        nullable=False,
+        doc="Full materialized path: /parent/child/",
+    )
+
+    workspace: Mapped[Workspace] = relationship(back_populates="agent_folders")
+    presets: Mapped[list[AgentPreset]] = relationship(
+        "AgentPreset",
+        back_populates="folder",
+    )
+
+
+class AgentTagLink(Base):
+    """Link table for agent presets and agent tags."""
+
+    __tablename__ = "agent_tag_link"
+    __table_args__ = (PrimaryKeyConstraint("tag_id", "preset_id"),)
+
+    tag_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("agent_tag.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    preset_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("agent_preset.id", ondelete="CASCADE"),
+        nullable=False,
     )
 
 
@@ -2183,6 +3491,7 @@ class AgentPreset(WorkspaceModel):
     __tablename__ = "agent_preset"
     __table_args__ = (
         UniqueConstraint("workspace_id", "slug", name="uq_agent_preset_workspace_slug"),
+        Index("ix_agent_preset_workspace_folder", "workspace_id", "folder_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -2207,6 +3516,12 @@ class AgentPreset(WorkspaceModel):
         nullable=True,
         doc="Optional description for the preset",
     )
+    current_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("agent_preset_version.id", ondelete="SET NULL"),
+        nullable=True,
+        doc="Current immutable version for this preset.",
+    )
     instructions: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,
@@ -2217,6 +3532,13 @@ class AgentPreset(WorkspaceModel):
     )
     model_provider: Mapped[str] = mapped_column(
         String(120), nullable=False, doc="LLM provider identifier"
+    )
+    catalog_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("agent_catalog.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        doc="Canonical catalog row backing this model selection",
     )
     base_url: Mapped[str | None] = mapped_column(
         String(500),
@@ -2248,8 +3570,157 @@ class AgentPreset(WorkspaceModel):
         nullable=True,
         doc="MCP integrations to use",
     )
+    agents: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        default=lambda: {"enabled": False},
+        server_default=text("'{\"enabled\": false}'::jsonb"),
+        nullable=False,
+        doc="Subagent configuration for this preset",
+    )
     retries: Mapped[int] = mapped_column(
         Integer, default=3, nullable=False, doc="Maximum retry attempts per run"
+    )
+    enable_thinking: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default=text("true"),
+        nullable=False,
+        doc="Whether to enable high thinking for agent runs",
+    )
+    enable_internet_access: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=text("false"),
+        nullable=False,
+        doc="Whether to enable direct internet access in the agent sandbox",
+    )
+    folder_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("agent_folder.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    workspace: Mapped[Workspace] = relationship(back_populates="agent_presets")
+    folder: Mapped[AgentFolder | None] = relationship(back_populates="presets")
+    tags: Mapped[list[AgentTag]] = relationship(
+        "AgentTag",
+        secondary=AgentTagLink.__table__,
+        back_populates="presets",
+    )
+    versions: Mapped[list[AgentPresetVersion]] = relationship(
+        "AgentPresetVersion",
+        back_populates="preset",
+        cascade="all, delete",
+        foreign_keys="[AgentPresetVersion.preset_id]",
+    )
+    skill_bindings: Mapped[list[AgentPresetSkill]] = relationship(
+        "AgentPresetSkill",
+        back_populates="preset",
+        cascade="all, delete-orphan",
+    )
+    current_version: Mapped[AgentPresetVersion | None] = relationship(
+        "AgentPresetVersion",
+        foreign_keys=[current_version_id],
+        uselist=False,
+        post_update=True,
+    )
+    chats: Mapped[list[Chat]] = relationship(
+        "Chat",
+        back_populates="agent_preset",
+        cascade="save-update",
+    )
+
+
+class AgentPresetVersion(WorkspaceModel):
+    """Immutable version snapshot for an agent preset."""
+
+    __tablename__ = "agent_preset_version"
+    __table_args__ = (UniqueConstraint("workspace_id", "preset_id", "version"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+        doc="Unique agent preset version identifier",
+    )
+    preset_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("agent_preset.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        doc="Logical preset this version belongs to",
+    )
+    version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        doc="Monotonic version number scoped to the preset",
+    )
+    instructions: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        doc="System instructions for the agent",
+    )
+    model_name: Mapped[str] = mapped_column(
+        String(120), nullable=False, doc="Model name used for execution"
+    )
+    model_provider: Mapped[str] = mapped_column(
+        String(120), nullable=False, doc="LLM provider identifier"
+    )
+    catalog_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("agent_catalog.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+        doc="Canonical catalog row backing this model selection",
+    )
+    base_url: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+        doc="Optional model base URL override",
+    )
+    output_type: Mapped[dict[str, Any] | str | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        doc="Optional structured output type definition",
+    )
+    actions: Mapped[list[str] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        doc="Tool identifiers available to the agent",
+    )
+    namespaces: Mapped[list[str] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        doc="Tool namespaces available to the agent",
+    )
+    tool_approvals: Mapped[dict[str, bool] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        doc="Tool approval requirements by tool name",
+    )
+    mcp_integrations: Mapped[list[str] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        doc="MCP integrations to use",
+    )
+    agents: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        default=lambda: {"enabled": False},
+        server_default=text("'{\"enabled\": false}'::jsonb"),
+        nullable=False,
+        doc="Subagent configuration for this preset version",
+    )
+    retries: Mapped[int] = mapped_column(
+        Integer, default=3, nullable=False, doc="Maximum retry attempts per run"
+    )
+    enable_thinking: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default=text("true"),
+        nullable=False,
+        doc="Whether to enable high thinking for agent runs",
     )
     enable_internet_access: Mapped[bool] = mapped_column(
         Boolean,
@@ -2259,11 +3730,519 @@ class AgentPreset(WorkspaceModel):
         doc="Whether to enable direct internet access in the agent sandbox",
     )
 
-    workspace: Mapped[Workspace] = relationship(back_populates="agent_presets")
-    chats: Mapped[list[Chat]] = relationship(
-        "Chat",
-        back_populates="agent_preset",
+    preset: Mapped[AgentPreset] = relationship(
+        "AgentPreset",
+        back_populates="versions",
+        foreign_keys=[preset_id],
+    )
+    skill_refs: Mapped[list[AgentPresetVersionSkill]] = relationship(
+        "AgentPresetVersionSkill",
+        back_populates="preset_version",
+        cascade="all, delete-orphan",
+    )
+
+
+class Skill(WorkspaceModel):
+    """Workspace-scoped logical skill with mutable draft and immutable versions."""
+
+    __tablename__ = "skill"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+        doc="Unique skill identifier",
+    )
+    name: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        index=True,
+        doc="Current active skill name and on-disk directory name",
+    )
+    current_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("skill_version.id", ondelete="SET NULL"),
+        nullable=True,
+        doc="Current published skill version",
+    )
+    draft_revision: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+        doc="Optimistic concurrency revision for draft mutations",
+    )
+    description: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        doc="Cached description parsed from root SKILL.md frontmatter",
+    )
+    archived_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=True,
+        doc="Timestamp for archived skills",
+    )
+
+    workspace: Mapped[Workspace] = relationship(back_populates="skills")
+    current_version: Mapped[SkillVersion | None] = relationship(
+        "SkillVersion",
+        foreign_keys=[current_version_id],
+        uselist=False,
+        post_update=True,
+    )
+    versions: Mapped[list[SkillVersion]] = relationship(
+        "SkillVersion",
+        back_populates="skill",
+        cascade="all, delete",
+        foreign_keys="[SkillVersion.skill_id]",
+    )
+    draft_files: Mapped[list[SkillDraftFile]] = relationship(
+        "SkillDraftFile",
+        back_populates="skill",
+        cascade="all, delete-orphan",
+    )
+    uploads: Mapped[list[SkillUpload]] = relationship(
+        "SkillUpload",
+        back_populates="skill",
+        cascade="all, delete-orphan",
+    )
+    preset_bindings: Mapped[list[AgentPresetSkill]] = relationship(
+        "AgentPresetSkill",
+        back_populates="skill",
         cascade="save-update",
+    )
+
+
+class SkillBlob(WorkspaceModel):
+    """Content-addressed blob metadata for skill files."""
+
+    __tablename__ = "skill_blob"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "sha256",
+            name="uq_skill_blob_workspace_sha256",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    sha256: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        index=True,
+        doc="SHA256 hash for blob deduplication within a workspace",
+    )
+    bucket: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        doc="Object storage bucket containing the blob",
+    )
+    key: Mapped[str] = mapped_column(
+        String(1024),
+        nullable=False,
+        doc="Object storage key containing the blob",
+    )
+    size_bytes: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        doc="Blob size in bytes",
+    )
+
+    workspace: Mapped[Workspace] = relationship(back_populates="skill_blobs")
+    draft_files: Mapped[list[SkillDraftFile]] = relationship(
+        "SkillDraftFile",
+        back_populates="blob",
+        cascade="save-update",
+    )
+    version_files: Mapped[list[SkillVersionFile]] = relationship(
+        "SkillVersionFile",
+        back_populates="blob",
+        cascade="save-update",
+    )
+    uploads: Mapped[list[SkillUpload]] = relationship(
+        "SkillUpload",
+        back_populates="blob",
+        cascade="save-update",
+    )
+
+
+class SkillUpload(WorkspaceModel):
+    """Ephemeral staged upload session for a skill draft blob."""
+
+    __tablename__ = "skill_upload"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    skill_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("skill.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    blob_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        ForeignKey("skill_blob.id", ondelete="SET NULL"),
+        nullable=True,
+        doc="Resolved blob row once the upload is finalized",
+    )
+    sha256: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        doc="Expected SHA256 of the uploaded blob",
+    )
+    size_bytes: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        doc="Expected upload size in bytes",
+    )
+    content_type: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        doc="Expected upload MIME type",
+    )
+    bucket: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        doc="Bucket to upload the blob into",
+    )
+    key: Mapped[str] = mapped_column(
+        String(1024),
+        nullable=False,
+        doc="Object storage key for the staged upload",
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        doc="Expiration timestamp for the upload session",
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID,
+        nullable=True,
+        doc="User that created the upload session, if any",
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=True,
+        doc="Timestamp when the upload was finalized",
+    )
+
+    skill: Mapped[Skill] = relationship(back_populates="uploads")
+    blob: Mapped[SkillBlob | None] = relationship(back_populates="uploads")
+
+
+class SkillDraftFile(WorkspaceModel):
+    """Mutable draft manifest row for a skill file."""
+
+    __tablename__ = "skill_draft_file"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "skill_id",
+            "path",
+            name="uq_skill_draft_file_workspace_skill_path",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    skill_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("skill.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    path: Mapped[str] = mapped_column(
+        String(1024),
+        nullable=False,
+        doc="Normalized relative POSIX path within the draft",
+    )
+    blob_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("skill_blob.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    content_type: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        doc="MIME type to use when serving this draft file",
+    )
+
+    skill: Mapped[Skill] = relationship(back_populates="draft_files")
+    blob: Mapped[SkillBlob] = relationship(back_populates="draft_files")
+
+
+class SkillVersion(WorkspaceModel):
+    """Immutable published snapshot of a skill draft."""
+
+    __tablename__ = "skill_version"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "skill_id",
+            "version",
+            name="uq_skill_version_workspace_skill_version",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    skill_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("skill.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        doc="Monotonic version number scoped to one skill",
+    )
+    manifest_sha256: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        doc="SHA256 of the normalized published manifest",
+    )
+    file_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        doc="Number of files in the published manifest",
+    )
+    total_size_bytes: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        doc="Total published skill size in bytes",
+    )
+    name: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        doc="Published skill name parsed from root SKILL.md frontmatter",
+    )
+    description: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        doc="Cached description parsed from root SKILL.md frontmatter",
+    )
+
+    skill: Mapped[Skill] = relationship(
+        "Skill",
+        back_populates="versions",
+        foreign_keys=[skill_id],
+    )
+    files: Mapped[list[SkillVersionFile]] = relationship(
+        "SkillVersionFile",
+        back_populates="skill_version",
+        cascade="all, delete-orphan",
+    )
+    preset_bindings: Mapped[list[AgentPresetSkill]] = relationship(
+        "AgentPresetSkill",
+        back_populates="skill_version",
+        cascade="save-update",
+    )
+    preset_version_refs: Mapped[list[AgentPresetVersionSkill]] = relationship(
+        "AgentPresetVersionSkill",
+        back_populates="skill_version",
+        cascade="save-update",
+    )
+
+
+class SkillVersionFile(WorkspaceModel):
+    """Immutable manifest row for a published skill file."""
+
+    __tablename__ = "skill_version_file"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "skill_version_id",
+            "path",
+            name="uq_skill_version_file_workspace_version_path",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    skill_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("skill_version.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    path: Mapped[str] = mapped_column(
+        String(1024),
+        nullable=False,
+        doc="Normalized relative POSIX path within the published manifest",
+    )
+    blob_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("skill_blob.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    content_type: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        doc="MIME type to use when serving this published file",
+    )
+
+    skill_version: Mapped[SkillVersion] = relationship(back_populates="files")
+    blob: Mapped[SkillBlob] = relationship(back_populates="version_files")
+
+
+class AgentPresetSkill(WorkspaceModel):
+    """Mutable skill binding for the current preset head."""
+
+    __tablename__ = "agent_preset_skill"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "preset_id",
+            "skill_id",
+            name="uq_agent_preset_skill_workspace_preset_skill",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    preset_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("agent_preset.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    skill_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("skill.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    skill_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("skill_version.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+        doc="Exact published skill version selected on the mutable preset head",
+    )
+
+    preset: Mapped[AgentPreset] = relationship(back_populates="skill_bindings")
+    skill: Mapped[Skill] = relationship(back_populates="preset_bindings")
+    skill_version: Mapped[SkillVersion] = relationship(
+        back_populates="preset_bindings",
+        foreign_keys=[skill_version_id],
+    )
+
+
+class AgentPresetVersionSkill(WorkspaceModel):
+    """Exact skill version snapshot bound to an immutable preset version."""
+
+    __tablename__ = "agent_preset_version_skill"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "preset_version_id",
+            "skill_id",
+            name="uq_agent_preset_version_skill_workspace_version_skill",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    preset_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("agent_preset_version.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    skill_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("skill.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    skill_version_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("skill_version.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+
+    preset_version: Mapped[AgentPresetVersion] = relationship(
+        back_populates="skill_refs"
+    )
+    skill: Mapped[Skill] = relationship()
+    skill_version: Mapped[SkillVersion] = relationship(
+        back_populates="preset_version_refs",
+        foreign_keys=[skill_version_id],
+    )
+
+
+class AgentTag(WorkspaceModel):
+    """A tag for organizing and filtering agent presets."""
+
+    __tablename__ = "agent_tag"
+    __table_args__ = (
+        UniqueConstraint("name", "workspace_id", name="uq_agent_tag_name_workspace"),
+        UniqueConstraint("ref", "workspace_id", name="uq_agent_tag_ref_workspace"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    ref: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+        index=True,
+        doc="Slug-like identifier derived from the name, used for API lookups alongside uuid.UUID",
+    )
+    color: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    workspace: Mapped[Workspace] = relationship(back_populates="agent_tags")
+    presets: Mapped[list[AgentPreset]] = relationship(
+        "AgentPreset",
+        secondary=AgentTagLink.__table__,
+        back_populates="tags",
     )
 
 
@@ -2453,6 +4432,10 @@ class OAuthIntegration(TimestampMixin, Base):
         Text,
         nullable=True,
     )
+    token_endpoint_auth_method: Mapped[str | None] = mapped_column(
+        String,
+        nullable=True,
+    )
 
     # Relationships
     user: Mapped[User | None] = relationship("User")
@@ -2576,6 +4559,9 @@ class MCPIntegration(TimestampMixin, Base):
         UniqueConstraint(
             "workspace_id", "slug", name="uq_mcp_integration_workspace_slug"
         ),
+        Index(
+            "ix_mcp_integration_workspace_catalog_slug", "workspace_id", "catalog_slug"
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -2608,10 +4594,24 @@ class MCPIntegration(TimestampMixin, Base):
         nullable=False,
         doc="Slug of the MCP integration",
     )
-    server_uri: Mapped[str] = mapped_column(
+    catalog_slug: Mapped[str | None] = mapped_column(
         String,
+        nullable=True,
+        doc="Platform MCP catalog slug this integration was created from",
+    )
+    # Server type: 'http' (HTTP/SSE) or 'stdio' (stdio)
+    server_type: Mapped[str] = mapped_column(
+        String(20),
+        default="http",
+        server_default="http",
         nullable=False,
-        doc="URL of the MCP server",
+        doc="Server type: 'http' (HTTP/SSE) or 'stdio' (stdio)",
+    )
+    # HTTP-type server fields
+    server_uri: Mapped[str | None] = mapped_column(
+        String,
+        nullable=True,
+        doc="URL of the MCP server (for http-type servers)",
     )
     auth_type: Mapped[MCPAuthType] = mapped_column(
         MCP_AUTH_TYPE_ENUM,
@@ -2629,11 +4629,100 @@ class MCPIntegration(TimestampMixin, Base):
         nullable=True,
         doc="Encrypted custom credentials (API key, bearer token, or JSON headers) for custom auth type",
     )
+    # Stdio-type server fields
+    stdio_command: Mapped[str | None] = mapped_column(
+        String(500),
+        nullable=True,
+        doc="Stdio command to run for stdio-type servers (e.g., 'npx')",
+    )
+    stdio_args: Mapped[list[str] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        doc="Arguments for the stdio command (e.g., ['@modelcontextprotocol/server-github'])",
+    )
+    encrypted_stdio_env: Mapped[bytes | None] = mapped_column(
+        LargeBinary,
+        nullable=True,
+        doc="Encrypted environment variables for stdio-type servers (JSON dict encrypted at rest)",
+    )
+    # General fields
+    timeout: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        doc="Timeout in seconds (HTTP timeout for http type, process timeout for stdio type)",
+    )
+    tools: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        doc="Tools discovered at the last successful connection verification "
+        "([{name, description, enabled, requires_approval, status}]); null means "
+        "the server is unverified",
+    )
 
     oauth_integration: Mapped[OAuthIntegration | None] = relationship(
         "OAuthIntegration",
         uselist=False,
         lazy="selectin",
+    )
+
+
+class MCPRefreshToken(OrganizationModel):
+    """Refresh tokens issued by the internal MCP OIDC IdP."""
+
+    __tablename__ = "mcp_refresh_token"
+    __table_args__ = (
+        Index("ix_mcp_refresh_token_family_id", "family_id"),
+        Index("ix_mcp_refresh_token_expires_at", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        default=uuid.uuid4,
+        nullable=False,
+        unique=True,
+        index=True,
+        doc="Unique refresh token identifier",
+    )
+    token_hash: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        unique=True,
+        index=True,
+        doc="SHA-256 hex digest of the opaque refresh token. Plaintext is never stored so a DB leak yields hashes only.",
+    )
+    family_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        nullable=False,
+        doc="Groups all tokens descended from one auth code exchange. Used for replay-detection revocation.",
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        doc="User the refresh token was issued to",
+    )
+    client_id: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+        doc="OAuth client_id the token was issued to",
+    )
+    encrypted_metadata: Mapped[bytes] = mapped_column(
+        LargeBinary,
+        nullable=False,
+        doc="Encrypted JSON blob with session context (email, scope, resource, is_platform_superuser). Encrypted via secrets.encryption.encrypt_bytes with TRACECAT__DB_ENCRYPTION_KEY.",
+    )
+    status: Mapped[str] = mapped_column(
+        String,
+        nullable=False,
+        default="active",
+        index=True,
+        doc="State machine: 'active' -> 'used' (rotated normally) or 'revoked' (family revoked).",
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        doc="Absolute expiry timestamp for this refresh token",
     )
 
 
@@ -2783,13 +4872,13 @@ class ChatMessage(WorkspaceModel):
     chat: Mapped[Chat] = relationship("Chat", back_populates="messages")
 
 
-class Tag(WorkspaceModel):
+class WorkflowTag(WorkspaceModel):
     """A workflow tag for organizing and filtering workflows."""
 
-    __tablename__ = "tag"
+    __tablename__ = "workflow_tag"
     __table_args__ = (
-        UniqueConstraint("name", "workspace_id", name="uq_tag_name_workspace"),
-        UniqueConstraint("ref", "workspace_id", name="uq_tag_ref_workspace"),
+        UniqueConstraint("name", "workspace_id", name="uq_workflow_tag_name_workspace"),
+        UniqueConstraint("ref", "workspace_id", name="uq_workflow_tag_ref_workspace"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -2811,7 +4900,7 @@ class Tag(WorkspaceModel):
     workspace: Mapped[Workspace] = relationship(back_populates="workflow_tags")
     workflows: Mapped[list[Workflow]] = relationship(
         "Workflow",
-        secondary=WorkflowTag.__table__,
+        secondary=WorkflowTagLink.__table__,
         back_populates="tags",
     )
 
@@ -2820,42 +4909,41 @@ class OrganizationInvitation(InvitationMixin, TimestampMixin, Base):
     """Invitation to join an organization."""
 
     __tablename__ = "organization_invitation"
-    __table_args__ = (Index("ix_organization_invitation_email", "email"),)
+    __table_args__ = (UniqueConstraint("email", "organization_id"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID, primary_key=True, default=uuid.uuid4)
     organization_id: Mapped[uuid.UUID] = mapped_column(
         UUID, ForeignKey("organization.id", ondelete="CASCADE"), index=True
     )
-    role: Mapped[OrgRole] = mapped_column(
-        Enum(OrgRole, name="orgrole"),
-        default=OrgRole.MEMBER,
-        doc="Role to grant upon acceptance",
+    created_by_platform_admin: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("false"),
+        doc="Whether the invitation was created by a platform admin",
     )
 
     # Relationships
     organization: Mapped[Organization] = relationship("Organization")
     inviter: Mapped[User | None] = relationship("User")
+    role_obj: Mapped[Role] = relationship("Role")
 
 
 class Invitation(InvitationMixin, TimestampMixin, Base):
     """Invitation to join a workspace."""
 
     __tablename__ = "invitation"
-    __table_args__ = (Index("ix_invitation_email", "email"),)
+    __table_args__ = (UniqueConstraint("workspace_id", "email"),)
 
     id: Mapped[uuid.UUID] = mapped_column(UUID, primary_key=True, default=uuid.uuid4)
     workspace_id: Mapped[uuid.UUID] = mapped_column(
         UUID, ForeignKey("workspace.id", ondelete="CASCADE"), index=True
     )
-    role: Mapped[WorkspaceRole] = mapped_column(
-        Enum(WorkspaceRole, name="workspacerole"),
-        default=WorkspaceRole.EDITOR,
-        doc="Role to grant upon acceptance",
-    )
 
     # Relationships
     workspace: Mapped[Workspace] = relationship("Workspace")
     inviter: Mapped[User | None] = relationship("User")
+    role_obj: Mapped[Role] = relationship("Role")
 
 
 class Tier(Base, TimestampMixin):
@@ -2924,3 +5012,280 @@ class OrganizationTier(Base, TimestampMixin):
         "Organization", back_populates="organization_tier"
     )
     tier: Mapped[Tier] = relationship("Tier")
+
+
+# =============================================================================
+# RBAC Tables
+# =============================================================================
+
+
+SCOPE_SOURCE_ENUM = Enum(ScopeSource, name="scopesource")
+
+
+class Scope(Base, TimestampMixin):
+    """Scope definitions for fine-grained access control.
+
+    Scopes follow the format `{resource}:{action}` (OAuth 2.0 compliant).
+    Examples: workflow:read, org:member:invite, action:tools.okta.list_users:execute
+
+    Scopes can be:
+    - Platform scopes (organization_id=NULL): Platform-owned scopes shared across all orgs.
+      Use `source_ref` for provenance (e.g., "core", "tracecat_registry", git URL).
+    - Custom scopes (organization_id=org_id): Organization-defined scopes.
+    """
+
+    __tablename__ = "scope"
+    __table_args__ = (
+        UniqueConstraint("organization_id", "name"),
+        # Partial unique index for system/registry scopes (organization_id IS NULL)
+        Index(
+            "ix_scope_name_system_unique",
+            "name",
+            unique=True,
+            postgresql_where=text("organization_id IS NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID, primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    resource: Mapped[str] = mapped_column(String(128))
+    action: Mapped[str] = mapped_column(String(64))
+    description: Mapped[str | None] = mapped_column(String(512))
+    source: Mapped[ScopeSource] = mapped_column(SCOPE_SOURCE_ENUM, index=True)
+    source_ref: Mapped[str | None] = mapped_column(String(255))
+    organization_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID, ForeignKey("organization.id", ondelete="CASCADE"), index=True
+    )
+
+    # Relationships
+    roles: Mapped[list[Role]] = relationship(
+        "Role",
+        secondary="role_scope",
+        back_populates="scopes",
+        lazy="select",
+    )
+
+
+class Role(Base, TimestampMixin):
+    """Roles that bundle scopes together.
+
+    Roles are organization-scoped and identified by an optional slug:
+    - System roles have well-known slugs: "workspace-admin", "workspace-editor", "workspace-viewer", "organization-owner", "organization-admin", "organization-member"
+    - Custom roles have NULL slugs
+
+    System roles are seeded on startup and should not be deleted.
+    """
+
+    __tablename__ = "role"
+    __table_args__ = (UniqueConstraint("organization_id", "slug"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID, primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(128), index=True)
+    slug: Mapped[str | None] = mapped_column(String(64), index=True)
+    description: Mapped[str | None] = mapped_column(String(512))
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID, ForeignKey("organization.id", ondelete="CASCADE"), index=True
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID, ForeignKey("user.id", ondelete="SET NULL")
+    )
+
+    # Relationships
+    scopes: Mapped[list[Scope]] = relationship(
+        "Scope",
+        secondary="role_scope",
+        back_populates="roles",
+        lazy="select",
+    )
+    group_role_assignments: Mapped[list[GroupRoleAssignment]] = relationship(
+        "GroupRoleAssignment",
+        back_populates="role",
+        lazy="select",
+    )
+    user_assignments: Mapped[list[UserRoleAssignment]] = relationship(
+        "UserRoleAssignment",
+        back_populates="role",
+        lazy="select",
+    )
+
+
+class RoleScope(Base):
+    """Junction table linking roles to their scopes."""
+
+    __tablename__ = "role_scope"
+
+    role_id: Mapped[uuid.UUID] = mapped_column(
+        UUID, ForeignKey("role.id", ondelete="CASCADE"), primary_key=True
+    )
+    scope_id: Mapped[uuid.UUID] = mapped_column(
+        UUID, ForeignKey("scope.id", ondelete="CASCADE"), primary_key=True
+    )
+
+
+class ServiceAccountScope(Base):
+    """Junction table linking service accounts to scopes."""
+
+    __tablename__ = "service_account_scope"
+
+    service_account_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("service_account.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    scope_id: Mapped[uuid.UUID] = mapped_column(
+        UUID,
+        ForeignKey("scope.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+
+class Group(Base, TimestampMixin):
+    """Groups for organizing users within an organization.
+
+    Groups are assigned roles at either:
+    - Organization level (workspace_id=NULL in GroupRoleAssignment): Scopes apply org-wide
+    - Workspace level: Scopes apply only within that workspace
+
+    Users inherit all scopes from groups they belong to.
+    """
+
+    __tablename__ = "group"
+    __table_args__ = (UniqueConstraint("organization_id", "name"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID, primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(128), index=True)
+    description: Mapped[str | None] = mapped_column(String(512))
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID, ForeignKey("organization.id", ondelete="CASCADE"), index=True
+    )
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID, ForeignKey("user.id", ondelete="SET NULL")
+    )
+
+    # Relationships
+    members: Mapped[list[User]] = relationship(
+        "User",
+        secondary="group_member",
+        lazy="select",
+    )
+    role_assignments: Mapped[list[GroupRoleAssignment]] = relationship(
+        "GroupRoleAssignment",
+        back_populates="group",
+        cascade="all, delete",
+        lazy="select",
+    )
+
+
+class GroupMember(Base):
+    """Junction table linking users to groups."""
+
+    __tablename__ = "group_member"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID, ForeignKey("user.id", ondelete="CASCADE"), primary_key=True
+    )
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        UUID, ForeignKey("group.id", ondelete="CASCADE"), primary_key=True
+    )
+    added_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now()
+    )
+
+
+class GroupRoleAssignment(Base):
+    """Assigns a role to a group at either org or workspace level.
+
+    - workspace_id=NULL: Org-wide assignment - scopes apply to all workspaces
+    - workspace_id=<id>: Workspace-specific assignment - scopes apply only to that workspace
+
+    Each group can have at most one assignment per workspace (or one org-wide assignment).
+    """
+
+    __tablename__ = "group_role_assignment"
+    __table_args__ = (
+        UniqueConstraint("group_id", "workspace_id"),
+        # Partial unique index for org-wide assignments (workspace_id IS NULL)
+        Index(
+            "ix_group_role_assignment_group_org_unique",
+            "group_id",
+            unique=True,
+            postgresql_where=text("workspace_id IS NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID, primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID, ForeignKey("organization.id", ondelete="CASCADE")
+    )
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        UUID, ForeignKey("group.id", ondelete="CASCADE")
+    )
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID, ForeignKey("workspace.id", ondelete="CASCADE")
+    )
+    role_id: Mapped[uuid.UUID] = mapped_column(
+        UUID, ForeignKey("role.id", ondelete="RESTRICT"), index=True
+    )
+    assigned_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now()
+    )
+    assigned_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID, ForeignKey("user.id", ondelete="SET NULL")
+    )
+
+    # Relationships
+    organization: Mapped[Organization] = relationship("Organization")
+    group: Mapped[Group] = relationship("Group", back_populates="role_assignments")
+    workspace: Mapped[Workspace | None] = relationship("Workspace")
+    role: Mapped[Role] = relationship("Role", back_populates="group_role_assignments")
+
+
+class UserRoleAssignment(Base):
+    """Direct assignment of a role to a user at org or workspace level.
+
+    - workspace_id=NULL: Org-wide assignment - scopes apply to all workspaces
+    - workspace_id=<id>: Workspace-specific assignment - scopes apply only to that workspace
+
+    Each user can have at most one direct role assignment per workspace (or one org-wide).
+    """
+
+    __tablename__ = "user_role_assignment"
+    __table_args__ = (
+        UniqueConstraint("user_id", "workspace_id"),
+        # Partial unique index for org-wide assignments (workspace_id IS NULL)
+        Index(
+            "ix_user_role_assignment_user_org_unique",
+            "organization_id",
+            "user_id",
+            unique=True,
+            postgresql_where=text("workspace_id IS NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID, primary_key=True, default=uuid.uuid4)
+    organization_id: Mapped[uuid.UUID] = mapped_column(
+        UUID, ForeignKey("organization.id", ondelete="CASCADE")
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID, ForeignKey("user.id", ondelete="CASCADE")
+    )
+    workspace_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID, ForeignKey("workspace.id", ondelete="CASCADE")
+    )
+    role_id: Mapped[uuid.UUID] = mapped_column(
+        UUID, ForeignKey("role.id", ondelete="RESTRICT"), index=True
+    )
+    assigned_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), server_default=func.now()
+    )
+    assigned_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID, ForeignKey("user.id", ondelete="SET NULL")
+    )
+
+    # Relationships
+    organization: Mapped[Organization] = relationship("Organization")
+    user: Mapped[User] = relationship(
+        "User", foreign_keys=[user_id], back_populates="role_assignments"
+    )
+    workspace: Mapped[Workspace | None] = relationship("Workspace")
+    role: Mapped[Role] = relationship("Role", back_populates="user_assignments")

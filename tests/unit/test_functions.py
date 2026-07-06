@@ -36,6 +36,7 @@ from tracecat.expressions.functions import (
     div,
     endswith,
     flatten,
+    flatten_dict,
     format_datetime,
     format_string,
     from_timestamp,
@@ -89,6 +90,7 @@ from tracecat.expressions.functions import (
     regex_match,
     regex_not_match,
     seconds_between,
+    serialize,
     serialize_json,
     set_timezone,
     slice_str,
@@ -771,6 +773,25 @@ def test_logical_operations(func, a: bool, b: Any, expected: bool) -> None:
 @pytest.mark.parametrize(
     "input_data,expected",
     [
+        ({"a": 1}, {"a": 1}),
+        ([1, 2, 3], [1, 2, 3]),
+        ("test", "test"),
+        (123, 123),
+    ],
+)
+def test_serialize(input_data: Any, expected: Any) -> None:
+    result = serialize(input_data)
+    assert orjson.loads(result) == expected
+
+
+def test_serialize_unsupported_type_raises() -> None:
+    with pytest.raises(TypeError):
+        serialize({"value": object()})
+
+
+@pytest.mark.parametrize(
+    "input_data,expected",
+    [
         ({"a": 1, "b": 2}, {"a": 1, "b": 2}),
         ([1, 2, 3], [1, 2, 3]),
         ("test", "test"),
@@ -986,6 +1007,21 @@ def test_flatten(input_iterables: list, expected: list) -> None:
     The function recursively flattens all sequences (including tuples) into a single list.
     """
     assert flatten(input_iterables) == expected
+
+
+@pytest.mark.parametrize(
+    "input_json,expected",
+    [
+        ('{"a": {"b": 1}}', {"a.b": 1}),
+        ('{"items": [1, 2]}', {"items[0]": 1, "items[1]": 2}),
+        (
+            '{"user": {"name": "Alice", "data": [1, 2]}}',
+            {"user.name": "Alice", "user.data[0]": 1, "user.data[1]": 2},
+        ),
+    ],
+)
+def test_flatten_dict_string_input(input_json: str, expected: dict[str, Any]) -> None:
+    assert flatten_dict(input_json) == expected
 
 
 @pytest.mark.parametrize(

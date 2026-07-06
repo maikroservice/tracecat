@@ -5,12 +5,19 @@ import { ArrowUpRight, Timer } from "lucide-react"
 import { useState } from "react"
 import type { CaseDurationDefinitionUpdate } from "@/client"
 import { CaseDurationsTable } from "@/components/cases/case-durations-table"
-import { FeatureFlagEmptyState } from "@/components/feature-flag-empty-state"
+import { EntitlementRequiredEmptyState } from "@/components/entitlement-required-empty-state"
 import { CenteredSpinner } from "@/components/loading/spinner"
 import { AlertNotification } from "@/components/notifications"
 import { Button } from "@/components/ui/button"
+import {
+  Empty,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from "@/components/ui/empty"
 import { toast } from "@/components/ui/use-toast"
-import { useFeatureFlag } from "@/hooks/use-feature-flags"
+import { useEntitlements } from "@/hooks/use-entitlements"
 import { useWorkspaceDetails } from "@/hooks/use-workspace"
 import {
   deleteCaseDurationDefinition,
@@ -23,16 +30,14 @@ export function CaseDurationsView() {
   const workspaceId = useWorkspaceId()
   const { workspace, workspaceLoading, workspaceError } = useWorkspaceDetails()
   const queryClient = useQueryClient()
-  const { isFeatureEnabled, isLoading: featureFlagLoading } = useFeatureFlag()
+  const { hasEntitlement, isLoading: entitlementsLoading } = useEntitlements()
+  const caseAddonsEnabled = hasEntitlement("case_addons")
 
   const {
     caseDurationDefinitions,
     caseDurationDefinitionsIsLoading,
     caseDurationDefinitionsError,
-  } = useCaseDurationDefinitions(
-    workspaceId,
-    isFeatureEnabled("case-durations")
-  )
+  } = useCaseDurationDefinitions(workspaceId, caseAddonsEnabled)
 
   const { mutateAsync: handleDelete, isPending: deleteIsPending } = useMutation(
     {
@@ -124,17 +129,17 @@ export function CaseDurationsView() {
   )
 
   // Check feature flag loading first - fastest check
-  if (featureFlagLoading) {
+  if (entitlementsLoading) {
     return <CenteredSpinner />
   }
 
   // Show enterprise-only message if feature is not enabled
   // This shows immediately after feature flags load (~200ms)
-  if (!isFeatureEnabled("case-durations")) {
+  if (!caseAddonsEnabled) {
     return (
       <div className="size-full overflow-auto">
         <div className="container flex h-full max-w-[1000px] items-center justify-center py-8">
-          <FeatureFlagEmptyState
+          <EntitlementRequiredEmptyState
             title="Enterprise only"
             description="Case durations are only available on enterprise plans."
           >
@@ -152,7 +157,7 @@ export function CaseDurationsView() {
                 Learn more <ArrowUpRight className="size-4" />
               </a>
             </Button>
-          </FeatureFlagEmptyState>
+          </EntitlementRequiredEmptyState>
         </div>
       </div>
     )
@@ -188,16 +193,18 @@ export function CaseDurationsView() {
   if (!caseDurationDefinitions || caseDurationDefinitions.length === 0) {
     return (
       <div className="size-full overflow-auto">
-        <div className="container flex h-full max-w-[1000px] flex-col items-center justify-center space-y-4 py-8 text-center">
-          <div className="rounded-full bg-muted p-3">
-            <Timer className="size-8 text-muted-foreground" />
-          </div>
-          <div className="space-y-1 text-muted-foreground">
-            <h4 className="text-sm font-semibold">No durations defined yet</h4>
-            <p className="text-xs">
-              Add your first duration metric using the button in the header.
-            </p>
-          </div>
+        <div className="container flex h-full max-w-[1000px] items-center justify-center py-8">
+          <Empty>
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                <Timer className="size-6" />
+              </EmptyMedia>
+              <EmptyTitle>No durations defined yet</EmptyTitle>
+              <EmptyDescription>
+                Add your first duration metric using the button in the header.
+              </EmptyDescription>
+            </EmptyHeader>
+          </Empty>
         </div>
       </div>
     )

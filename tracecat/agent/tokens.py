@@ -4,7 +4,7 @@ This module provides token minting and verification for authenticating requests
 between the jailed agent runtime and trusted services:
 
 1. MCP Token: For tool execution via the trusted MCP server
-2. LLM Token: For LLM API calls via the LiteLLM gateway
+2. LLM Token: For LLM API calls via the LLM gateway
 
 These tokens are separate to provide isolation - a compromised MCP execution
 path (which runs user code) cannot make arbitrary LLM calls, and vice versa.
@@ -20,11 +20,12 @@ from typing import Any, Literal
 
 import jwt
 from jwt import PyJWTError
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from tracecat import config
-from tracecat.agent.types import OutputType
-from tracecat.identifiers import UserID, WorkspaceID
+from tracecat.auth.secrets import get_service_key
+from tracecat.identifiers import OrganizationID, UserID, WorkspaceID
+from tracecat.registry.lock.types import RegistryLock
 
 # -----------------------------------------------------------------------------
 # MCP Token (for tool execution)
@@ -40,22 +41,43 @@ MCP_REQUIRED_CLAIMS = (
     "iat",
     "exp",
     "workspace_id",
+    "organization_id",
     "allowed_actions",
     "session_id",
 )
 
 
 class UserMCPServerClaim(BaseModel):
-    """User MCP server configuration in JWT claims."""
+    """User MCP server reference in JWT claims.
+
+    Carries only non-secret identifiers. Headers (OAuth bearers, custom
+    auth) are resolved fresh by the trusted MCP server at call time via the
+    source ``id``.
+
+    The legacy ``url``/``transport``/``headers``/``timeout`` fields are
+    kept here so in-flight JWTs and Temporal activity outputs serialized
+    before this change still validate on replay. New mint paths set only
+    ``(name, id)``; trusted-server code paths use ``id``.
+    """
+
+    model_config = ConfigDict(extra="ignore")
 
     name: str
     """Unique identifier for the server."""
-    url: str
+    id: uuid.UUID | None = None
+    """UUID of the source ``mcp_integrations`` row. Required on new tokens;
+    optional only to support replay of pre-rollout tokens that lack it."""
+
+    # --- Legacy fields kept for replay of in-flight tokens. ---
+    # New mint paths leave these unset. Trusted server reads only (name, id).
+    url: str | None = None
     """HTTP/SSE endpoint URL."""
     transport: Literal["http", "sse"] = "http"
     """Transport type: 'http' or 'sse'."""
     headers: dict[str, str] = Field(default_factory=dict)
     """Auth headers."""
+    timeout: int | None = None
+    """Optional request timeout in seconds."""
 
 
 class InternalToolContext(BaseModel):
@@ -84,6 +106,12 @@ class MCPTokenClaims(BaseModel):
     """Optional user ID for audit/traceability."""
     session_id: uuid.UUID
     """Agent session ID for traceability."""
+    parent_agent_workflow_id: str | None = None
+    """Optional parent durable agent workflow ID for correlation."""
+    parent_agent_run_id: str | None = None
+    """Optional parent durable agent run ID for correlation."""
+    organization_id: OrganizationID
+    """Organization UUID for authorization context."""
     allowed_actions: list[str]
     """Set of allowed action names (e.g., {"tools.slack.post_message", "core.http_request"})."""
     user_mcp_servers: list[UserMCPServerClaim] = Field(default_factory=list)
@@ -92,14 +120,26 @@ class MCPTokenClaims(BaseModel):
     """Set of allowed internal tool names (e.g., {"internal.builder.get_preset_summary"})."""
     internal_tool_context: InternalToolContext | None = None
     """Context for internal tools (preset_id, entity_type, etc.)."""
+    # Decode must tolerate already-signed legacy tokens. New tokens require this
+    # at mint time so registry tool execution stays pinned to compile-time locks.
+    registry_lock: RegistryLock | None = None
+    """Registry lock resolved for this token's registry actions.
+
+    Optional for tokens minted before registry locks were embedded in MCP claims.
+    New tokens should always include this claim.
+    """
 
 
 def mint_mcp_token(
     *,
     workspace_id: WorkspaceID,
+    organization_id: OrganizationID,
     allowed_actions: list[str],
     session_id: uuid.UUID,
+    registry_lock: RegistryLock,
     user_id: UserID | None = None,
+    parent_agent_workflow_id: str | None = None,
+    parent_agent_run_id: str | None = None,
     user_mcp_servers: list[UserMCPServerClaim] | None = None,
     allowed_internal_tools: list[str] | None = None,
     internal_tool_context: InternalToolContext | None = None,
@@ -110,14 +150,16 @@ def mint_mcp_token(
     This token is minted by the AgentExecutor (trusted) and passed to the
     jailed runtime. The runtime cannot decode or modify it - it's opaque.
 
-    The token contains minimal identity info (workspace_id, user_id) rather than
-    a full Role object. The Role is reconstructed on the trusted side when the
-    token is verified, providing better security isolation.
+    The token contains minimal identity info (workspace_id, organization_id, user_id)
+    rather than a full Role object. The Role is reconstructed on the trusted side
+    when the token is verified, providing better security isolation.
 
     Args:
         workspace_id: Workspace UUID for authorization context
+        organization_id: Organization UUID for authorization context
         allowed_actions: Set of allowed action names
         session_id: Agent session ID for traceability
+        registry_lock: Registry lock resolved for this token's registry actions
         user_id: Optional user ID for audit/traceability
         user_mcp_servers: User-defined MCP server configs for proxying
         allowed_internal_tools: Set of allowed internal tool names
@@ -127,9 +169,6 @@ def mint_mcp_token(
     Returns:
         Signed JWT string
     """
-    if not config.TRACECAT__SERVICE_KEY:
-        raise ValueError("TRACECAT__SERVICE_KEY is not set")
-
     now = datetime.now(UTC)
     ttl = ttl_seconds or config.TRACECAT__EXECUTOR_TOKEN_TTL_SECONDS
 
@@ -139,24 +178,26 @@ def mint_mcp_token(
         "sub": MCP_TOKEN_SUBJECT,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(seconds=ttl)).timestamp()),
-        "workspace_id": str(workspace_id),
-        "allowed_actions": allowed_actions,
-        "session_id": str(session_id),
     }
+    # Use the claims model as the single serialization path for UUIDs and nested
+    # Pydantic values instead of manually encoding each optional claim.
+    payload.update(
+        MCPTokenClaims(
+            workspace_id=workspace_id,
+            organization_id=organization_id,
+            user_id=user_id,
+            session_id=session_id,
+            parent_agent_workflow_id=parent_agent_workflow_id,
+            parent_agent_run_id=parent_agent_run_id,
+            allowed_actions=allowed_actions,
+            user_mcp_servers=user_mcp_servers or [],
+            allowed_internal_tools=allowed_internal_tools or [],
+            internal_tool_context=internal_tool_context,
+            registry_lock=registry_lock,
+        ).model_dump(mode="json", exclude_none=True)
+    )
 
-    if user_id is not None:
-        payload["user_id"] = str(user_id)
-
-    if user_mcp_servers:
-        payload["user_mcp_servers"] = [s.model_dump() for s in user_mcp_servers]
-
-    if allowed_internal_tools:
-        payload["allowed_internal_tools"] = allowed_internal_tools
-
-    if internal_tool_context:
-        payload["internal_tool_context"] = internal_tool_context.model_dump(mode="json")
-
-    return jwt.encode(payload, config.TRACECAT__SERVICE_KEY, algorithm="HS256")
+    return jwt.encode(payload, get_service_key(), algorithm="HS256")
 
 
 def verify_mcp_token(token: str) -> MCPTokenClaims:
@@ -171,13 +212,10 @@ def verify_mcp_token(token: str) -> MCPTokenClaims:
     Raises:
         ValueError: If token is invalid or missing required claims
     """
-    if not config.TRACECAT__SERVICE_KEY:
-        raise ValueError("TRACECAT__SERVICE_KEY is not set")
-
     try:
         payload = jwt.decode(
             token,
-            config.TRACECAT__SERVICE_KEY,
+            get_service_key(),
             algorithms=["HS256"],
             audience=MCP_TOKEN_AUDIENCE,
             issuer=MCP_TOKEN_ISSUER,
@@ -209,9 +247,22 @@ LLM_REQUIRED_CLAIMS = (
     "iat",
     "exp",
     "workspace_id",
+    "organization_id",
     "session_id",
     "model",
+    "provider",
 )
+
+
+class LLMRouteClaim(BaseModel):
+    """Immutable model route authorized by an LLM token."""
+
+    model: str
+    provider: str
+    catalog_id: uuid.UUID | None = None
+    base_url: str | None = None
+    model_settings: dict[str, Any] = Field(default_factory=dict)
+    use_workspace_credentials: bool = False
 
 
 class LLMTokenClaims(BaseModel):
@@ -219,14 +270,46 @@ class LLMTokenClaims(BaseModel):
 
     These claims are set by the AgentExecutor when minting the token
     and are immutable - the jailed runtime cannot modify them.
+
+    ``extra="ignore"`` lets tokens minted by a previous release (e.g. with
+    the legacy ``use_workspace_credentials`` field) still verify during the
+    rollout window, so in-flight sessions don't break on deploy.
     """
+
+    model_config = ConfigDict(extra="ignore")
 
     # Identity
     workspace_id: WorkspaceID = Field(..., description="Workspace UUID")
+    organization_id: OrganizationID = Field(..., description="Organization UUID")
     session_id: uuid.UUID = Field(..., description="Agent session UUID")
 
     # Model configuration
     model: str = Field(..., description="The model to use for this run")
+    provider: str = Field(
+        ..., description="The provider for the model (e.g., openai, anthropic, bedrock)"
+    )
+    catalog_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "Catalog row backing this request. When set, the gateway loads "
+            "credentials (and the invocation target for cloud/custom "
+            "providers) from ``agent_catalog.encrypted_config`` instead of "
+            "the legacy ``agent-{provider}-credentials`` secret. Null for "
+            "direct-provider platform rows and for legacy-replay tokens."
+        ),
+    )
+    use_workspace_credentials: bool = Field(
+        default=False,
+        description=(
+            "Legacy credential-scope claim for pre-catalog tokens. When true "
+            "and catalog_id is null, the gateway resolves workspace provider "
+            "credentials during the migration window."
+        ),
+    )
+    base_url: str | None = Field(
+        default=None,
+        description="Optional provider base URL override from the agent config/preset",
+    )
 
     # Model settings - passed through to LLM provider as-is
     # Supports: temperature, max_tokens, reasoning_effort, etc.
@@ -235,27 +318,22 @@ class LLMTokenClaims(BaseModel):
         description="Model-specific settings passed through to the LLM provider",
     )
 
-    # Output type for structured outputs (response_format)
-    output_type: OutputType | None = Field(
-        default=None,
-        description="Expected output type for structured outputs",
-    )
-
-    # Credential scope
-    use_workspace_credentials: bool = Field(
-        default=False,
-        description="If True, use workspace-level credentials; otherwise org-level",
-    )
+    routes: dict[str, LLMRouteClaim] = Field(default_factory=dict)
+    """Optional request-model keyed route map for subagent model isolation."""
 
 
 def mint_llm_token(
     *,
     workspace_id: WorkspaceID,
+    organization_id: OrganizationID,
     session_id: uuid.UUID,
     model: str,
+    provider: str,
+    catalog_id: uuid.UUID | None = None,
+    base_url: str | None = None,
     model_settings: dict[str, Any] | None = None,
-    output_type: OutputType | None = None,
     use_workspace_credentials: bool = False,
+    routes: dict[str, LLMRouteClaim] | None = None,
     ttl_seconds: int | None = None,
 ) -> str:
     """Create a signed LLM JWT for jailed agent runtime.
@@ -264,23 +342,26 @@ def mint_llm_token(
     jailed runtime. The runtime cannot decode or modify it - it's opaque.
 
     Args:
-        workspace_id: The workspace UUID as string
-        session_id: The agent session UUID as string
+        workspace_id: The workspace UUID
+        organization_id: The organization UUID
+        session_id: The agent session UUID
         model: The model to use for this run
+        provider: The provider for the model (e.g., openai, anthropic, bedrock)
+        catalog_id: Optional catalog row backing this request. When set, the
+            gateway loads credentials from ``agent_catalog.encrypted_config``;
+            when ``None`` the gateway falls back to the legacy
+            ``agent-{provider}-credentials`` secret lookup.
+        base_url: Optional provider base URL override from the agent config/preset
         model_settings: Model-specific settings (temperature, max_tokens,
             reasoning_effort, etc.) passed through to LLM provider
-        output_type: Expected output type for structured outputs
-        use_workspace_credentials: Whether to use workspace-level creds
+        use_workspace_credentials: Legacy credential scope for no-catalog tokens
         ttl_seconds: Token TTL in seconds (defaults to executor token TTL)
 
     Returns:
         Signed JWT string
     """
-    if not config.TRACECAT__SERVICE_KEY:
-        raise ValueError("TRACECAT__SERVICE_KEY is not set")
-
     now = datetime.now(UTC)
-    ttl = ttl_seconds or config.TRACECAT__EXECUTOR_TOKEN_TTL_SECONDS
+    ttl = ttl_seconds or config.TRACECAT__AGENT_SANDBOX_TIMEOUT + 60
 
     payload: dict[str, Any] = {
         # Standard JWT claims
@@ -291,19 +372,22 @@ def mint_llm_token(
         "exp": int((now + timedelta(seconds=ttl)).timestamp()),
         # Identity claims
         "workspace_id": str(workspace_id),
+        "organization_id": str(organization_id),
         "session_id": str(session_id),
         # Model configuration
         "model": model,
+        "provider": provider,
+        "catalog_id": str(catalog_id) if catalog_id is not None else None,
+        "base_url": base_url,
         "model_settings": model_settings or {},
-        # Credential scope
         "use_workspace_credentials": use_workspace_credentials,
     }
+    if routes:
+        payload["routes"] = {
+            key: route.model_dump(mode="json") for key, route in routes.items()
+        }
 
-    # Only include output_type if provided
-    if output_type is not None:
-        payload["output_type"] = output_type
-
-    return jwt.encode(payload, config.TRACECAT__SERVICE_KEY, algorithm="HS256")
+    return jwt.encode(payload, get_service_key(), algorithm="HS256")
 
 
 def verify_llm_token(token: str) -> LLMTokenClaims:
@@ -318,13 +402,13 @@ def verify_llm_token(token: str) -> LLMTokenClaims:
     Raises:
         ValueError: If token is invalid, expired, or missing required claims
     """
-    if not config.TRACECAT__SERVICE_KEY:
-        raise ValueError("TRACECAT__SERVICE_KEY is not set")
+    if not token:
+        raise ValueError("Invalid LLM token")
 
     try:
         payload = jwt.decode(
             token,
-            config.TRACECAT__SERVICE_KEY,
+            get_service_key(),
             algorithms=["HS256"],
             audience=LLM_TOKEN_AUDIENCE,
             issuer=LLM_TOKEN_ISSUER,

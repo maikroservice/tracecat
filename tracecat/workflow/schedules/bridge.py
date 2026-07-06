@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 import temporalio.client
 from temporalio.api.common.v1 import Payloads
@@ -8,18 +8,26 @@ from temporalio.exceptions import TemporalError
 
 from tracecat import config
 from tracecat.auth.types import Role
+from tracecat.authz.scopes import SERVICE_PRINCIPAL_SCOPES
 from tracecat.dsl.client import get_temporal_client
 from tracecat.dsl.common import DSLRunArgs
 from tracecat.identifiers import ScheduleUUID, WorkflowID
 from tracecat.identifiers.schedules import AnyScheduleID
 from tracecat.logger import logger
-from tracecat.workflow.executions.enums import TemporalSearchAttr, TriggerType
+from tracecat.workflow.executions.enums import (
+    ExecutionType,
+    TemporalSearchAttr,
+    TriggerType,
+)
 from tracecat.workflow.schedules.schemas import ScheduleUpdate
 
 
 def build_schedule_search_attributes(role: Role) -> TypedSearchAttributes:
     """Build search attributes for scheduled workflows."""
-    pairs = [TriggerType.SCHEDULED.to_temporal_search_attr_pair()]
+    pairs = [
+        TriggerType.SCHEDULED.to_temporal_search_attr_pair(),
+        ExecutionType.PUBLISHED.to_temporal_search_attr_pair(),
+    ]
     if role.workspace_id is not None:
         pairs.append(
             TemporalSearchAttr.WORKSPACE_ID.create_pair(str(role.workspace_id))
@@ -45,6 +53,7 @@ async def create_schedule(
     start_at: datetime | None = None,
     end_at: datetime | None = None,
     timeout: float | None = None,
+    status: Literal["online", "offline"] = "online",
 ) -> temporalio.client.ScheduleHandle:
     # Importing here to avoid circular imports...
     from tracecat.dsl.workflow import DSLWorkflow
@@ -95,6 +104,7 @@ async def create_schedule(
                 # Allow overlapping workflows to run in parallel
                 overlap=temporalio.client.ScheduleOverlapPolicy.ALLOW_ALL,
             ),
+            state=temporalio.client.ScheduleState(paused=status != "online"),
         ),
     )
 
@@ -144,7 +154,11 @@ async def update_schedule(schedule_id: AnyScheduleID, params: ScheduleUpdate) ->
                     "Error extracting role from schedule action",
                     error=e,
                 )
-                role = Role(type="service", service_id="tracecat-schedule-runner")
+                role = Role(
+                    type="service",
+                    service_id="tracecat-schedule-runner",
+                    scopes=SERVICE_PRINCIPAL_SCOPES["tracecat-schedule-runner"],
+                )
             action.typed_search_attributes = build_schedule_search_attributes(role)
             if "inputs" in set_fields:
                 action.args[0].dsl.trigger_inputs = set_fields["inputs"]  # type: ignore

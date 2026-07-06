@@ -33,11 +33,10 @@ from tracecat.storage.object import (
     CollectionObject,
     ObjectRef,
     StoredObjectValidator,
-    get_object_storage,
+    retrieve_stored_object,
 )
 from tracecat.storage.utils import (
     cached_blob_download,
-    cached_select_item,
     compute_sha256,
     deserialize_object,
     serialize_object,
@@ -251,10 +250,7 @@ async def _fetch_chunk(ref: ObjectRef) -> CollectionChunkV1:
 
 
 async def _fetch_chunk_item(ref: ObjectRef, local_index: int) -> Any:
-    """Fetch a single item from a chunk using S3 Select with caching.
-
-    Uses S3 Select to retrieve only the requested array element instead of
-    downloading the entire chunk. Results are cached by (sha256, index).
+    """Fetch a single item from a chunk.
 
     Args:
         ref: ObjectRef to the chunk.
@@ -263,12 +259,12 @@ async def _fetch_chunk_item(ref: ObjectRef, local_index: int) -> Any:
     Returns:
         The item at the given index.
     """
-    return await cached_select_item(
-        sha256=ref.sha256,
-        bucket=ref.bucket,
-        key=ref.key,
-        local_index=local_index,
-    )
+    chunk = await _fetch_chunk(ref)
+    if local_index < 0 or local_index >= len(chunk.items):
+        raise IndexError(
+            f"Chunk index {local_index} out of range for chunk with {len(chunk.items)} items"
+        )
+    return chunk.items[local_index]
 
 
 async def get_collection_page(
@@ -321,8 +317,6 @@ async def get_collection_page(
 async def get_collection_item(collection: CollectionObject, index: int) -> Any:
     """Get a single item from a collection by index.
 
-    Uses S3 Select to fetch only the requested item instead of the entire chunk.
-
     Args:
         collection: CollectionObject handle.
         index: Item index (0-indexed, supports negative indexing).
@@ -346,8 +340,13 @@ async def get_collection_item(collection: CollectionObject, index: int) -> Any:
     chunk_idx = index // collection.chunk_size
     local_idx = index % collection.chunk_size
 
-    # Use S3 Select for efficient single-item retrieval
-    return await _fetch_chunk_item(manifest.chunks[chunk_idx], local_idx)
+    item = await _fetch_chunk_item(manifest.chunks[chunk_idx], local_idx)
+
+    if collection.element_kind == "value":
+        return item
+
+    stored = StoredObjectValidator.validate_python(item)
+    return await retrieve_stored_object(stored)
 
 
 async def materialize_collection_values(
@@ -376,11 +375,10 @@ async def materialize_collection_values(
         return items
 
     # element_kind == "stored_object": retrieve each handle
-    storage = get_object_storage()
     values: list[Any] = []
     for item in items:
         stored = StoredObjectValidator.validate_python(item)
-        value = await storage.retrieve(stored)
+        value = await retrieve_stored_object(stored)
         values.append(value)
 
     return values

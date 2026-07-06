@@ -2,6 +2,7 @@
 
 import {
   Copy,
+  CopyPlus,
   DownloadIcon,
   ExternalLink,
   FolderKanban,
@@ -13,52 +14,75 @@ import {
 import Link from "next/link"
 import type {
   FolderDirectoryItem,
+  TagRead,
   WorkflowDirectoryItem,
   WorkflowReadMinimal,
 } from "@/client"
 import { DeleteWorkflowAlertDialogTrigger } from "@/components/dashboard/delete-workflow-dialog"
-import { ViewMode } from "@/components/dashboard/folder-view-toggle"
 import { ActiveDialog } from "@/components/dashboard/table-common"
-import { ExportMenuItem } from "@/components/export-workflow-dropdown-item"
 import {
-  DropdownMenuCheckboxItem,
-  DropdownMenuGroup,
-  DropdownMenuItem,
-  DropdownMenuPortal,
-  DropdownMenuSeparator,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
-} from "@/components/ui/dropdown-menu"
+  ContextMenuCheckboxItem,
+  ContextMenuGroup,
+  ContextMenuItem,
+  ContextMenuPortal,
+  ContextMenuSeparator,
+  ContextMenuSub,
+  ContextMenuSubContent,
+  ContextMenuSubTrigger,
+} from "@/components/ui/context-menu"
 import { toast } from "@/components/ui/use-toast"
-import {
-  useOrgAppSettings,
-  useWorkflowManager,
-  useWorkflowTags,
-} from "@/lib/hooks"
+import { exportWorkflow, handleExportError } from "@/lib/export"
+import { useOrgAppSettings, useWorkflowManager } from "@/lib/hooks"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
 export function WorkflowActions({
-  view,
   item,
+  onDuplicateWorkflow,
+  duplicateDisabled = false,
   setSelectedWorkflow,
   setActiveDialog,
+  showMoveToFolder = true,
+  availableTags,
+  areTagsLoading = false,
 }: {
-  view: ViewMode
   item: WorkflowDirectoryItem
+  onDuplicateWorkflow: (item: WorkflowDirectoryItem) => void
+  duplicateDisabled?: boolean
   setSelectedWorkflow: (workflow: WorkflowReadMinimal) => void
   setActiveDialog?: (activeDialog: ActiveDialog | null) => void
+  showMoveToFolder?: boolean
+  availableTags?: TagRead[]
+  areTagsLoading?: boolean
 }) {
   const { appSettings } = useOrgAppSettings()
   const workspaceId = useWorkspaceId()
-  const { tags } = useWorkflowTags(workspaceId)
 
-  const { addWorkflowTag, removeWorkflowTag } = useWorkflowManager()
+  const { addWorkflowTag, removeWorkflowTag } = useWorkflowManager(undefined, {
+    listEnabled: false,
+  })
   const enabledExport = appSettings?.app_workflow_export_enabled ?? false
 
+  const handleExport = async (draft: boolean) => {
+    if (!enabledExport) {
+      return
+    }
+
+    try {
+      await exportWorkflow({
+        workspaceId,
+        workflowId: item.id,
+        format: "yaml",
+        draft,
+      })
+    } catch (error) {
+      console.error("Failed to download workflow definition as YAML:", error)
+      toast(handleExportError(error as Error))
+    }
+  }
+
   return (
-    <DropdownMenuGroup>
-      <DropdownMenuItem
+    <ContextMenuGroup>
+      <ContextMenuItem
         className="text-xs"
         onClick={(e) => e.stopPropagation()}
         asChild
@@ -71,9 +95,9 @@ export function WorkflowActions({
           <ExternalLink className="mr-2 size-3.5" />
           Open in new tab
         </Link>
-      </DropdownMenuItem>
+      </ContextMenuItem>
       {item.alias && (
-        <DropdownMenuItem
+        <ContextMenuItem
           className="text-xs"
           onClick={(e) => {
             e.stopPropagation() // Prevent row click
@@ -84,10 +108,10 @@ export function WorkflowActions({
         >
           <Copy className="mr-2 size-3.5" />
           Copy workflow alias
-        </DropdownMenuItem>
+        </ContextMenuItem>
       )}
-      {view === ViewMode.Folders && (
-        <DropdownMenuItem
+      {showMoveToFolder && (
+        <ContextMenuItem
           className="text-xs"
           onClick={(e) => {
             e.stopPropagation() // Prevent row click
@@ -97,25 +121,23 @@ export function WorkflowActions({
         >
           <FolderUp className="mr-2 size-3.5" />
           Move to folder
-        </DropdownMenuItem>
+        </ContextMenuItem>
       )}
-      {tags && tags.length > 0 ? (
-        <DropdownMenuSub>
-          <DropdownMenuSubTrigger
+      {availableTags && availableTags.length > 0 ? (
+        <ContextMenuSub>
+          <ContextMenuSubTrigger
             className="text-xs"
             onClick={(e) => e.stopPropagation()}
           >
             <TagsIcon className="mr-2 size-3.5" />
             Tags
-          </DropdownMenuSubTrigger>
-          <DropdownMenuPortal>
-            <DropdownMenuSubContent>
-              {/* No tags */}
-
-              {tags.map((tag) => {
+          </ContextMenuSubTrigger>
+          <ContextMenuPortal>
+            <ContextMenuSubContent>
+              {availableTags.map((tag) => {
                 const hasTag = item.tags?.some((t) => t.id === tag.id)
                 return (
-                  <DropdownMenuCheckboxItem
+                  <ContextMenuCheckboxItem
                     key={tag.id}
                     className="text-xs"
                     checked={hasTag}
@@ -164,40 +186,52 @@ export function WorkflowActions({
                       }}
                     />
                     <span>{tag.name}</span>
-                  </DropdownMenuCheckboxItem>
+                  </ContextMenuCheckboxItem>
                 )
               })}
-            </DropdownMenuSubContent>
-          </DropdownMenuPortal>
-        </DropdownMenuSub>
+            </ContextMenuSubContent>
+          </ContextMenuPortal>
+        </ContextMenuSub>
+      ) : areTagsLoading ? (
+        <ContextMenuItem
+          className="!bg-transparent text-xs !text-muted-foreground"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <TagsIcon className="mr-2 size-3.5" />
+          <span>Loading tags...</span>
+        </ContextMenuItem>
       ) : (
-        <DropdownMenuItem
+        <ContextMenuItem
           className="!bg-transparent text-xs !text-muted-foreground hover:cursor-not-allowed"
           onClick={(e) => e.stopPropagation()}
         >
           <TagsIcon className="mr-2 size-3.5" />
           <span>No tags available</span>
-        </DropdownMenuItem>
+        </ContextMenuItem>
       )}
-      <ExportMenuItem
-        enabledExport={enabledExport}
-        format="yaml"
-        workspaceId={workspaceId}
-        workflowId={item.id}
-        draft={true}
-        label="Export draft"
-        icon={<DownloadIcon className="mr-2 size-3.5" />}
-      />
-      <ExportMenuItem
-        enabledExport={enabledExport}
-        format="yaml"
-        workspaceId={workspaceId}
-        workflowId={item.id}
-        draft={false}
-        label="Export saved"
-        icon={<DownloadIcon className="mr-2 size-3.5" />}
-      />
-      <DropdownMenuItem
+      <ContextMenuItem
+        className="text-xs"
+        disabled={!enabledExport}
+        onClick={(e) => {
+          e.stopPropagation()
+          void handleExport(true)
+        }}
+      >
+        <DownloadIcon className="mr-2 size-3.5" />
+        Export draft
+      </ContextMenuItem>
+      <ContextMenuItem
+        className="text-xs"
+        disabled={!enabledExport}
+        onClick={(e) => {
+          e.stopPropagation()
+          void handleExport(false)
+        }}
+      >
+        <DownloadIcon className="mr-2 size-3.5" />
+        Export saved
+      </ContextMenuItem>
+      <ContextMenuItem
         className="text-xs"
         onClick={(e) => {
           e.stopPropagation() // Prevent row click
@@ -206,22 +240,32 @@ export function WorkflowActions({
       >
         <Copy className="mr-2 size-3.5" />
         Copy workflow ID
-      </DropdownMenuItem>
-      <DropdownMenuSeparator />
+      </ContextMenuItem>
+      <ContextMenuItem
+        className="text-xs"
+        disabled={duplicateDisabled || !enabledExport}
+        onClick={(event) => {
+          event.stopPropagation()
+          onDuplicateWorkflow(item)
+        }}
+      >
+        <CopyPlus className="mr-2 size-3.5" />
+        Duplicate workflow
+      </ContextMenuItem>
+      <ContextMenuSeparator />
       <DeleteWorkflowAlertDialogTrigger asChild>
-        <DropdownMenuItem
+        <ContextMenuItem
           className="text-xs text-rose-500 focus:text-rose-600"
           onClick={(e) => {
             e.stopPropagation() // Prevent row click
             setSelectedWorkflow(item)
-            console.debug("Selected workflow to delete", item)
           }}
         >
           <Trash2 className="mr-2 size-3.5" />
           Delete
-        </DropdownMenuItem>
+        </ContextMenuItem>
       </DeleteWorkflowAlertDialogTrigger>
-    </DropdownMenuGroup>
+    </ContextMenuGroup>
   )
 }
 
@@ -235,8 +279,8 @@ export function FolderActions({
   setSelectedFolder: (folder: FolderDirectoryItem | null) => void
 }) {
   return (
-    <DropdownMenuGroup>
-      <DropdownMenuItem
+    <ContextMenuGroup>
+      <ContextMenuItem
         className="text-xs"
         onClick={(e) => e.stopPropagation()}
         onSelect={(e) => {
@@ -246,8 +290,8 @@ export function FolderActions({
       >
         <Copy className="mr-2 size-3.5" />
         Copy folder ID
-      </DropdownMenuItem>
-      <DropdownMenuItem
+      </ContextMenuItem>
+      <ContextMenuItem
         className="text-xs"
         onClick={(e) => e.stopPropagation()}
         onSelect={(e) => {
@@ -258,8 +302,8 @@ export function FolderActions({
       >
         <Pencil className="mr-2 size-3.5" />
         Rename folder
-      </DropdownMenuItem>
-      <DropdownMenuItem
+      </ContextMenuItem>
+      <ContextMenuItem
         className="text-xs"
         onClick={(e) => e.stopPropagation()}
         onSelect={(e) => {
@@ -270,9 +314,9 @@ export function FolderActions({
       >
         <FolderKanban className="mr-2 size-3.5" />
         Move folder
-      </DropdownMenuItem>
-      <DropdownMenuSeparator />
-      <DropdownMenuItem
+      </ContextMenuItem>
+      <ContextMenuSeparator />
+      <ContextMenuItem
         className="text-xs text-rose-500 focus:text-rose-600"
         onClick={(e) => e.stopPropagation()}
         onSelect={(e) => {
@@ -283,7 +327,7 @@ export function FolderActions({
       >
         <Trash2 className="mr-2 size-3.5" />
         Delete folder
-      </DropdownMenuItem>
-    </DropdownMenuGroup>
+      </ContextMenuItem>
+    </ContextMenuGroup>
   )
 }

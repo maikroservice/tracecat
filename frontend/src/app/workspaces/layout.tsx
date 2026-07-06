@@ -1,30 +1,55 @@
 "use client"
 
 import { ReactFlowProvider } from "@xyflow/react"
-import { LogOut } from "lucide-react"
+import { LogOut, Plus, Shield } from "lucide-react"
 import Image from "next/image"
-import { useParams, usePathname } from "next/navigation"
+import Link from "next/link"
+import { useParams, usePathname, useRouter } from "next/navigation"
 import TracecatIcon from "public/icon.png"
 import type React from "react"
-import { useEffect, useMemo } from "react"
+import { useEffect, useMemo, useState } from "react"
+import { ApiError } from "@/client"
+import { NoOrganizationAccess } from "@/components/auth/no-organization-access"
+import { useScopeCheck } from "@/components/auth/scope-guard"
 import { CaseSelectionProvider } from "@/components/cases/case-selection-context"
 import { CenteredSpinner } from "@/components/loading/spinner"
 import { ControlsHeader } from "@/components/nav/controls-header"
 import { DynamicNavbar } from "@/components/nav/dynamic-nav"
+import { SettingsModal } from "@/components/settings/settings-modal"
 import { AppSidebar } from "@/components/sidebar/app-sidebar"
 import { Button } from "@/components/ui/button"
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
-import { useAuthActions } from "@/hooks/use-auth"
+import { useAuth, useAuthActions } from "@/hooks/use-auth"
 import { useWorkspaceManager } from "@/lib/hooks"
+import { getWorkspaceLandingPath } from "@/lib/workspace-navigation"
 import { WorkflowBuilderProvider } from "@/providers/builder"
+import { ScopeProvider } from "@/providers/scopes"
+import { SkillsStudioProvider } from "@/providers/skills-studio"
 import { WorkflowProvider } from "@/providers/workflow"
 import { WorkspaceIdProvider } from "@/providers/workspace-id"
+
+const NO_ORG_MEMBERSHIPS_DETAIL = "User has no organization memberships"
+
+function isNoOrgMembershipsError(error: unknown): boolean {
+  if (!(error instanceof ApiError)) {
+    return false
+  }
+  const body = error.body
+  if (!body || typeof body !== "object") {
+    return false
+  }
+  const detail =
+    "detail" in body ? (body as { detail?: unknown }).detail : undefined
+  return detail === NO_ORG_MEMBERSHIPS_DETAIL
+}
 
 export default function WorkspaceLayout({
   children,
 }: {
   children: React.ReactNode
 }) {
+  const router = useRouter()
+  const { user, userIsLoading } = useAuth()
   const {
     workspaces,
     workspacesLoading,
@@ -32,9 +57,20 @@ export default function WorkspaceLayout({
     setLastWorkspaceId,
     getLastWorkspaceId,
   } = useWorkspaceManager()
-  const params = useParams<{ workspaceId?: string; workflowId?: string }>()
+  const params = useParams<{
+    workspaceId?: string
+    workflowId?: string
+    skillId?: string
+  }>()
   const workspaceId = params?.workspaceId
   const workflowId = params?.workflowId
+  const skillId = params?.skillId
+  const requestedWorkspaceExists = useMemo(() => {
+    if (!workspaceId || !workspaces) {
+      return false
+    }
+    return workspaces.some((workspace) => workspace.id === workspaceId)
+  }, [workspaceId, workspaces])
   const lastViewedWorkspaceId = useMemo(() => {
     if (!workspaces || workspaces.length === 0) {
       return undefined
@@ -51,16 +87,71 @@ export default function WorkspaceLayout({
   }, [getLastWorkspaceId, workspaces])
 
   useEffect(() => {
-    if (workspaceId) {
+    if (workspaceId && requestedWorkspaceExists) {
       setLastWorkspaceId(workspaceId)
     }
-  }, [setLastWorkspaceId, workspaceId])
+  }, [requestedWorkspaceExists, setLastWorkspaceId, workspaceId])
+
+  const fallbackWorkspaceId = useMemo(() => {
+    if (!workspaces || workspaces.length === 0) {
+      return undefined
+    }
+    return lastViewedWorkspaceId ?? workspaces[0]?.id
+  }, [lastViewedWorkspaceId, workspaces])
+  const hasNoOrgMemberships =
+    workspacesError && isNoOrgMembershipsError(workspacesError)
+
+  useEffect(() => {
+    if (
+      workspacesLoading ||
+      workspacesError ||
+      !workspaceId ||
+      requestedWorkspaceExists ||
+      !fallbackWorkspaceId
+    ) {
+      return
+    }
+    router.replace(getWorkspaceLandingPath(fallbackWorkspaceId))
+  }, [
+    fallbackWorkspaceId,
+    requestedWorkspaceExists,
+    router,
+    workspaceId,
+    workspacesError,
+    workspacesLoading,
+  ])
+
+  useEffect(() => {
+    if (!hasNoOrgMemberships || userIsLoading || !user?.isSuperuser) {
+      return
+    }
+    router.replace("/admin")
+  }, [hasNoOrgMemberships, router, user?.isSuperuser, userIsLoading])
+
   if (workspacesLoading) {
     return <CenteredSpinner />
+  }
+  if (hasNoOrgMemberships) {
+    if (userIsLoading || user?.isSuperuser) {
+      return <CenteredSpinner />
+    }
+    return <NoOrganizationAccess />
   }
   if (workspacesError || !workspaces) {
     throw workspacesError
   }
+
+  if (workspaceId && !requestedWorkspaceExists) {
+    if (workspaces.length === 0) {
+      return (
+        <ScopeProvider>
+          <NoWorkspaces />
+        </ScopeProvider>
+      )
+    }
+    return <CenteredSpinner />
+  }
+
   let selectedWorkspaceId: string
   if (workspaceId) {
     selectedWorkspaceId = workspaceId
@@ -69,33 +160,57 @@ export default function WorkspaceLayout({
   } else if (workspaces.length > 0) {
     selectedWorkspaceId = workspaces[0].id
   } else {
-    return <NoWorkspaces />
+    return (
+      <ScopeProvider>
+        <NoWorkspaces />
+      </ScopeProvider>
+    )
   }
 
   return (
     <WorkspaceIdProvider workspaceId={selectedWorkspaceId}>
-      {workflowId ? (
-        <WorkflowView workspaceId={selectedWorkspaceId} workflowId={workflowId}>
+      <ScopeProvider>
+        {workflowId ? (
+          <WorkflowView
+            workspaceId={selectedWorkspaceId}
+            workflowId={workflowId}
+          >
+            <WorkspaceChildren>{children}</WorkspaceChildren>
+          </WorkflowView>
+        ) : skillId ? (
+          <SkillsStudioProvider
+            workspaceId={selectedWorkspaceId}
+            skillId={skillId}
+          >
+            <WorkspaceChildren>{children}</WorkspaceChildren>
+          </SkillsStudioProvider>
+        ) : (
           <WorkspaceChildren>{children}</WorkspaceChildren>
-        </WorkflowView>
-      ) : (
-        <WorkspaceChildren>{children}</WorkspaceChildren>
-      )}
+        )}
+        <SettingsModal />
+      </ScopeProvider>
     </WorkspaceIdProvider>
   )
 }
 
 function WorkspaceChildren({ children }: { children: React.ReactNode }) {
-  const params = useParams<{
-    workflowId?: string
-    caseId?: string
-  }>()
+  const params = useParams<{ workflowId?: string }>()
+  const canReadWorkspace = useScopeCheck("workspace:read")
   const pathname = usePathname()
   const isWorkflowBuilder = !!params?.workflowId
-  const isCaseDetail = !!params?.caseId
+  const isCasesPage = Boolean(pathname?.match(/\/cases(\/|$)/))
+  const isInboxPage = pathname?.includes("/inbox")
+  const isTablesPage = Boolean(pathname?.match(/\/tables(\/|$)/))
   const isSettingsPage = pathname?.includes("/settings")
   const isOrganizationPage = pathname?.includes("/organization")
-  const isRegistryPage = pathname?.includes("/registry")
+
+  if (canReadWorkspace === undefined) {
+    return <CenteredSpinner />
+  }
+
+  if (canReadWorkspace === false) {
+    return <WorkspaceAccessDenied />
+  }
 
   // Use old navbar for workflow builder
   if (isWorkflowBuilder) {
@@ -107,13 +222,23 @@ function WorkspaceChildren({ children }: { children: React.ReactNode }) {
     )
   }
 
-  // Settings, organization and registry pages have their own sidebars
-  if (isSettingsPage || isOrganizationPage || isRegistryPage) {
+  // Settings and organization pages have their own sidebars
+  if (isSettingsPage || isOrganizationPage) {
     return <>{children}</>
   }
 
-  // Case detail pages have their own layout with dual SidebarInset
-  if (isCaseDetail) {
+  // Cases pages have their own layout with an optional chat sidebar.
+  if (isCasesPage) {
+    return <>{children}</>
+  }
+
+  // Inbox pages have their own layout with chat sidebar
+  if (isInboxPage) {
+    return <>{children}</>
+  }
+
+  // Tables pages have their own layout with side panels.
+  if (isTablesPage) {
     return <>{children}</>
   }
 
@@ -130,6 +255,23 @@ function WorkspaceChildren({ children }: { children: React.ReactNode }) {
         </CaseSelectionProvider>
       </SidebarInset>
     </SidebarProvider>
+  )
+}
+
+function WorkspaceAccessDenied() {
+  const router = useRouter()
+
+  return (
+    <main className="container flex size-full max-w-[400px] flex-col items-center justify-center space-y-4">
+      <Image src={TracecatIcon} alt="Tracecat" className="mb-4 size-16" />
+      <h1 className="text-2xl font-semibold tracking-tight">Access denied</h1>
+      <span className="text-center text-muted-foreground">
+        You don&apos;t have permission to access this workspace.
+      </span>
+      <Button variant="outline" onClick={() => router.replace("/workspaces")}>
+        Back to workspaces
+      </Button>
+    </main>
   )
 }
 
@@ -152,22 +294,61 @@ function WorkflowView({
 }
 
 function NoWorkspaces() {
+  const { user } = useAuth()
   const { logout } = useAuthActions()
+  const canCreateWorkspace = useScopeCheck("workspace:create")
+  const { createWorkspace } = useWorkspaceManager()
+  const router = useRouter()
+  const [isCreating, setIsCreating] = useState(false)
+
   const handleLogout = async () => {
     await logout()
   }
+
+  const handleCreateWorkspace = async () => {
+    setIsCreating(true)
+    try {
+      const workspace = await createWorkspace({ name: "New Workspace" })
+      router.replace(getWorkspaceLandingPath(workspace.id))
+    } catch (error) {
+      console.error("Error creating workspace", error)
+      setIsCreating(false)
+    }
+  }
+
   return (
     <main className="container flex size-full max-w-[400px] flex-col items-center justify-center space-y-4">
       <Image src={TracecatIcon} alt="Tracecat" className="mb-4 size-16" />
       <h1 className="text-2xl font-semibold tracking-tight">No workspaces</h1>
       <span className="text-center text-muted-foreground">
-        You are not a member of any workspace. Please contact your
-        administrator.
+        {canCreateWorkspace
+          ? "There are no workspaces yet. Create one to get started."
+          : "You are not a member of any workspace. Please contact your administrator."}
       </span>
-      <Button variant="outline" onClick={handleLogout}>
-        <LogOut className="mr-2 size-4" />
-        <span>Logout</span>
-      </Button>
+      <div className="flex gap-2">
+        {canCreateWorkspace && (
+          <Button
+            variant="default"
+            onClick={handleCreateWorkspace}
+            disabled={isCreating}
+          >
+            <Plus className="mr-2 size-4" />
+            <span>{isCreating ? "Creating..." : "Create workspace"}</span>
+          </Button>
+        )}
+        {user?.isSuperuser && (
+          <Button variant="outline" asChild>
+            <Link href="/admin">
+              <Shield className="mr-2 size-4" />
+              <span>Admin</span>
+            </Link>
+          </Button>
+        )}
+        <Button variant="outline" onClick={handleLogout}>
+          <LogOut className="mr-2 size-4" />
+          <span>Logout</span>
+        </Button>
+      </div>
     </main>
   )
 }

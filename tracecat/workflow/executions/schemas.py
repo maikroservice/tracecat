@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import (
     Annotated,
     Any,
@@ -10,15 +12,25 @@ from typing import (
     cast,
 )
 
+import temporalio.api.common.v1
 import temporalio.api.enums.v1
 import temporalio.api.history.v1
 from google.protobuf.json_format import MessageToDict
-from pydantic import BaseModel, ConfigDict, Field, PlainSerializer
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PlainSerializer,
+    PrivateAttr,
+    model_validator,
+)
+from temporalio.api.failure.v1 import Failure
 from temporalio.client import WorkflowExecution, WorkflowExecutionStatus
 from tracecat_ee.agent.types import AgentWorkflowID
 from tracecat_ee.agent.workflows.durable import AgentWorkflowArgs
 
 from tracecat.auth.types import Role
+from tracecat.dsl._converter import get_data_converter
 from tracecat.dsl.action import ScatterActionInput
 from tracecat.dsl.common import (
     AgentActionMemo,
@@ -44,29 +56,73 @@ from tracecat.identifiers import WorkflowExecutionID, WorkflowID
 from tracecat.identifiers.workflow import AnyWorkflowID, WorkflowUUID
 from tracecat.logger import logger
 from tracecat.sessions import Session
+from tracecat.storage.object import CollectionObject, StoredObject
 from tracecat.workflow.executions.common import (
     HISTORY_TO_WF_EVENT_TYPE,
+    UnreadableTemporalPayload,
     extract_first,
     is_action_activity,
+    is_unreadable_temporal_payload,
 )
 from tracecat.workflow.executions.enums import (
     ExecutionType,
     TriggerType,
     WorkflowEventType,
     WorkflowExecutionEventStatus,
+    WorkflowExecutionStatusLiteral,
 )
 from tracecat.workflow.management.schemas import GetWorkflowDefinitionActivityInputs
 
-WorkflowExecutionStatusLiteral = Literal[
-    "RUNNING",
-    "COMPLETED",
-    "FAILED",
-    "CANCELED",
-    "TERMINATED",
-    "CONTINUED_AS_NEW",
-    "TIMED_OUT",
-]
-"""Mapped literal types for workflow execution statuses."""
+_ERROR_MESSAGE_MAX_LENGTH = 2048
+_SENSITIVE_ERROR_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]+"),
+        r"\1 [REDACTED]",
+    ),
+    (
+        re.compile(
+            r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|passwd|secret)=([^&\s]+)"
+        ),
+        r"\1=[REDACTED]",
+    ),
+    (
+        re.compile(r"(?i)(authorization:\s*(?:basic|bearer)\s+)[^\s,;]+"),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(r"(?i)(://[^/\s:@]+:)([^@\s/]+)@"),
+        r"\1[REDACTED]@",
+    ),
+)
+
+DEFAULT_CHILD_WORKFLOW_ACTION_REF = "Unknown Child Workflow"
+DEFAULT_AGENT_ACTION_REF = "unknown_agent_action"
+
+
+async def _child_workflow_memo_from_temporal_or_default(
+    memo: temporalio.api.common.v1.Memo,
+) -> ChildWorkflowMemo:
+    try:
+        return await ChildWorkflowMemo.from_temporal(memo)
+    except Exception as e:
+        logger.warning("Error parsing child workflow memo", error=e)
+        return ChildWorkflowMemo(
+            action_ref=DEFAULT_CHILD_WORKFLOW_ACTION_REF,
+            mask_output=True,
+        )
+
+
+async def _agent_action_memo_from_temporal_or_default(
+    memo: temporalio.api.common.v1.Memo,
+) -> AgentActionMemo:
+    try:
+        return await AgentActionMemo.from_temporal(memo)
+    except Exception as e:
+        logger.warning("Error parsing agent action memo", error=e)
+        return AgentActionMemo(
+            action_ref=DEFAULT_AGENT_ACTION_REF,
+            mask_output=True,
+        )
 
 
 class WorkflowExecutionBase(BaseModel):
@@ -124,6 +180,50 @@ class WorkflowExecutionReadMinimal(WorkflowExecutionBase):
         )
 
 
+class WorkflowRunReadMinimal(WorkflowExecutionReadMinimal):
+    workflow_id: str | None = Field(
+        default=None,
+        description="Short workflow ID parsed from workflow execution ID.",
+    )
+    workflow_title: str | None = Field(
+        default=None,
+        description="Workflow title from workspace metadata when available.",
+    )
+    workflow_alias: str | None = Field(
+        default=None,
+        description=(
+            "Workflow alias from workspace metadata or execution search attributes."
+        ),
+    )
+
+    @staticmethod
+    def from_dataclass(
+        execution: WorkflowExecution,
+        *,
+        workflow_id: str | None = None,
+        workflow_title: str | None = None,
+        workflow_alias: str | None = None,
+    ) -> WorkflowRunReadMinimal:
+        base = WorkflowExecutionReadMinimal.from_dataclass(execution)
+        return WorkflowRunReadMinimal(
+            id=base.id,
+            run_id=base.run_id,
+            start_time=base.start_time,
+            execution_time=base.execution_time,
+            close_time=base.close_time,
+            status=base.status,
+            workflow_type=base.workflow_type,
+            task_queue=base.task_queue,
+            history_length=base.history_length,
+            parent_wf_exec_id=base.parent_wf_exec_id,
+            trigger_type=base.trigger_type,
+            execution_type=base.execution_type,
+            workflow_id=workflow_id,
+            workflow_title=workflow_title,
+            workflow_alias=workflow_alias,
+        )
+
+
 class WorkflowExecutionRead(WorkflowExecutionBase):
     events: list[WorkflowExecutionEvent] = Field(
         ..., description="The events in the workflow execution"
@@ -146,6 +246,131 @@ class WorkflowExecutionReadCompact[TInput: Any, TResult: Any, TSessionEvent: Any
     )
 
 
+class WorkflowExecutionObjectField(StrEnum):
+    ACTION_RESULT = "action_result"
+
+
+class WorkflowExecutionObjectRequest(BaseModel):
+    event_id: int = Field(..., ge=1, description="Temporal history event ID")
+    field: WorkflowExecutionObjectField = Field(
+        default=WorkflowExecutionObjectField.ACTION_RESULT
+    )
+    collection_index: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Optional index into a CollectionObject result. "
+            "When omitted, operates on the top-level object result."
+        ),
+    )
+
+
+class WorkflowExecutionCollectionPageRequest(BaseModel):
+    event_id: int = Field(..., ge=1, description="Temporal history event ID")
+    field: WorkflowExecutionObjectField = Field(
+        default=WorkflowExecutionObjectField.ACTION_RESULT
+    )
+    offset: int = Field(default=0, ge=0, description="Page start index (0-indexed)")
+    limit: int = Field(
+        default=25,
+        ge=1,
+        le=100,
+        description="Maximum number of items to return",
+    )
+
+
+class WorkflowExecutionCollectionPageItemKind(StrEnum):
+    STORED_OBJECT_REF = "stored_object_ref"
+    INLINE_VALUE = "inline_value"
+
+
+class WorkflowExecutionCollectionPageItem(BaseModel):
+    index: int = Field(..., ge=0, description="Collection index for this item")
+    kind: WorkflowExecutionCollectionPageItemKind = Field(
+        ..., description="Descriptor type for this collection page item"
+    )
+    stored: StoredObject | None = Field(
+        default=None,
+        description="StoredObject descriptor when kind is stored_object_ref",
+    )
+    value_preview: str | None = Field(
+        default=None,
+        description="UTF-8 preview of serialized inline value when kind is inline_value",
+    )
+    value_size_bytes: int | None = Field(
+        default=None,
+        ge=0,
+        description="Serialized inline value size in bytes when kind is inline_value",
+    )
+    truncated: bool = Field(
+        default=False,
+        description="Whether value_preview was truncated",
+    )
+
+    @model_validator(mode="after")
+    def validate_kind_fields(self) -> WorkflowExecutionCollectionPageItem:
+        if self.kind == WorkflowExecutionCollectionPageItemKind.STORED_OBJECT_REF:
+            if self.stored is None:
+                raise ValueError(
+                    "`stored` is required when kind is `stored_object_ref`"
+                )
+            if self.value_preview is not None or self.value_size_bytes is not None:
+                raise ValueError(
+                    "`value_preview` and `value_size_bytes` must be omitted when kind is `stored_object_ref`"
+                )
+            return self
+
+        if self.stored is not None:
+            raise ValueError("`stored` must be omitted when kind is `inline_value`")
+        if self.value_preview is None or self.value_size_bytes is None:
+            raise ValueError(
+                "`value_preview` and `value_size_bytes` are required when kind is `inline_value`"
+            )
+        return self
+
+
+class WorkflowExecutionCollectionPageResponse(BaseModel):
+    collection: CollectionObject = Field(
+        ..., description="Collection metadata for the requested result"
+    )
+    offset: int = Field(..., ge=0, description="Requested page offset")
+    limit: int = Field(..., ge=1, description="Requested page size")
+    next_offset: int | None = Field(
+        default=None,
+        ge=0,
+        description="Offset to use for next page, or null if no more items",
+    )
+    items: list[WorkflowExecutionCollectionPageItem] = Field(
+        default_factory=list,
+        description="Collection page descriptors",
+    )
+
+
+class WorkflowExecutionObjectDownloadResponse(BaseModel):
+    download_url: str = Field(..., description="Pre-signed download URL")
+    file_name: str = Field(..., description="Suggested file name")
+    content_type: str = Field(..., description="MIME type of the object")
+    size_bytes: int = Field(..., ge=0, description="Object size in bytes")
+    expires_in_seconds: int = Field(
+        ..., ge=1, description="Presigned URL expiry in seconds"
+    )
+
+
+class WorkflowExecutionObjectPreviewResponse(BaseModel):
+    content: str = Field(..., description="Preview text content")
+    content_type: str = Field(..., description="MIME type of the object")
+    size_bytes: int = Field(..., ge=0, description="Total object size in bytes")
+    preview_bytes: int = Field(
+        ..., ge=0, description="Number of bytes used for preview"
+    )
+    truncated: bool = Field(
+        ..., description="Whether preview is truncated due to size limits"
+    )
+    encoding: Literal["utf-8", "unknown"] = Field(
+        ..., description="Encoding used to decode preview text"
+    )
+
+
 def destructure_slugified_namespace(s: str, delimiter: str = "__") -> tuple[str, str]:
     *stem, leaf = s.split(delimiter)
     return (".".join(stem), leaf)
@@ -158,10 +383,13 @@ EventInput = (
     | InteractionResult
     | InteractionInput
     | AgentWorkflowArgs
+    | UnreadableTemporalPayload
 )
 
 
 class EventGroup[T: EventInput](BaseModel):
+    _mask_output: bool = PrivateAttr(default=False)
+
     event_id: int
     udf_namespace: str
     udf_name: str
@@ -178,6 +406,13 @@ class EventGroup[T: EventInput](BaseModel):
     join_strategy: JoinStrategy = JoinStrategy.ALL
     related_wf_exec_id: WorkflowExecutionID | AgentWorkflowID | None = None
 
+    @property
+    def should_mask_output(self) -> bool:
+        return self._mask_output
+
+    def set_mask_output(self, mask_output: bool) -> None:
+        self._mask_output = mask_output
+
     @staticmethod
     async def from_scheduled_activity(
         event: temporalio.api.history.v1.HistoryEvent,
@@ -192,6 +427,16 @@ class EventGroup[T: EventInput](BaseModel):
         activity_input_data = await extract_first(attrs.input)
 
         act_type = attrs.activity_type.name
+        if is_unreadable_temporal_payload(activity_input_data):
+            return EventGroup(
+                event_id=event.event_id,
+                udf_namespace="temporal",
+                udf_name=act_type,
+                udf_key=act_type,
+                action_ref=attrs.activity_id,
+                action_input=cast(EventInput, activity_input_data),
+            )
+
         # Handle specific activity types we care about
         if act_type == "get_workflow_definition_activity":
             action_input = GetWorkflowDefinitionActivityInputs(**activity_input_data)
@@ -214,7 +459,7 @@ class EventGroup[T: EventInput](BaseModel):
         namespace, task_name = destructure_slugified_namespace(
             task.action, delimiter="."
         )
-        return EventGroup(
+        group = EventGroup(
             event_id=event.event_id,
             udf_namespace=namespace,
             udf_name=task_name,
@@ -228,11 +473,13 @@ class EventGroup[T: EventInput](BaseModel):
             start_delay=task.start_delay,
             join_strategy=task.join_strategy,
         )
+        group.set_mask_output(task.mask_output)
+        return group
 
     @staticmethod
     async def from_initiated_child_workflow(
         event: temporalio.api.history.v1.HistoryEvent,
-    ) -> EventGroup[DSLRunArgs | AgentWorkflowArgs]:
+    ) -> EventGroup[EventInput]:
         if (
             event.event_type
             != temporalio.api.enums.v1.EventType.EVENT_TYPE_START_CHILD_WORKFLOW_EXECUTION_INITIATED
@@ -244,7 +491,21 @@ class EventGroup[T: EventInput](BaseModel):
         match attrs.workflow_type.name:
             case "DSLWorkflow":
                 wf_exec_id: WorkflowExecutionID = attrs.workflow_id
+                memo = await _child_workflow_memo_from_temporal_or_default(attrs.memo)
                 input = await extract_first(attrs.input)
+                if is_unreadable_temporal_payload(input):
+                    child_group = EventGroup(
+                        event_id=event.event_id,
+                        udf_namespace="core.workflow",
+                        udf_name="execute",
+                        udf_key="core.workflow.execute",
+                        action_ref=None,
+                        action_input=cast(EventInput, input),
+                        related_wf_exec_id=wf_exec_id,
+                    )
+                    child_group.set_mask_output(memo.mask_output)
+                    return child_group
+
                 dsl_run_args = DSLRunArgs(**input)
                 # Create an event group
 
@@ -256,7 +517,7 @@ class EventGroup[T: EventInput](BaseModel):
                     action_description = None
 
                 wf_id = WorkflowUUID.new(dsl_run_args.wf_id)
-                return EventGroup(
+                child_group: EventGroup[EventInput] = EventGroup(
                     event_id=event.event_id,
                     udf_namespace="core.workflow",
                     udf_name="execute",
@@ -265,15 +526,34 @@ class EventGroup[T: EventInput](BaseModel):
                     action_ref=None,
                     action_title=action_title,
                     action_description=action_description,
-                    action_input=dsl_run_args,
+                    action_input=cast(EventInput, dsl_run_args),
                     related_wf_exec_id=wf_exec_id,
                 )
+                child_group.set_mask_output(memo.mask_output)
+                return child_group
             case "DurableAgentWorkflow":
                 agent_wf_id = AgentWorkflowID.from_workflow_id(attrs.workflow_id)
+                memo = await _agent_action_memo_from_temporal_or_default(attrs.memo)
                 input = await extract_first(attrs.input)
-                agent_run_args = AgentWorkflowArgs(**input)
                 namespace, name = PlatformAction.AI_AGENT.value.split(".", 1)
-                return EventGroup(
+                if is_unreadable_temporal_payload(input):
+                    agent_group = EventGroup(
+                        event_id=event.event_id,
+                        udf_namespace=namespace,
+                        udf_name=name,
+                        udf_key=PlatformAction.AI_AGENT.value,
+                        action_id=agent_wf_id,
+                        action_ref=None,
+                        action_title="AI Agent",
+                        action_description="AI Agent",
+                        action_input=cast(EventInput, input),
+                        related_wf_exec_id=agent_wf_id,
+                    )
+                    agent_group.set_mask_output(memo.mask_output)
+                    return agent_group
+
+                agent_run_args = AgentWorkflowArgs(**input)
+                agent_group: EventGroup[EventInput] = EventGroup(
                     event_id=event.event_id,
                     udf_namespace=namespace,
                     udf_name=name,
@@ -282,16 +562,18 @@ class EventGroup[T: EventInput](BaseModel):
                     action_ref=None,
                     action_title="AI Agent",
                     action_description="AI Agent",
-                    action_input=agent_run_args,
+                    action_input=cast(EventInput, agent_run_args),
                     related_wf_exec_id=agent_wf_id,
                 )
+                agent_group.set_mask_output(memo.mask_output)
+                return agent_group
             case _:
                 raise ValueError("Event is not a child workflow initiated event.")
 
     @staticmethod
     async def from_accepted_workflow_update(
         event: temporalio.api.history.v1.HistoryEvent,
-    ) -> EventGroup[InteractionInput]:
+    ) -> EventGroup[InteractionInput | UnreadableTemporalPayload]:
         if (
             event.event_type
             != temporalio.api.enums.v1.EventType.EVENT_TYPE_WORKFLOW_EXECUTION_UPDATE_ACCEPTED
@@ -301,7 +583,16 @@ class EventGroup[T: EventInput](BaseModel):
 
         attrs = event.workflow_execution_update_accepted_event_attributes
         input = await extract_first(attrs.accepted_request.input.args)
-        group = EventGroup(
+        if is_unreadable_temporal_payload(input):
+            return EventGroup(
+                event_id=event.event_id,
+                udf_namespace="core.interact",
+                udf_name="response",
+                udf_key="core.interact.response",
+                action_input=input,
+            )
+
+        group: EventGroup[InteractionInput | UnreadableTemporalPayload] = EventGroup(
             event_id=event.event_id,
             udf_namespace="core.interact",
             udf_name="response",
@@ -317,10 +608,113 @@ class EventGroup[T: EventInput](BaseModel):
 class EventFailure(BaseModel):
     message: str
     cause: dict[str, Any] | None = None
+    root_cause_message: str | None = None
 
     @staticmethod
-    def from_history_event(
+    def _has_encoded_attributes(failure: Failure) -> bool:
+        current: Failure | None = failure
+        while current is not None:
+            if current.HasField("encoded_attributes"):
+                return True
+            current = current.cause if current.HasField("cause") else None
+        return False
+
+    @staticmethod
+    async def _decode_failure_exception(failure: Any) -> BaseException | None:
+        if not isinstance(failure, Failure) or not EventFailure._has_encoded_attributes(
+            failure
+        ):
+            return None
+
+        decoded_failure = Failure()
+        decoded_failure.CopyFrom(failure)
+        try:
+            return await get_data_converter(compression_enabled=False).decode_failure(
+                decoded_failure
+            )
+        except Exception as e:
+            logger.warning("Failed to decode Temporal failure attributes", error=e)
+            return None
+
+    @staticmethod
+    def _exception_message(error: BaseException | None) -> str | None:
+        if error is None:
+            return None
+
+        message = getattr(error, "message", None)
+        if isinstance(message, str) and message.strip():
+            return message
+
+        fallback = str(error)
+        return fallback if fallback.strip() else None
+
+    @staticmethod
+    def _exception_root_cause_message(error: BaseException | None) -> str | None:
+        if error is None:
+            return None
+
+        root_message: str | None = None
+        current = error.__cause__
+        seen: set[int] = set()
+        while current is not None:
+            current_id = id(current)
+            if current_id in seen:
+                break
+            seen.add(current_id)
+
+            if message := EventFailure._exception_message(current):
+                root_message = message
+            current = current.__cause__
+        return root_message
+
+    @staticmethod
+    def extract_root_cause_message(cause: dict[str, Any] | None) -> str | None:
+        """Extract the deepest non-empty message from nested Temporal failure causes."""
+        if not cause:
+            return None
+
+        root_message: str | None = None
+        current: dict[str, Any] | None = cause
+        seen: set[int] = set()
+        # Termination argument:
+        # - Each non-breaking iteration adds a new object id to `seen`.
+        # - If a dict repeats (cycle), we break on the `seen` check.
+        # - If `cause` is missing or not a dict, we break.
+        # Therefore the loop cannot run indefinitely.
+        while current is not None:
+            current_id = id(current)
+            if current_id in seen:
+                break
+            seen.add(current_id)
+
+            message = current.get("message")
+            if isinstance(message, str) and message.strip():
+                root_message = message
+
+            nested_cause = current.get("cause")
+            if not isinstance(nested_cause, dict):
+                break
+            current = nested_cause
+
+        return root_message
+
+    @staticmethod
+    def sanitize_error_text(text: str | None) -> str | None:
+        if text is None:
+            return None
+
+        sanitized = text
+        for pattern, replacement in _SENSITIVE_ERROR_PATTERNS:
+            sanitized = pattern.sub(replacement, sanitized)
+        if len(sanitized) > _ERROR_MESSAGE_MAX_LENGTH:
+            return f"{sanitized[:_ERROR_MESSAGE_MAX_LENGTH]}...[truncated]"
+        return sanitized
+
+    @staticmethod
+    async def from_history_event(
         event: temporalio.api.history.v1.HistoryEvent,
+        *,
+        include_raw_cause: bool = False,
     ) -> EventFailure:
         match event.event_type:
             case temporalio.api.enums.v1.EventType.EVENT_TYPE_ACTIVITY_TASK_FAILED:
@@ -334,9 +728,18 @@ class EventFailure(BaseModel):
             case _:
                 raise ValueError("Event type not supported for failure extraction.")
 
+        decoded_error = await EventFailure._decode_failure_exception(failure)
+        cause = MessageToDict(failure.cause) if failure.HasField("cause") else None
+        root_cause_message = EventFailure._exception_root_cause_message(
+            decoded_error
+        ) or EventFailure.extract_root_cause_message(cause)
+        message = EventFailure._exception_message(decoded_error) or getattr(
+            failure, "message", ""
+        )
         return EventFailure(
-            message=failure.message,
-            cause=MessageToDict(failure.cause) if failure.cause is not None else None,
+            message=EventFailure.sanitize_error_text(message) or "",
+            cause=cause if include_raw_cause else None,
+            root_cause_message=EventFailure.sanitize_error_text(root_cause_message),
         )
 
 
@@ -362,6 +765,8 @@ class WorkflowExecutionEventCompact[TInput: Any, TResult: Any, TSessionEvent: An
 ):
     """A compact representation of a workflow execution event."""
 
+    _mask_output: bool = PrivateAttr(default=False)
+
     source_event_id: int
     """The event ID of the source event."""
     schedule_time: datetime
@@ -380,9 +785,21 @@ class WorkflowExecutionEventCompact[TInput: Any, TResult: Any, TSessionEvent: An
     child_wf_exec_id: WorkflowExecutionID | None = None
     child_wf_count: int = 0
     loop_index: int | None = None
+    """Loop index for `for_each` child workflow executions."""
+    while_iteration: int | None = None
+    """Iteration index for `core.loop.start` do-while control actions."""
+    while_continue: bool | None = None
+    """Continue decision for `core.loop.end` do-while control actions."""
     child_wf_wait_strategy: WaitStrategy | None = None
     # SSE streaming for agents
     session: Session[TSessionEvent] | None = None
+
+    @property
+    def should_mask_output(self) -> bool:
+        return self._mask_output
+
+    def set_mask_output(self, mask_output: bool) -> None:
+        self._mask_output = mask_output
 
     @staticmethod
     async def from_source_event(
@@ -421,6 +838,19 @@ class WorkflowExecutionEventCompact[TInput: Any, TResult: Any, TSessionEvent: An
         activity_input_data = await extract_first(attrs.input)
 
         act_type = attrs.activity_type.name
+        if is_unreadable_temporal_payload(activity_input_data):
+            return WorkflowExecutionEventCompact(
+                source_event_id=event.event_id,
+                schedule_time=event.event_time.ToDatetime(UTC),
+                curr_event_type=HISTORY_TO_WF_EVENT_TYPE[event.event_type],
+                status=WorkflowExecutionEventStatus.SCHEDULED,
+                action_name=act_type,
+                action_ref=attrs.activity_id,
+                action_input=activity_input_data,
+                stream_id=ROOT_STREAM,
+                session=None,
+            )
+
         # Only parse activities that use action schemas
         if not is_action_activity(act_type):
             logger.trace("Skipping non-action activity", act_type=act_type)
@@ -438,7 +868,7 @@ class WorkflowExecutionEventCompact[TInput: Any, TResult: Any, TSessionEvent: An
                 logger.debug("Scatter input task is None", event_id=event.event_id)
                 return None
 
-            return WorkflowExecutionEventCompact(
+            compact_event = WorkflowExecutionEventCompact(
                 source_event_id=event.event_id,
                 schedule_time=event.event_time.ToDatetime(UTC),
                 curr_event_type=HISTORY_TO_WF_EVENT_TYPE[event.event_type],
@@ -449,6 +879,8 @@ class WorkflowExecutionEventCompact[TInput: Any, TResult: Any, TSessionEvent: An
                 stream_id=scatter_input.stream_id or ROOT_STREAM,
                 session=None,
             )
+            compact_event.set_mask_output(task.mask_output)
+            return compact_event
 
         # Handle RunActionInput for other action activities
         try:
@@ -465,7 +897,7 @@ class WorkflowExecutionEventCompact[TInput: Any, TResult: Any, TSessionEvent: An
         if action_input.session_id is not None:
             session = Session(id=action_input.session_id)  # No events
 
-        return WorkflowExecutionEventCompact(
+        compact_event = WorkflowExecutionEventCompact(
             source_event_id=event.event_id,
             schedule_time=event.event_time.ToDatetime(UTC),
             curr_event_type=HISTORY_TO_WF_EVENT_TYPE[event.event_type],
@@ -476,6 +908,8 @@ class WorkflowExecutionEventCompact[TInput: Any, TResult: Any, TSessionEvent: An
             stream_id=action_input.stream_id,
             session=session,
         )
+        compact_event.set_mask_output(task.mask_output)
+        return compact_event
 
     @staticmethod
     async def from_initiated_child_workflow(
@@ -499,11 +933,7 @@ class WorkflowExecutionEventCompact[TInput: Any, TResult: Any, TSessionEvent: An
         wf_exec_id: WorkflowExecutionID = attrs.workflow_id
         match attrs.workflow_type.name:
             case "DSLWorkflow":
-                try:
-                    memo = ChildWorkflowMemo.from_temporal(attrs.memo)
-                except Exception as e:
-                    logger.error("Error parsing child workflow memo", error=e)
-                    raise e
+                memo = await _child_workflow_memo_from_temporal_or_default(attrs.memo)
 
                 if (
                     attrs.parent_close_policy
@@ -521,9 +951,26 @@ class WorkflowExecutionEventCompact[TInput: Any, TResult: Any, TSessionEvent: An
                 )
 
                 input_data = await extract_first(attrs.input)
+                if is_unreadable_temporal_payload(input_data):
+                    compact_event = WorkflowExecutionEventCompact(
+                        source_event_id=event.event_id,
+                        schedule_time=event.event_time.ToDatetime(UTC),
+                        curr_event_type=HISTORY_TO_WF_EVENT_TYPE[event.event_type],
+                        status=status,
+                        action_name=PlatformAction.CHILD_WORKFLOW_EXECUTE.value,
+                        action_ref=memo.action_ref,
+                        action_input=input_data,
+                        child_wf_exec_id=wf_exec_id,
+                        loop_index=memo.loop_index,
+                        child_wf_wait_strategy=memo.wait_strategy,
+                        stream_id=memo.stream_id,
+                    )
+                    compact_event.set_mask_output(memo.mask_output)
+                    return compact_event
+
                 dsl_run_args = DSLRunArgs(**input_data)
 
-                return WorkflowExecutionEventCompact(
+                compact_event = WorkflowExecutionEventCompact(
                     source_event_id=event.event_id,
                     schedule_time=event.event_time.ToDatetime(UTC),
                     curr_event_type=HISTORY_TO_WF_EVENT_TYPE[event.event_type],
@@ -536,20 +983,35 @@ class WorkflowExecutionEventCompact[TInput: Any, TResult: Any, TSessionEvent: An
                     child_wf_wait_strategy=memo.wait_strategy,
                     stream_id=memo.stream_id,
                 )
+                compact_event.set_mask_output(memo.mask_output)
+                return compact_event
             case "DurableAgentWorkflow":
-                try:
-                    memo = AgentActionMemo.from_temporal(attrs.memo)
-                except Exception as e:
-                    logger.error("Error parsing agent action memo", error=e)
-                    raise e
+                memo = await _agent_action_memo_from_temporal_or_default(attrs.memo)
 
                 input_data = await extract_first(attrs.input)
+                if is_unreadable_temporal_payload(input_data):
+                    compact_event = WorkflowExecutionEventCompact(
+                        source_event_id=event.event_id,
+                        schedule_time=event.event_time.ToDatetime(UTC),
+                        curr_event_type=HISTORY_TO_WF_EVENT_TYPE[event.event_type],
+                        status=WorkflowExecutionEventStatus.SCHEDULED,
+                        action_name=PlatformAction.AI_AGENT.value,
+                        action_ref=memo.action_ref,
+                        action_input=input_data,
+                        child_wf_exec_id=None,
+                        loop_index=memo.loop_index,
+                        stream_id=memo.stream_id,
+                        session=None,
+                    )
+                    compact_event.set_mask_output(memo.mask_output)
+                    return compact_event
+
                 agent_run_args = AgentWorkflowArgs(**input_data)
                 session = None
                 session_id = agent_run_args.agent_args.session_id
                 if session_id is not None:
                     session = Session(id=session_id)
-                return WorkflowExecutionEventCompact(
+                compact_event = WorkflowExecutionEventCompact(
                     source_event_id=event.event_id,
                     schedule_time=event.event_time.ToDatetime(UTC),
                     curr_event_type=HISTORY_TO_WF_EVENT_TYPE[event.event_type],
@@ -562,6 +1024,8 @@ class WorkflowExecutionEventCompact[TInput: Any, TResult: Any, TSessionEvent: An
                     stream_id=memo.stream_id,
                     session=session,
                 )
+                compact_event.set_mask_output(memo.mask_output)
+                return compact_event
             case _:
                 raise ValueError(
                     f"Unexpected child workflow type: {attrs.workflow_type.name}"
@@ -579,6 +1043,17 @@ class WorkflowExecutionEventCompact[TInput: Any, TResult: Any, TSessionEvent: An
 
         attrs = event.workflow_execution_update_accepted_event_attributes
         input_data = await extract_first(attrs.accepted_request.input.args)
+        if is_unreadable_temporal_payload(input_data):
+            return WorkflowExecutionEventCompact(
+                source_event_id=event.event_id,
+                schedule_time=event.event_time.ToDatetime(UTC),
+                curr_event_type=HISTORY_TO_WF_EVENT_TYPE[event.event_type],
+                status=WorkflowExecutionEventStatus.SCHEDULED,
+                action_name="core.interact.response",
+                action_ref="core.interact.response",
+                action_input=input_data,
+            )
+
         signal_input = InteractionInput(**input_data)
         return WorkflowExecutionEventCompact(
             source_event_id=event.event_id,
@@ -614,11 +1089,92 @@ class WorkflowExecutionCreateResponse(TypedDict):
 
 class WorkflowDispatchResponse(TypedDict):
     wf_id: WorkflowID
-    result: Any
+    result: StoredObject
 
 
 class WorkflowExecutionTerminate(BaseModel):
     reason: str | None = None
+
+
+class WorkflowExecutionRelationFilter(StrEnum):
+    ALL = "all"
+    ROOT = "root"
+    CHILD = "child"
+
+
+class WorkflowExecutionStatusFilterMode(StrEnum):
+    INCLUDE = "include"
+    EXCLUDE = "exclude"
+
+
+class WorkflowExecutionResetReapplyType(StrEnum):
+    ALL_ELIGIBLE = "all_eligible"
+    SIGNAL_ONLY = "signal_only"
+    NONE = "none"
+
+
+class WorkflowExecutionResetPointRead(BaseModel):
+    event_id: int = Field(..., ge=1)
+    event_time: datetime
+    event_type: str
+    label: str
+    is_start: bool = Field(
+        default=False,
+        description="True when this point maps to the earliest resettable point.",
+    )
+    is_resettable: bool = Field(
+        default=False,
+        description="Whether the event can be used directly as a reset target.",
+    )
+
+
+class WorkflowExecutionResetRequest(BaseModel):
+    event_id: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Temporal history event id to reset from. If omitted, reset uses start."
+        ),
+    )
+    reason: str | None = Field(default=None, max_length=1024)
+    reapply_type: WorkflowExecutionResetReapplyType = Field(
+        default=WorkflowExecutionResetReapplyType.ALL_ELIGIBLE
+    )
+
+
+class WorkflowExecutionResetResponse(BaseModel):
+    execution_id: WorkflowExecutionID
+    new_run_id: str
+
+
+class WorkflowExecutionBulkResetRequest(BaseModel):
+    execution_ids: list[WorkflowExecutionID] = Field(
+        default_factory=list,
+        min_length=1,
+        max_length=100,
+    )
+    event_id: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Temporal history event id to reset from. If omitted, reset uses start."
+        ),
+    )
+    reason: str | None = Field(default=None, max_length=1024)
+    reapply_type: WorkflowExecutionResetReapplyType = Field(
+        default=WorkflowExecutionResetReapplyType.ALL_ELIGIBLE
+    )
+
+
+class WorkflowExecutionBulkResetItemResult(BaseModel):
+    execution_id: WorkflowExecutionID
+    ok: bool = Field(default=False)
+    new_run_id: str | None = Field(default=None)
+    error: str | None = Field(default=None)
+
+
+class WorkflowExecutionBulkResetResponse(BaseModel):
+    results: list[WorkflowExecutionBulkResetItemResult] = Field(default_factory=list)
 
 
 class ReceiveInteractionResponse(BaseModel):

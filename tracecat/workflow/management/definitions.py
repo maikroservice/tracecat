@@ -1,11 +1,18 @@
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import case, select
+from sqlalchemy.orm import selectinload
 from temporalio import activity
+from temporalio.exceptions import ApplicationError
 
-from tracecat.db.models import WorkflowDefinition
+from tracecat.authz.controls import require_scope
+from tracecat.db.models import Workflow, WorkflowDefinition
 from tracecat.dsl.common import DSLInput
-from tracecat.exceptions import TracecatException
+from tracecat.exceptions import (
+    BuiltinRegistryHasNoSelectionError,
+    EntitlementRequired,
+    TracecatValidationError,
+)
 from tracecat.identifiers.workflow import WorkflowID
 from tracecat.logger import logger
 from tracecat.registry.lock.service import RegistryLockService
@@ -22,17 +29,38 @@ class WorkflowDefinitionsService(BaseWorkspaceService):
     service_name = "workflow_definitions"
 
     async def get_definition_by_workflow_id(
-        self, workflow_id: WorkflowID, *, version: int | None = None
+        self,
+        workflow_id: WorkflowID,
+        *,
+        version: int | None = None,
+        load_relationships: bool = True,
     ) -> WorkflowDefinition | None:
         statement = select(WorkflowDefinition).where(
             WorkflowDefinition.workspace_id == self.workspace_id,
             WorkflowDefinition.workflow_id == workflow_id,
         )
-        if version:
+        if load_relationships:
+            statement = statement.options(
+                selectinload(WorkflowDefinition.workflow).options(
+                    selectinload(Workflow.case_trigger),
+                    selectinload(Workflow.actions),
+                )
+            )
+        if version is not None:
             statement = statement.where(WorkflowDefinition.version == version)
         else:
-            # Get the latest version
-            statement = statement.order_by(WorkflowDefinition.version.desc())
+            current_version_sq = (
+                select(Workflow.version)
+                .where(
+                    Workflow.workspace_id == self.workspace_id,
+                    Workflow.id == workflow_id,
+                )
+                .scalar_subquery()
+            )
+            statement = statement.order_by(
+                case((WorkflowDefinition.version == current_version_sq, 0), else_=1),
+                WorkflowDefinition.version.desc(),
+            ).limit(1)
 
         result = await self.session.execute(statement)
         return result.scalars().first()
@@ -48,6 +76,47 @@ class WorkflowDefinitionsService(BaseWorkspaceService):
         result = await self.session.execute(statement)
         return list(result.scalars().all())
 
+    async def _create_workflow_definition(
+        self,
+        workflow_id: WorkflowID,
+        dsl: DSLInput,
+        *,
+        alias: str | None = None,
+        registry_lock: RegistryLock | None = None,
+        commit: bool = True,
+        require_initial: bool = False,
+    ) -> WorkflowDefinition:
+        statement = (
+            select(WorkflowDefinition)
+            .where(
+                WorkflowDefinition.workspace_id == self.workspace_id,
+                WorkflowDefinition.workflow_id == workflow_id,
+            )
+            .order_by(WorkflowDefinition.version.desc())
+        )
+        result = await self.session.execute(statement)
+        latest_defn = result.scalars().first()
+        if require_initial and latest_defn is not None:
+            raise TracecatValidationError("Initial workflow definition already exists")
+
+        version = latest_defn.version + 1 if latest_defn else 1
+        defn = WorkflowDefinition(
+            workspace_id=self.workspace_id,
+            workflow_id=workflow_id,
+            content=dsl.model_dump(exclude_unset=True),
+            version=version,
+            alias=alias,
+            registry_lock=registry_lock.model_dump() if registry_lock else None,
+        )
+        self.session.add(defn)
+        if commit:
+            await self.session.commit()
+        else:
+            await self.session.flush()
+        await self.session.refresh(defn)
+        return defn
+
+    @require_scope("workflow:update")
     async def create_workflow_definition(
         self,
         workflow_id: WorkflowID,
@@ -69,33 +138,33 @@ class WorkflowDefinitionsService(BaseWorkspaceService):
         Returns:
             The created WorkflowDefinition.
         """
-        statement = (
-            select(WorkflowDefinition)
-            .where(
-                WorkflowDefinition.workspace_id == self.workspace_id,
-                WorkflowDefinition.workflow_id == workflow_id,
-            )
-            .order_by(WorkflowDefinition.version.desc())
-        )
-        result = await self.session.execute(statement)
-        latest_defn = result.scalars().first()
-
-        version = latest_defn.version + 1 if latest_defn else 1
-        defn = WorkflowDefinition(
-            workspace_id=self.workspace_id,
-            workflow_id=workflow_id,
-            content=dsl.model_dump(exclude_unset=True),
-            version=version,
+        return await self._create_workflow_definition(
+            workflow_id,
+            dsl,
             alias=alias,
-            registry_lock=registry_lock.model_dump() if registry_lock else None,
+            registry_lock=registry_lock,
+            commit=commit,
         )
-        self.session.add(defn)
-        if commit:
-            await self.session.commit()
-        else:
-            await self.session.flush()
-        await self.session.refresh(defn)
-        return defn
+
+    @require_scope("workflow:create")
+    async def create_initial_workflow_definition(
+        self,
+        workflow_id: WorkflowID,
+        dsl: DSLInput,
+        *,
+        alias: str | None = None,
+        registry_lock: RegistryLock | None = None,
+        commit: bool = True,
+    ) -> WorkflowDefinition:
+        """Create the first committed definition for a newly created workflow."""
+        return await self._create_workflow_definition(
+            workflow_id,
+            dsl,
+            alias=alias,
+            registry_lock=registry_lock,
+            commit=commit,
+            require_initial=True,
+        )
 
 
 @activity.defn
@@ -109,7 +178,7 @@ async def get_workflow_definition_activity(
         if not defn:
             msg = f"Workflow definition not found for {input.workflow_id.short()}, version={input.version}"
             logger.error(msg)
-            raise TracecatException(msg)
+            raise ApplicationError(msg, non_retryable=True)
         dsl = DSLInput(**defn.content)
     # Convert from DB dict type to RegistryLock (JSONB deserializes to dict)
     registry_lock = (
@@ -127,8 +196,22 @@ async def resolve_registry_lock_activity(
     This activity is called at workflow start if no lock is provided,
     ensuring all trigger paths have a valid registry lock.
     """
-    async with RegistryLockService.with_session(role=input.role) as service:
-        lock = await service.resolve_lock_with_bindings(input.action_names)
+    try:
+        async with RegistryLockService.with_session(role=input.role) as service:
+            lock = await service.resolve_lock_with_bindings(input.action_names)
+    except BuiltinRegistryHasNoSelectionError as e:
+        raise ApplicationError(
+            str(e),
+            e.detail,
+            type=e.__class__.__name__,
+        ) from e
+    except EntitlementRequired as e:
+        raise ApplicationError(
+            str(e),
+            e.detail,
+            non_retryable=True,
+            type=e.__class__.__name__,
+        ) from e
     logger.info(
         "Resolved registry lock",
         num_origins=len(lock.origins),

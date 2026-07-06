@@ -1,13 +1,10 @@
-from __future__ import annotations
-
-from typing import Annotated, Any
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy.exc import IntegrityError
 
-from tracecat.auth.credentials import RoleACL
-from tracecat.auth.types import Role
-from tracecat.authz.enums import WorkspaceRole
+from tracecat.auth.dependencies import WorkspaceActorRouteRole
+from tracecat.authz.controls import require_scope
 from tracecat.db.dependencies import AsyncDBSession
 from tracecat.exceptions import TracecatNotFoundError
 from tracecat.identifiers import VariableID
@@ -23,31 +20,12 @@ from tracecat.variables.service import VariablesService
 
 router = APIRouter(prefix="/variables", tags=["variables"])
 
-WorkspaceUser = Annotated[
-    Role,
-    RoleACL(
-        allow_user=True,
-        allow_service=False,
-        require_workspace="yes",
-        require_workspace_roles=[WorkspaceRole.EDITOR, WorkspaceRole.ADMIN],
-    ),
-]
-
-WorkspaceAdminUser = Annotated[
-    Role,
-    RoleACL(
-        allow_user=True,
-        allow_service=False,
-        require_workspace="yes",
-        require_workspace_roles=WorkspaceRole.ADMIN,
-    ),
-]
-
 
 @router.get("/search", response_model=list[VariableRead])
+@require_scope("variable:read")
 async def search_variables(
     *,
-    role: WorkspaceUser,
+    role: WorkspaceActorRouteRole,
     session: AsyncDBSession,
     environment: str | None = Query(None),
     names: set[str] | None = Query(
@@ -70,9 +48,10 @@ async def search_variables(
 
 
 @router.get("", response_model=list[VariableReadMinimal])
+@require_scope("variable:read")
 async def list_variables(
     *,
-    role: WorkspaceUser,
+    role: WorkspaceActorRouteRole,
     session: AsyncDBSession,
     environment: str | None = Query(None),
 ) -> list[VariableReadMinimal]:
@@ -91,9 +70,10 @@ async def list_variables(
 
 
 @router.get("/{variable_name}", response_model=VariableRead)
+@require_scope("variable:read")
 async def get_variable_by_name(
     *,
-    role: WorkspaceAdminUser,
+    role: WorkspaceActorRouteRole,
     session: AsyncDBSession,
     variable_name: str,
     environment: str | None = Query(None),
@@ -111,9 +91,10 @@ async def get_variable_by_name(
 
 
 @router.post("", status_code=status.HTTP_201_CREATED, response_model=VariableRead)
+@require_scope("variable:create")
 async def create_variable(
     *,
-    role: WorkspaceAdminUser,
+    role: WorkspaceActorRouteRole,
     session: AsyncDBSession,
     params: VariableCreate,
 ) -> VariableRead:
@@ -130,9 +111,10 @@ async def create_variable(
 
 
 @router.post("/{variable_id}", response_model=VariableRead)
+@require_scope("variable:update")
 async def update_variable_by_id(
     *,
-    role: WorkspaceAdminUser,
+    role: WorkspaceActorRouteRole,
     session: AsyncDBSession,
     variable_id: VariableID,
     params: VariableUpdate,
@@ -155,9 +137,10 @@ async def update_variable_by_id(
 
 
 @router.delete("/{variable_id}", status_code=status.HTTP_204_NO_CONTENT)
+@require_scope("variable:delete")
 async def delete_variable_by_id(
     *,
-    role: WorkspaceAdminUser,
+    role: WorkspaceActorRouteRole,
     session: AsyncDBSession,
     variable_id: VariableID,
 ) -> None:

@@ -319,22 +319,27 @@ import {
   type VariableUpdate,
   type VcsGetGithubAppCredentialsStatusResponse,
   type VcsGetGithubAppManifestResponse,
-  type VcsGetGitlabTokenCredentialsStatusResponse,
+  type VcsGetGitlabCredentialsStatusResponse,
+  type VcsListGitlabWorkspaceConfigsResponse,
   type VcsSaveGithubAppCredentialsData,
   type VcsSaveGithubAppCredentialsResponse,
-  type VcsSaveGitlabTokenCredentialsData,
-  type VcsSaveGitlabTokenCredentialsResponse,
+  type VcsSaveGitlabCredentialsData,
+  type VcsSaveGitlabCredentialsResponse,
+  type VcsTestGitlabConnectionData,
+  type VcsTestGitlabConnectionResponse,
   variablesCreateVariable,
   variablesDeleteVariableById,
   variablesListVariables,
   variablesUpdateVariableById,
   vcsDeleteGithubAppCredentials,
-  vcsDeleteGitlabTokenCredentials,
+  vcsDeleteGitlabCredentials,
   vcsGetGithubAppCredentialsStatus,
   vcsGetGithubAppManifest,
-  vcsGetGitlabTokenCredentialsStatus,
+  vcsGetGitlabCredentialsStatus,
+  vcsListGitlabWorkspaceConfigs,
   vcsSaveGithubAppCredentials,
-  vcsSaveGitlabTokenCredentials,
+  vcsSaveGitlabCredentials,
+  vcsTestGitlabConnection,
   type WebhookUpdate,
   type WorkflowDirectoryItem,
   type WorkflowExecutionCreate,
@@ -2751,15 +2756,16 @@ export function useDeleteGitHubAppCredentials() {
   }
 }
 
-export function useGitLabTokenCredentialsStatus() {
+export function useGitLabCredentialsStatus() {
+  // Get GitLab credentials status (custom non-EE integration)
   const {
     data: credentialsStatus,
     isLoading: credentialsStatusIsLoading,
     error: credentialsStatusError,
     refetch: refetchCredentialsStatus,
-  } = useQuery<VcsGetGitlabTokenCredentialsStatusResponse>({
-    queryKey: ["gitlab-token-credentials-status"],
-    queryFn: async () => await vcsGetGitlabTokenCredentialsStatus(),
+  } = useQuery<VcsGetGitlabCredentialsStatusResponse>({
+    queryKey: ["gitlab-credentials-status"],
+    queryFn: async () => await vcsGetGitlabCredentialsStatus(),
   })
 
   return {
@@ -2770,47 +2776,42 @@ export function useGitLabTokenCredentialsStatus() {
   }
 }
 
-export function useGitLabTokenCredentials() {
+export function useGitLabCredentials() {
   const queryClient = useQueryClient()
 
+  // Save GitLab credentials mutation
   const saveCredentials = useMutation<
-    VcsSaveGitlabTokenCredentialsResponse,
+    VcsSaveGitlabCredentialsResponse,
     ApiError,
-    VcsSaveGitlabTokenCredentialsData["requestBody"]
+    VcsSaveGitlabCredentialsData["requestBody"]
   >({
     mutationFn: async (data) => {
-      return await vcsSaveGitlabTokenCredentials({ requestBody: data })
+      return await vcsSaveGitlabCredentials({ requestBody: data })
     },
     onSuccess: () => {
-      invalidateGitLabTokenCredentialQueries(queryClient)
+      invalidateGitLabCredentialQueries(queryClient)
+    },
+  })
+
+  // Delete GitLab credentials mutation
+  const deleteCredentials = useMutation<void, ApiError>({
+    mutationFn: async () => {
+      await vcsDeleteGitlabCredentials()
+    },
+    onSuccess: () => {
+      invalidateGitLabCredentialQueries(queryClient)
     },
   })
 
   return {
     saveCredentials,
-  }
-}
-
-export function useDeleteGitLabTokenCredentials() {
-  const queryClient = useQueryClient()
-
-  const deleteCredentials = useMutation<void, ApiError>({
-    mutationFn: async () => {
-      await vcsDeleteGitlabTokenCredentials()
-    },
-    onSuccess: () => {
-      invalidateGitLabTokenCredentialQueries(queryClient)
-    },
-  })
-
-  return {
     deleteCredentials,
   }
 }
 
-function invalidateGitLabTokenCredentialQueries(queryClient: QueryClient) {
+function invalidateGitLabCredentialQueries(queryClient: QueryClient) {
   queryClient.invalidateQueries({
-    queryKey: ["gitlab-token-credentials-status"],
+    queryKey: ["gitlab-credentials-status"],
   })
   queryClient.invalidateQueries({
     queryKey: ["workflow-sync-branches"],
@@ -2818,6 +2819,48 @@ function invalidateGitLabTokenCredentialQueries(queryClient: QueryClient) {
   queryClient.invalidateQueries({
     queryKey: ["repository_commits"],
   })
+}
+
+export function useGitLabTestConnection() {
+  const testConnection = useMutation<
+    VcsTestGitlabConnectionResponse,
+    ApiError,
+    VcsTestGitlabConnectionData["requestBody"]
+  >({
+    mutationFn: async (data) => {
+      return await vcsTestGitlabConnection({ requestBody: data })
+    },
+  })
+
+  return {
+    testConnection,
+    isTestingConnection: testConnection.isPending,
+    testConnectionError: testConnection.error,
+    testConnectionData: testConnection.data,
+  }
+}
+
+export type GitLabTestConnectionResponse = VcsTestGitlabConnectionResponse
+export type GitLabWorkspaceConfig = VcsListGitlabWorkspaceConfigsResponse[number]
+
+export function useGitLabWorkspaceConfigs() {
+  const {
+    data: workspaces,
+    error: workspacesError,
+    isLoading: workspacesIsLoading,
+    refetch: refetchWorkspaces,
+  } = useQuery<VcsListGitlabWorkspaceConfigsResponse>({
+    queryKey: ["gitlab-workspace-configs"],
+    queryFn: async () => await vcsListGitlabWorkspaceConfigs(),
+    staleTime: 2 * 60 * 1000, // 2 minutes
+  })
+
+  return {
+    workspaces,
+    workspacesError,
+    workspacesIsLoading,
+    refetchWorkspaces,
+  }
 }
 
 export function useOrgAgentSettings() {

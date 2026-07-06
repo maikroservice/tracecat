@@ -98,9 +98,19 @@ export function OrganizationSidebar({
       title: "Git sync",
       url: "/organization/vcs",
       icon: GitBranchIcon,
-      isActive: pathname?.includes("/organization/vcs"),
+      isActive:
+        pathname?.includes("/organization/vcs") &&
+        !pathname?.includes("/organization/vcs/gitlab"),
       visible: canViewSettings === true,
       locked: !gitSyncEnabled,
+    },
+    {
+      title: "GitLab workflow sync",
+      url: "/organization/vcs/gitlab",
+      icon: GitBranchIcon,
+      isActive: pathname?.includes("/organization/vcs/gitlab"),
+      visible: canViewSettings === true,
+      locked: false,
     },
     // MCP settings page not yet implemented — hidden until route exists
     // {

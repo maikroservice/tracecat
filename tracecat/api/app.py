@@ -170,6 +170,7 @@ from tracecat.tables.router import router as tables_router
 from tracecat.tags.router import router as tags_router
 from tracecat.variables.internal_router import router as internal_variables_router
 from tracecat.variables.router import router as variables_router
+from tracecat.vcs.gitlab.router import gitlab_org_router as gitlab_vcs_router
 from tracecat.vcs.router import org_router as vcs_router
 from tracecat.webhooks.router import router as webhook_router
 from tracecat.workflow.actions.router import router as workflow_actions_router
@@ -568,6 +569,8 @@ def create_app(**kwargs) -> FastAPI:
     app.include_router(mcp_oidc_router)
     app.include_router(feature_flags_router)
     app.include_router(vcs_router)
+    # Custom (non-EE) GitLab workflow sync - always available
+    app.include_router(gitlab_vcs_router)
     # RBAC routers - user scopes + role listing + user role assignments are always included (OSS)
     app.include_router(user_scopes_router)
     app.include_router(rbac_roles_read_router)

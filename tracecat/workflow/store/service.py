@@ -44,6 +44,20 @@ class WorkflowStoreService(BaseWorkspaceService):
             workspace_id=self.workspace_id,
         )
 
+        # Custom (non-EE) GitLab sync path: used when the workspace's git
+        # provider is GitLab and the fork's GitLab credentials are configured.
+        from tracecat.vcs.gitlab.sync import GitLabWorkflowSyncService
+
+        if gitlab_sync := await GitLabWorkflowSyncService.if_gitlab_workspace(
+            session=self.session, role=self.role
+        ):
+            return await gitlab_sync.publish_workflow(
+                workflow=workflow,
+                workflow_id=workflow_id,
+                dsl=dsl,
+                params=params,
+            )
+
         publish_message = params.message or f"Publish workflow: {dsl.title}"
         validated_branch: str
         validated_pr_base_branch: str | None = None

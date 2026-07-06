@@ -9,3 +9,4 @@ class SecretType(StrEnum):
     MTLS = "mtls"
     CA_CERT = "ca_cert"
     GITHUB_APP = "github_app"
+    GITLAB_TOKEN = "gitlab_token"

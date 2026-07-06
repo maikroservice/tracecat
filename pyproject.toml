@@ -59,6 +59,7 @@ dependencies = [
     "pydantic-extra-types==2.11.0",
     "pydantic==2.12.5",
     "pygithub==2.8.1",
+    "python-gitlab==8.0.0",
     "pysaml2==7.5.0",
     "python-slugify==8.0.4",
     "redis[hiredis]==7.1.0",

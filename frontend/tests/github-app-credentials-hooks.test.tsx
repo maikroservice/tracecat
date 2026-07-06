@@ -4,15 +4,14 @@ import type { ReactNode } from "react"
 import type { GitHubAppRepository } from "@/client"
 import {
   vcsDeleteGithubAppCredentials,
-  vcsDeleteGitlabTokenCredentials,
+  vcsDeleteGitlabCredentials,
   vcsSaveGithubAppCredentials,
-  vcsSaveGitlabTokenCredentials,
+  vcsSaveGitlabCredentials,
 } from "@/client"
 import {
   useDeleteGitHubAppCredentials,
-  useDeleteGitLabTokenCredentials,
   useGitHubAppCredentials,
-  useGitLabTokenCredentials,
+  useGitLabCredentials,
 } from "@/lib/hooks"
 
 jest.mock("@/client", () => {
@@ -20,9 +19,9 @@ jest.mock("@/client", () => {
   return {
     ...actual,
     vcsDeleteGithubAppCredentials: jest.fn(),
-    vcsDeleteGitlabTokenCredentials: jest.fn(),
+    vcsDeleteGitlabCredentials: jest.fn(),
     vcsSaveGithubAppCredentials: jest.fn(),
-    vcsSaveGitlabTokenCredentials: jest.fn(),
+    vcsSaveGitlabCredentials: jest.fn(),
   }
 })
 
@@ -35,13 +34,13 @@ const mockDeleteGitHubAppCredentials =
   vcsDeleteGithubAppCredentials as jest.MockedFunction<
     typeof vcsDeleteGithubAppCredentials
   >
-const mockSaveGitLabTokenCredentials =
-  vcsSaveGitlabTokenCredentials as jest.MockedFunction<
-    typeof vcsSaveGitlabTokenCredentials
+const mockSaveGitLabCredentials =
+  vcsSaveGitlabCredentials as jest.MockedFunction<
+    typeof vcsSaveGitlabCredentials
   >
-const mockDeleteGitLabTokenCredentials =
-  vcsDeleteGitlabTokenCredentials as jest.MockedFunction<
-    typeof vcsDeleteGitlabTokenCredentials
+const mockDeleteGitLabCredentials =
+  vcsDeleteGitlabCredentials as jest.MockedFunction<
+    typeof vcsDeleteGitlabCredentials
   >
 
 const cachedRepositories: GitHubAppRepository[] = [
@@ -76,12 +75,12 @@ describe("GitHub App credential hooks", () => {
       app_id: "123456",
     })
     mockDeleteGitHubAppCredentials.mockResolvedValue(undefined)
-    mockSaveGitLabTokenCredentials.mockResolvedValue({
-      message: "GitLab token credentials created successfully",
+    mockSaveGitLabCredentials.mockResolvedValue({
+      message: "GitLab credentials created successfully",
       action: "created",
-      base_url: "https://gitlab.example.test",
+      gitlab_url: "https://gitlab.example.test",
     })
-    mockDeleteGitLabTokenCredentials.mockResolvedValue(undefined)
+    mockDeleteGitLabCredentials.mockResolvedValue(undefined)
   })
 
   function wrapper({ children }: { children: ReactNode }) {
@@ -127,17 +126,17 @@ describe("GitHub App credential hooks", () => {
 
   it("invalidates GitLab credential-dependent repository queries when credentials are saved", async () => {
     const invalidateQueries = jest.spyOn(queryClient, "invalidateQueries")
-    const { result } = renderHook(() => useGitLabTokenCredentials(), {
+    const { result } = renderHook(() => useGitLabCredentials(), {
       wrapper,
     })
 
     await result.current.saveCredentials.mutateAsync({
-      base_url: "https://gitlab.example.test",
-      token: "token",
+      access_token: "token",
+      gitlab_url: "https://gitlab.example.test",
     })
 
     expect(invalidateQueries).toHaveBeenCalledWith({
-      queryKey: ["gitlab-token-credentials-status"],
+      queryKey: ["gitlab-credentials-status"],
     })
     expect(invalidateQueries).toHaveBeenCalledWith({
       queryKey: ["workflow-sync-branches"],
@@ -149,14 +148,14 @@ describe("GitHub App credential hooks", () => {
 
   it("invalidates GitLab credential-dependent repository queries when credentials are deleted", async () => {
     const invalidateQueries = jest.spyOn(queryClient, "invalidateQueries")
-    const { result } = renderHook(() => useDeleteGitLabTokenCredentials(), {
+    const { result } = renderHook(() => useGitLabCredentials(), {
       wrapper,
     })
 
     await result.current.deleteCredentials.mutateAsync()
 
     expect(invalidateQueries).toHaveBeenCalledWith({
-      queryKey: ["gitlab-token-credentials-status"],
+      queryKey: ["gitlab-credentials-status"],
     })
     expect(invalidateQueries).toHaveBeenCalledWith({
       queryKey: ["workflow-sync-branches"],

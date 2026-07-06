@@ -19,6 +19,7 @@ from tracecat.workspace_sync.enums import VcsProvider
 class WorkspaceSettings(TypedDict):
     git_provider: NotRequired[VcsProvider | None]
     git_repo_url: NotRequired[str | None]
+    git_branch: NotRequired[str | None]
     workflow_unlimited_timeout_enabled: NotRequired[bool | None]
     workflow_default_timeout_seconds: NotRequired[int | None]
     allowed_attachment_extensions: NotRequired[list[str] | None]
@@ -30,6 +31,7 @@ class WorkspaceSettings(TypedDict):
 class WorkspaceSettingsRead(Schema):
     git_provider: VcsProvider | None = None
     git_repo_url: str | None = None
+    git_branch: str | None = None
     workflow_unlimited_timeout_enabled: bool | None = None
     workflow_default_timeout_seconds: int | None = None
     allowed_attachment_extensions: list[str] | None = None
@@ -56,6 +58,7 @@ class WorkspaceSettingsRead(Schema):
 class WorkspaceSettingsUpdate(Schema):
     git_provider: VcsProvider | None = None
     git_repo_url: str | None = None
+    git_branch: str | None = None
     workflow_unlimited_timeout_enabled: bool | None = Field(
         default=None,
         description="Allow workflows to run indefinitely without timeout constraints. When enabled, individual workflow timeout settings are ignored.",

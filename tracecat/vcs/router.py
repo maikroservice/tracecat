@@ -340,4 +340,6 @@ async def get_gitlab_token_credentials_status(
 
 # Mount VCS sub-routers after all endpoints are defined.
 org_router.include_router(github_router)
-org_router.include_router(gitlab_router)
+# NOTE: The EE GitLab token endpoints are not mounted. The fork's custom
+# GitLab integration (tracecat.vcs.gitlab.router) is mounted from app.py
+# at the same paths instead.

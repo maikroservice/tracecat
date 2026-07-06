@@ -98,6 +98,7 @@ import { useRepositoryBranches } from "@/hooks/use-workspace-sync"
 import type { TracecatApiError } from "@/lib/errors"
 import {
   useCreateDraftWorkflowExecution,
+  useGitLabCredentialsStatus,
   useOrgAppSettings,
   useWorkflowManager,
 } from "@/lib/hooks"
@@ -140,6 +141,8 @@ export function BuilderNav() {
 
   const workspaceId = useWorkspaceId()
   const { workspace, workspaceLoading } = useWorkspaceDetails()
+  const { credentialsStatus: gitLabCredentialsStatus } =
+    useGitLabCredentialsStatus()
   const workflowTitle = workflow?.title ?? "Untitled workflow"
 
   // Track if there are pending workflow updates (e.g., title/description changes)
@@ -165,6 +168,20 @@ export function BuilderNav() {
         setValidationErrors(errors || null)
       } else {
         setValidationErrors(null)
+        // If GitLab credentials are configured and the workspace syncs to
+        // GitLab, also publish to Git
+        if (
+          gitLabCredentialsStatus?.exists &&
+          workspace?.settings?.git_provider === "gitlab" &&
+          workspace?.settings?.git_repo_url
+        ) {
+          console.log("Publishing to Git...")
+          try {
+            await publishWorkflow({ create_pr: true })
+          } catch (publishError) {
+            console.error("Failed to publish workflow to Git:", publishError)
+          }
+        }
       }
     } catch (error) {
       console.error("Failed to save workflow:", error)
@@ -652,7 +669,12 @@ function WorkflowSaveActions({
   hasPendingUpdates?: boolean
 }) {
   const { hasEntitlement } = useEntitlements()
-  const isGitSyncEnabled = hasEntitlement("git_sync")
+  const { credentialsStatus: gitLabCredentialsStatus } =
+    useGitLabCredentialsStatus()
+  // Git publish is available if the git-sync entitlement is enabled
+  // (enterprise) OR the custom GitLab integration is configured.
+  const isGitSyncEnabled =
+    hasEntitlement("git_sync") || gitLabCredentialsStatus?.exists === true
   const [publishOpen, setPublishOpen] = React.useState(false)
   const [isPublishing, setIsPublishing] = React.useState(false)
   const [isCreatingBranch, setIsCreatingBranch] = React.useState(true)

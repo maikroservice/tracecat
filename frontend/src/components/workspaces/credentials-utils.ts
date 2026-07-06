@@ -4,7 +4,7 @@ import type { WorkspaceSecretListItem } from "@/lib/hooks"
 export type CredentialConnectionFilter = "all" | "connected" | "not_connected"
 
 /** Secret types available on the workspace credentials page. */
-export type WorkspaceSecretType = Exclude<SecretType, "github_app">
+export type WorkspaceSecretType = Exclude<SecretType, "github_app" | "gitlab_token">
 export type CredentialSecretTypeFilter = "all" | WorkspaceSecretType
 
 export interface CredentialGroup {
@@ -36,6 +36,7 @@ export const credentialSecretTypeLabels: Record<SecretType, string> = {
   mtls: "mTLS",
   ca_cert: "CA certificate",
   github_app: "GitHub app",
+  gitlab_token: "GitLab token",
 }
 
 export function normalizeSecretEnvironment(

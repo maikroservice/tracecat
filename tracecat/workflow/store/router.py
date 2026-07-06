@@ -19,6 +19,7 @@ from tracecat.sync import PullOptions, PullResult
 from tracecat.vcs.exceptions import VcsProviderError
 from tracecat.vcs.github.app import GitHubAppError, GitHubAppService
 from tracecat.vcs.github.schemas import GitHubAppRepository
+from tracecat.vcs.gitlab.sync import GitLabWorkflowSyncService
 from tracecat.workflow.management.definitions import WorkflowDefinitionsService
 from tracecat.workflow.store.schemas import (
     WorkflowDslPublish,
@@ -150,6 +151,12 @@ async def list_workflow_commits(
         )
 
     try:
+        # Custom (non-EE) GitLab sync path
+        if gitlab_sync := await GitLabWorkflowSyncService.if_gitlab_workspace(
+            session=session, role=role
+        ):
+            return await gitlab_sync.list_commits(branch=branch, limit=limit)
+
         sync_service = await WorkspaceSyncService.for_workspace(
             session=session, role=role
         )
@@ -205,6 +212,13 @@ async def list_workflow_branches(
         )
 
     try:
+        # Custom (non-EE) GitLab sync path
+        if gitlab_sync := await GitLabWorkflowSyncService.if_gitlab_workspace(
+            session=session, role=role
+        ):
+            branch_names = await gitlab_sync.list_branches()
+            return [GitBranchInfo(name=name) for name in branch_names[:limit]]
+
         sync_service = await WorkspaceSyncService.for_workspace(
             session=session, role=role
         )
@@ -329,6 +343,15 @@ async def pull_workflows(
             commit_sha=params.commit_sha,
             dry_run=params.dry_run,
         )
+        # Custom (non-EE) GitLab sync path
+        if gitlab_sync := await GitLabWorkflowSyncService.if_gitlab_workspace(
+            session=session, role=role
+        ):
+            return await gitlab_sync.pull(
+                options=pull_options,
+                sync_schedules=params.sync_schedules,
+            )
+
         sync_service = await WorkspaceSyncService.for_workspace(
             session=session, role=role
         )

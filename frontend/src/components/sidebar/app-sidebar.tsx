@@ -124,6 +124,8 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const canViewServiceAccounts = useScopeCheck("workspace:service_account:read")
   const canViewMcpAccess = useScopeCheck("workspace:read")
   const canViewCases = useScopeCheck("case:read")
+  // "Owner" = org admin; used to restrict nav items hidden for regular members
+  const isOrgOwner = useScopeCheck("org:update")
   const canAccessMissionControl =
     canExecuteAgents === true && canViewAgents === true
   const shouldLoadEntitlements =
@@ -178,7 +180,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         url: `${basePath}/cases`,
         icon: LayersIcon,
         isActive: pathname?.startsWith(`${basePath}/cases`),
-        visible: canViewCases === true,
+        visible: false, // Hidden by policy (fork customization)
       },
       {
         title: "Agents",
@@ -219,14 +221,14 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         url: `${basePath}/integrations`,
         icon: BlocksIcon,
         isActive: pathname?.startsWith(`${basePath}/integrations`),
-        visible: canViewIntegrations === true,
+        visible: false, // Hidden by policy (fork customization)
       },
       {
         title: "MCP servers",
         url: `${basePath}/mcp-servers`,
         icon: Sparkles,
         isActive: pathname?.startsWith(`${basePath}/mcp-servers`),
-        visible: canViewIntegrations === true,
+        visible: false, // Hidden by policy (fork customization)
       },
       {
         title: "Skills",
@@ -246,7 +248,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         url: `${basePath}/actions`,
         icon: BoxIcon,
         isActive: pathname?.startsWith(`${basePath}/actions`),
-        visible: canViewActions === true,
+        visible: false, // Hidden by policy (fork customization)
       },
     ],
     [
@@ -273,14 +275,15 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
       url: `${basePath}/runs`,
       icon: ListVideoIcon,
       isActive: pathname?.startsWith(`${basePath}/runs`),
-      visible: canViewWorkflows === true,
+      visible: false, // Hidden by policy (fork customization)
     },
     {
       title: "Inbox",
       url: `${basePath}/inbox`,
       icon: ListChecksIcon,
       isActive: pathname?.startsWith(`${basePath}/inbox`),
-      visible: canViewInbox === true,
+      // Only org owners/admins see the inbox (fork customization)
+      visible: canViewInbox === true && isOrgOwner === true,
       badgeCount: pendingApprovalsCount,
       badgeLabel: `${pendingApprovalsCount} pending approval${pendingApprovalsCount === 1 ? "" : "s"}`,
     },

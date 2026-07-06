@@ -1,0 +1,10 @@
+# Per-Dockerfile ignore for Dockerfile.prebuilt (BuildKit).
+# Unlike the default .dockerignore, this must include .next/standalone
+# and .next/static from the host-side build.
+node_modules
+tests
+build
+.next/cache
+Dockerfile
+Dockerfile.prod
+Dockerfile.prebuilt

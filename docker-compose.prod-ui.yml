@@ -7,15 +7,13 @@ services:
       replicas: 0
 
   ui-prod:
+    # Requires a host-side `next build` first (NEXT_PUBLIC_* baked at build
+    # time). Uses the thin prebuilt image to avoid ~10GB of in-Docker build
+    # cache; switch dockerfile back to Dockerfile.prod for a self-contained
+    # build on hosts with more disk.
     build:
       context: ./frontend
-      dockerfile: Dockerfile.prod
-      args:
-        NEXT_PUBLIC_APP_ENV: production
-        NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL}
-        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
-        NEXT_SERVER_API_URL: ${NEXT_SERVER_API_URL}
-        NODE_ENV: production
+      dockerfile: Dockerfile.prebuilt
     restart: unless-stopped
     environment:
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}

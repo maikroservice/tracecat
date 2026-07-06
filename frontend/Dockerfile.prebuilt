@@ -1,0 +1,23 @@
+# Thin production image from a host-side `next build` (output: standalone).
+# Build the app first: NEXT_PUBLIC_* env set, then `pnpm exec next build`.
+# Mirrors the runner stage of Dockerfile.prod without the in-Docker build,
+# to keep Docker build cache usage minimal on disk-constrained hosts.
+FROM node:22-alpine AS runner
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV NEXT_PUBLIC_APP_ENV=production
+
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 nextjs
+
+COPY public ./public
+COPY --chown=nextjs:nodejs .next/standalone ./
+COPY --chown=nextjs:nodejs .next/static ./.next/static
+
+USER nextjs
+
+EXPOSE 3000
+ENV PORT=3000
+
+CMD ["sh", "-c", "HOSTNAME=0.0.0.0 node server.js"]

@@ -1,0 +1,34 @@
+# Override: run the production UI build instead of the dev server.
+# Usage: docker compose -f docker-compose.dev.yml -f docker-compose.prod-ui.yml up -d
+services:
+  ui:
+    # Disable the dev-mode UI (memory-heavy `next dev`)
+    deploy:
+      replicas: 0
+
+  ui-prod:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.prod
+      args:
+        NEXT_PUBLIC_APP_ENV: production
+        NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL}
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+        NEXT_SERVER_API_URL: ${NEXT_SERVER_API_URL}
+        NODE_ENV: production
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+      NEXT_PUBLIC_APP_ENV: production
+      NEXT_PUBLIC_APP_URL: ${NEXT_PUBLIC_APP_URL}
+      NEXT_PUBLIC_AUTH_TYPES: ${TRACECAT__AUTH_TYPES}
+      NEXT_SERVER_API_URL: ${NEXT_SERVER_API_URL}
+      NODE_ENV: production
+      TRACECAT__SERVICE_KEY: ${TRACECAT__SERVICE_KEY}
+    networks:
+      default:
+        # Take over the `ui` hostname that Caddy proxies to
+        aliases:
+          - ui
+    depends_on:
+      - api

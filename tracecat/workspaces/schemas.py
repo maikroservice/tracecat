@@ -7,7 +7,7 @@ from pydantic import EmailStr, Field, computed_field, field_validator
 
 from tracecat import config
 from tracecat.core.schemas import Schema
-from tracecat.git.constants import GIT_SSH_URL_REGEX
+from tracecat.git.constants import GIT_HTTPS_URL_REGEX, GIT_SSH_URL_REGEX
 from tracecat.identifiers import InvitationID, OrganizationID, UserID, WorkspaceID
 from tracecat.invitations.enums import InvitationStatus
 from tracecat.workspace_sync.enums import VcsProvider
@@ -94,13 +94,14 @@ class WorkspaceSettingsUpdate(Schema):
     @field_validator("git_repo_url", mode="before")
     @classmethod
     def validate_git_repo_url(cls, value: str | None) -> str | None:
-        """Ensure workspace git repo URLs use the shared Git SSH format."""
+        """Ensure workspace git repo URLs use the Git SSH or HTTPS format."""
         if value is None:
             return value
 
-        if not GIT_SSH_URL_REGEX.match(value):
+        if not (GIT_SSH_URL_REGEX.match(value) or GIT_HTTPS_URL_REGEX.match(value)):
             raise ValueError(
-                "Must be a valid Git SSH URL (e.g., git+ssh://<user>@github.com/org/repo.git)"
+                "Must be a valid Git SSH URL (e.g., git+ssh://<user>@github.com/org/repo.git) "
+                "or HTTPS URL (e.g., https://gitlab.com/group/repo.git)"
             )
 
         return value

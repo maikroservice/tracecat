@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import re
 from typing import Any
 
 import yaml
@@ -19,6 +18,7 @@ from pydantic import ValidationError
 from tracecat.db.models import User, Workflow
 from tracecat.dsl.common import DSLInput
 from tracecat.exceptions import TracecatNotFoundError, TracecatSettingsError
+from tracecat.git.constants import GIT_HTTPS_URL_REGEX
 from tracecat.git.types import GitUrl
 from tracecat.git.utils import parse_git_url
 from tracecat.identifiers.workflow import WorkflowUUID
@@ -37,11 +37,6 @@ from tracecat.workflow.store.schemas import (
     WorkflowDslPublishResult,
 )
 from tracecat.workspaces.service import WorkspaceService
-
-GIT_HTTPS_URL_REGEX = re.compile(
-    r"^https://(?P<host>[^/:]+)(?::(?P<port>\d+))?/(?P<path>[^/@]+?(?:/[^/@]+?)+?)(?:\.git)?(?:@(?P<ref>[^/@]+))?$"
-)
-"""Git HTTPS URL with optional port and multi-segment paths (supports GitLab nested groups)."""
 
 
 def parse_gitlab_repo_url(url: str) -> GitUrl:

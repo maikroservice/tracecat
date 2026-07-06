@@ -17,7 +17,7 @@ from pydantic import SecretStr
 from tracecat.secrets.enums import SecretType
 from tracecat.secrets.schemas import SecretCreate, SecretKeyValue, SecretUpdate
 from tracecat.secrets.service import SecretsService
-from tracecat.service import BaseService
+from tracecat.service import BaseOrgService
 from tracecat.vcs.exceptions import VcsProviderError
 from tracecat.vcs.gitlab.schemas import GitLabConfig, GitLabCredentials
 
@@ -29,7 +29,7 @@ class GitLabError(VcsProviderError):
     """GitLab operation error (custom non-EE integration)."""
 
 
-class GitLabService(BaseService):
+class GitLabService(BaseOrgService):
     """GitLab service for workflow store integration (organization-level).
 
     Access control is enforced at the router layer (org-admin endpoints) and

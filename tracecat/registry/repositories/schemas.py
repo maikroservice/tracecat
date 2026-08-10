@@ -4,7 +4,7 @@ from datetime import datetime
 from pydantic import BaseModel, Field, field_validator
 
 from tracecat.exceptions import TracecatValidationError
-from tracecat.git.constants import GIT_SSH_URL_REGEX
+from tracecat.git.constants import GIT_PLUS_HTTPS_URL_REGEX, GIT_SSH_URL_REGEX
 from tracecat.registry.actions.schemas import (
     RegistryActionRead,
     RegistryActionValidationErrorInfo,
@@ -42,7 +42,7 @@ class RegistryRepositoryCreate(BaseModel):
 
     @field_validator("origin", mode="before")
     def validate_origin(cls, v: str) -> str:
-        """Validates if a git+ssh URL is safe and properly formatted.
+        """Validates if a git+ssh or git+https URL is safe and properly formatted.
 
         Args:
             v: The URL string to validate
@@ -59,16 +59,24 @@ class RegistryRepositoryCreate(BaseModel):
         ):
             return v
 
-        # Aside from the default origins, we only support git+ssh URLs
-        if not v.startswith("git+ssh://"):
-            raise TracecatValidationError("Only git+ssh URLs are currently supported")
-
-        # Delegate to shared regex to ensure consistency across validators
-        if not GIT_SSH_URL_REGEX.match(v):
-            raise TracecatValidationError(
-                "Must be a valid Git SSH URL (e.g., git+ssh://<user>@github.com/org/repo.git)"
-            )
-        return v
+        # Delegate to shared regexes to ensure consistency across validators
+        if v.startswith("git+ssh://"):
+            if not GIT_SSH_URL_REGEX.match(v):
+                raise TracecatValidationError(
+                    "Must be a valid Git SSH URL (e.g., git+ssh://<user>@github.com/org/repo.git). "
+                    "Note: use a slash after the host, not the scp-style colon."
+                )
+            return v
+        if v.startswith("git+https://"):
+            if not GIT_PLUS_HTTPS_URL_REGEX.match(v):
+                raise TracecatValidationError(
+                    "Must be a valid Git HTTPS URL without embedded credentials "
+                    "(e.g., git+https://gitlab.com/org/repo.git)"
+                )
+            return v
+        raise TracecatValidationError(
+            "Only git+ssh and git+https URLs are currently supported"
+        )
 
 
 class RegistryRepositoryUpdate(BaseModel):

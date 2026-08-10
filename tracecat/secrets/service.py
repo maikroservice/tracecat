@@ -20,11 +20,15 @@ from tracecat.exceptions import (
 )
 from tracecat.identifiers import SecretID, WorkspaceID
 from tracecat.logger import logger
-from tracecat.registry.constants import REGISTRY_GIT_SSH_KEY_SECRET_NAME
+from tracecat.registry.constants import (
+    REGISTRY_GIT_SSH_KEY_SECRET_NAME,
+    REGISTRY_GIT_TOKEN_SECRET_NAME,
+)
 from tracecat.secrets.constants import DEFAULT_SECRETS_ENVIRONMENT
 from tracecat.secrets.encryption import decrypt_keyvalues, encrypt_keyvalues
 from tracecat.secrets.enums import SecretType
 from tracecat.secrets.schemas import (
+    GitToken,
     SecretCreate,
     SecretKeyValue,
     SecretSearch,
@@ -463,3 +467,37 @@ class SecretsService(BaseOrgService):
                 f"SSH key {key_name} not found. Please check whether this key exists.\n\n"
                 " If not, please create a key in your organization's credentials page and try again."
             ) from e
+
+    @require_scope("org:secret:read")
+    async def get_registry_git_token(
+        self, key_name: str | None = None, environment: str | None = None
+    ) -> GitToken | None:
+        """Fetch the org's HTTPS git access token for git+https registries.
+
+        Returns None if the secret does not exist so callers can fall back to
+        anonymous access (public repositories).
+        """
+        key_name = key_name or REGISTRY_GIT_TOKEN_SECRET_NAME
+        try:
+            secret = await self.get_org_secret_by_name(key_name, environment)
+        except TracecatNotFoundError:
+            return None
+        kvs = self.decrypt_keys(secret.encrypted_keys)
+        username: str | None = None
+        token: SecretStr | None = None
+        for kv in kvs:
+            key = kv.key.lower()
+            if key in ("token", "password", "access_token"):
+                token = kv.value
+            elif key in ("username", "user"):
+                username = kv.value.get_secret_value()
+        if token is None and len(kvs) == 1:
+            # Single-key secrets are treated as the token itself
+            token = kvs[0].value
+        if token is None:
+            raise TracecatCredentialsNotFoundError(
+                f"Secret {key_name} exists but has no 'token' key. "
+                "Add a key named 'token' (and optionally 'username')."
+            )
+        logger.debug("Git access token found", key_name=key_name)
+        return GitToken(username=username or "oauth2", token=token)

@@ -5,7 +5,7 @@ import type { RegistryRepositoryReadMinimal } from "@/client"
 const TRACECAT_REGISTRY_ORIGIN = "tracecat_registry"
 
 export function isCustomRegistryOrigin(origin: string): boolean {
-  return origin.startsWith("git+ssh://")
+  return origin.startsWith("git+ssh://") || origin.startsWith("git+https://")
 }
 
 export function isTracecatRegistryOrigin(

@@ -22,6 +22,7 @@ from tracecat.exceptions import (
     TracecatCredentialsNotFoundError,
     TracecatValidationError,
 )
+from tracecat.git.auth import https_token_context
 from tracecat.git.utils import list_git_commits, parse_git_url
 from tracecat.logger import logger
 from tracecat.parse import safe_url
@@ -304,11 +305,11 @@ async def list_repository_commits(
             detail="Registry repository not found",
         ) from e
 
-    # Only support git+ssh repositories for commit listing
-    if not repo.origin.startswith("git+ssh://"):
+    # Only support git repositories for commit listing
+    if not repo.origin.startswith(("git+ssh://", "git+https://")):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Commit listing is only supported for git+ssh repositories",
+            detail="Commit listing is only supported for git repositories",
         )
 
     try:
@@ -318,34 +319,49 @@ async def list_repository_commits(
 
         git_url = parse_git_url(repo.origin, allowed_domains=allowed_domains)
 
-        # Get SSH context for git operations
-        async with (
-            get_async_session_context_manager() as db_session,
-            ssh_context(role=role, git_url=git_url, session=db_session) as ssh_env,
-        ):
-            if ssh_env is None:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="No SSH key found for git operations",
+        if git_url.scheme == "https":
+            async with (
+                get_async_session_context_manager() as db_session,
+                https_token_context(
+                    role=role, git_url=git_url, session=db_session
+                ) as token_env,
+            ):
+                # git does not understand the pip-style git+https prefix
+                commits = await list_git_commits(
+                    git_url.transport_url,
+                    env=token_env,
+                    branch=branch,
+                    limit=min(limit, 100),  # Cap at 100 commits max
+                )
+        else:
+            # Get SSH context for git operations
+            async with (
+                get_async_session_context_manager() as db_session,
+                ssh_context(role=role, git_url=git_url, session=db_session) as ssh_env,
+            ):
+                if ssh_env is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="No SSH key found for git operations",
+                    )
+
+                # List commits from the repository
+                commits = await list_git_commits(
+                    repo.origin,
+                    env=ssh_env,
+                    branch=branch,
+                    limit=min(limit, 100),  # Cap at 100 commits max
                 )
 
-            # List commits from the repository
-            commits = await list_git_commits(
-                repo.origin,
-                env=ssh_env,
-                branch=branch,
-                limit=min(limit, 100),  # Cap at 100 commits max
-            )
+        logger.info(
+            "Listed repository commits",
+            repository_id=repository_id,
+            origin=repo.origin,
+            branch=branch,
+            count=len(commits),
+        )
 
-            logger.info(
-                "Listed repository commits",
-                repository_id=repository_id,
-                origin=repo.origin,
-                branch=branch,
-                count=len(commits),
-            )
-
-            return commits
+        return commits
 
     except ValueError as e:
         logger.error("Invalid git URL", origin=repo.origin, error=str(e))

@@ -288,11 +288,11 @@ class AdminRegistryService(BasePlatformService):
             await self._delete_current_version_if_exists(repo)
 
         try:
-            if repo.origin.startswith("git+ssh://"):
-                # NOTE: Platform git+ssh sync is not yet supported.
+            if repo.origin.startswith(("git+ssh://", "git+https://")):
+                # NOTE: Platform git sync is not yet supported.
                 # Platform registry only supports origin=tracecat-registry.
                 raise ValueError(
-                    f"git+ssh origins are not supported for platform registry sync. "
+                    f"git origins are not supported for platform registry sync. "
                     f"Origin: {repo.origin}"
                 )
             else:

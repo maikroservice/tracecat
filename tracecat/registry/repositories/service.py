@@ -112,6 +112,7 @@ class RegistryReposService(BaseOrgService):
         # because tracecat.git.utils and tracecat.registry.repository both
         # import RegistryReposService back, which would cycle if pulled to
         # module scope.
+        from tracecat.git.auth import https_token_context
         from tracecat.git.utils import parse_git_url
         from tracecat.registry.actions.service import RegistryActionsService
 
@@ -133,8 +134,9 @@ class RegistryReposService(BaseOrgService):
         force = sync_params.force if sync_params else False
 
         is_git_ssh = repository.origin.startswith("git+ssh://")
+        is_git_https = repository.origin.startswith("git+https://")
         git_repo_package_name: str | None = None
-        if is_git_ssh:
+        if is_git_ssh or is_git_https:
             git_repo_package_name = await get_setting(
                 "git_repo_package_name", role=self.role
             )
@@ -172,6 +174,25 @@ class RegistryReposService(BaseOrgService):
                     target_commit_sha=target_commit_sha,
                     git_repo_package_name=git_repo_package_name,
                     ssh_env=ssh_env,
+                )
+        elif is_git_https:
+            allowed_domains_setting = await get_setting(
+                "git_allowed_domains", role=self.role
+            )
+            allowed_domains = allowed_domains_setting or {"github.com"}
+            git_url = parse_git_url(repository.origin, allowed_domains=allowed_domains)
+
+            async with https_token_context(
+                role=self.role, git_url=git_url, session=self.session
+            ) as token_env:
+                (
+                    commit_sha,
+                    version,
+                ) = await actions_service.sync_actions_from_repository(
+                    repository,
+                    target_commit_sha=target_commit_sha,
+                    git_repo_package_name=git_repo_package_name,
+                    ssh_env=token_env,
                 )
         else:
             commit_sha, version = await actions_service.sync_actions_from_repository(

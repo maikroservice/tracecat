@@ -2841,7 +2841,8 @@ export function useGitLabTestConnection() {
 }
 
 export type GitLabTestConnectionResponse = VcsTestGitlabConnectionResponse
-export type GitLabWorkspaceConfig = VcsListGitlabWorkspaceConfigsResponse[number]
+export type GitLabWorkspaceConfig =
+  VcsListGitlabWorkspaceConfigsResponse[number]
 
 export function useGitLabWorkspaceConfigs() {
   const {

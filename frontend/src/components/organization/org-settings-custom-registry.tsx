@@ -129,8 +129,9 @@ export function OrgSettingsCustomRegistryForm() {
                   </span>
                 </span>
                 <span>
-                  With <span className="font-mono tracking-tighter">git+ssh</span>
-                  , authentication uses the{" "}
+                  With{" "}
+                  <span className="font-mono tracking-tighter">git+ssh</span>,
+                  authentication uses the{" "}
                   <span className="font-mono tracking-tighter">
                     github-ssh-key
                   </span>{" "}

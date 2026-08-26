@@ -59,8 +59,13 @@ describe("gitFormSchema git_repo_url superRefine", () => {
     ],
     [
       "non numeric port",
-      "git+ssh://git@github.com:notaport/org/repo.git",
+      "git+ssh://git@github.com:12ab/org/repo.git",
       "Port must be numeric",
+    ],
+    [
+      "scp-style colon path",
+      "git+ssh://git@github.com:org/repo.git",
+      "Use a slash after the hostname, not the scp-style colon (git+ssh://git@github.com/org/repo.git)",
     ],
     [
       "insufficient path segments",

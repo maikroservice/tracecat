@@ -228,7 +228,15 @@ async def test_list_workflow_branches_success(
     test_admin_role: Role,
 ) -> None:
     """Test GET /workflows/sync/branches returns branch list."""
-    with patch("tracecat.workflow.store.router.WorkspaceSyncService") as mock_sync_cls:
+    with (
+        # The router probes the custom GitLab sync path first; stub it out so
+        # the AsyncMock DB session is never queried by real service code.
+        patch(
+            "tracecat.workflow.store.router.GitLabWorkflowSyncService.if_gitlab_workspace",
+            AsyncMock(return_value=None),
+        ),
+        patch("tracecat.workflow.store.router.WorkspaceSyncService") as mock_sync_cls,
+    ):
         mock_sync_svc = AsyncMock()
         mock_sync_svc.list_branches.return_value = [
             GitBranchInfo(name="main", is_default=True),
@@ -255,7 +263,15 @@ async def test_list_workflow_branches_missing_repo_returns_400(
     test_admin_role: Role,
 ) -> None:
     """Test GET /workflows/sync/branches returns 400 when repo URL is missing."""
-    with patch("tracecat.workflow.store.router.WorkspaceSyncService") as mock_sync_cls:
+    with (
+        # The router probes the custom GitLab sync path first; stub it out so
+        # the AsyncMock DB session is never queried by real service code.
+        patch(
+            "tracecat.workflow.store.router.GitLabWorkflowSyncService.if_gitlab_workspace",
+            AsyncMock(return_value=None),
+        ),
+        patch("tracecat.workflow.store.router.WorkspaceSyncService") as mock_sync_cls,
+    ):
         mock_sync_svc = AsyncMock()
         mock_sync_svc.list_branches.side_effect = TracecatSettingsError(
             "Git repository URL not configured for this workspace."
@@ -277,7 +293,15 @@ async def test_list_workflow_branches_github_error_returns_400(
     test_admin_role: Role,
 ) -> None:
     """Test GET /workflows/sync/branches maps GitHub errors to 400."""
-    with patch("tracecat.workflow.store.router.WorkspaceSyncService") as mock_sync_cls:
+    with (
+        # The router probes the custom GitLab sync path first; stub it out so
+        # the AsyncMock DB session is never queried by real service code.
+        patch(
+            "tracecat.workflow.store.router.GitLabWorkflowSyncService.if_gitlab_workspace",
+            AsyncMock(return_value=None),
+        ),
+        patch("tracecat.workflow.store.router.WorkspaceSyncService") as mock_sync_cls,
+    ):
         mock_sync_svc = AsyncMock()
         mock_sync_svc.list_branches.side_effect = GitHubAppError(
             "Unable to access repository"
@@ -310,7 +334,15 @@ async def test_workspace_sync_export_routes_map_service_construction_errors_to_4
     path: str,
     payload: dict[str, object],
 ) -> None:
-    with patch("tracecat.workflow.store.router.WorkspaceSyncService") as mock_sync_cls:
+    with (
+        # The router probes the custom GitLab sync path first; stub it out so
+        # the AsyncMock DB session is never queried by real service code.
+        patch(
+            "tracecat.workflow.store.router.GitLabWorkflowSyncService.if_gitlab_workspace",
+            AsyncMock(return_value=None),
+        ),
+        patch("tracecat.workflow.store.router.WorkspaceSyncService") as mock_sync_cls,
+    ):
         mock_sync_cls.for_workspace = AsyncMock(
             side_effect=TracecatSettingsError(
                 "Unsupported Git provider configured for this workspace: unknown"

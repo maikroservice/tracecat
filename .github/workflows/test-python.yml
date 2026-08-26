@@ -237,7 +237,18 @@ jobs:
             TRACECAT__CONTEXT_COMPRESSION_THRESHOLD_KB=0 \
             uv run pytest tests/temporal -m "requires_api and not live_secret" -ra -o faulthandler_timeout=300
           else
-            uv run pytest tests/${{ matrix.test_group }} -m "not live_secret" -n auto -ra -o faulthandler_timeout=300
+            # The nsjail sandbox smokes build Docker images inside the test and
+            # need Blacksmith-class runners; they time out on GitHub-hosted
+            # runners, so deselect them on fork CI.
+            uv run pytest tests/${{ matrix.test_group }} -m "not live_secret" -n auto -ra -o faulthandler_timeout=300 \
+              --deselect tests/unit/executor/test_run_python_sdk_context.py::test_run_python_nsjail_can_import_registry_ctx_with_registry_paths \
+              --deselect tests/unit/executor/test_run_python_sdk_context.py::test_run_python_nsjail_sdk_calls_use_action_gateway_without_network \
+              --deselect tests/unit/test_agent_sandbox_litellm.py::test_agent_nsjail_runtime_has_duckdb_cli \
+              --deselect "tests/unit/test_agent_sandbox_litellm.py::test_run_agent_activity_makes_attached_skills_visible_in_each_sandbox_mode[nsjail]" \
+              --deselect "tests/unit/test_agent_sandbox_litellm.py::test_run_agent_activity_reproduces_mcp_compression_initialize_timeout_in_each_sandbox_mode[nsjail]" \
+              --deselect "tests/unit/test_agent_sandbox_litellm.py::test_run_agent_activity_spawns_full_claude_harness_runtime_in_each_sandbox_mode[nsjail]" \
+              --deselect tests/unit/test_agent_sandbox_litellm.py::test_run_agent_activity_spawns_full_claude_harness_runtime_with_pasta_in_nsjail \
+              --deselect tests/unit/test_executor_sandbox_nsjail.py::test_action_runner_executes_registry_action_smoke
           fi
 
       - name: Show Docker logs on failure

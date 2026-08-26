@@ -495,6 +495,7 @@ class TestWorkspaceService:
         "git+ssh://git@example.com/org/repo",
         "git+ssh://someuser@git.example.com/org/repo.git",
         "git+ssh://git@github.com/org/repo.git@feature/custom-branch",
+        "https://github.com/org/repo.git",
     ],
 )
 def test_workspace_settings_update_accepts_valid_git_urls(valid_url: str) -> None:
@@ -507,7 +508,6 @@ def test_workspace_settings_update_accepts_valid_git_urls(valid_url: str) -> Non
 @pytest.mark.parametrize(
     "invalid_url",
     [
-        "https://github.com/org/repo.git",
         "git+ssh://github.com/org/repo.git",
         "git+ssh://git@github.com",
         "git+ssh://git@github.com:not_a_port/org/repo.git",

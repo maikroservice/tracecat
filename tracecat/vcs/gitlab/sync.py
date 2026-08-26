@@ -76,18 +76,20 @@ class GitLabWorkflowSyncService(BaseWorkspaceService):
             workspace = await WorkspaceService(
                 session=session, role=role
             ).get_workspace(svc.workspace_id)
-        except Exception:
-            return None
-        if not workspace or not workspace.settings:
-            return None
-        provider = workspace.settings.get("git_provider")
-        if provider != "gitlab":
-            # Legacy configs (pre git_provider) are detected by repo URL host.
-            repo_url = workspace.settings.get("git_repo_url") or ""
-            if provider is not None or "gitlab" not in repo_url.lower():
+            if not workspace or not workspace.settings:
                 return None
-        gl_svc = GitLabService(session=session, role=role)
-        if not await gl_svc.has_credentials():
+            provider = workspace.settings.get("git_provider")
+            if provider != "gitlab":
+                # Legacy configs (pre git_provider) are detected by repo URL host.
+                repo_url = workspace.settings.get("git_repo_url") or ""
+                if provider is not None or "gitlab" not in repo_url.lower():
+                    return None
+            gl_svc = GitLabService(session=session, role=role)
+            if not await gl_svc.has_credentials():
+                return None
+        except Exception:
+            # This is a best-effort probe: any failure means the custom GitLab
+            # path does not apply and the caller falls back to the default path.
             return None
         return svc
 

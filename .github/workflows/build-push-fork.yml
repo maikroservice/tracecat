@@ -10,6 +10,12 @@ on:
   push:
     branches: ["main"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Explicit image tag (e.g. 1.0.0-beta.50-bm.1); empty = automatic versioning"
+        required: false
+        type: string
+        default: ""
 
 env:
   REGISTRY: ghcr.io
@@ -59,7 +65,18 @@ jobs:
 
       - name: Get next API version
         id: api
+        env:
+          EXPLICIT_TAG: ${{ inputs.tag }}
         run: |
+          if [ -n "$EXPLICIT_TAG" ]; then
+            if ! printf '%s' "$EXPLICIT_TAG" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
+              echo "Invalid image tag: $EXPLICIT_TAG" >&2
+              exit 1
+            fi
+            echo "version=$EXPLICIT_TAG" >> "$GITHUB_OUTPUT"
+            echo "Using explicit tag: $EXPLICIT_TAG"
+            exit 0
+          fi
           TOKEN=$(echo "${{ secrets.GITHUB_TOKEN }}" | base64)
           TAGS=$(curl -s -H "Authorization: Bearer ${TOKEN}" \
             "https://ghcr.io/v2/maikroservice/tracecat/tags/list" | jq -r '.tags[]?' 2>/dev/null || echo "")
@@ -81,7 +98,18 @@ jobs:
 
       - name: Get next UI version
         id: ui
+        env:
+          EXPLICIT_TAG: ${{ inputs.tag }}
         run: |
+          if [ -n "$EXPLICIT_TAG" ]; then
+            if ! printf '%s' "$EXPLICIT_TAG" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$'; then
+              echo "Invalid image tag: $EXPLICIT_TAG" >&2
+              exit 1
+            fi
+            echo "version=$EXPLICIT_TAG" >> "$GITHUB_OUTPUT"
+            echo "Using explicit tag: $EXPLICIT_TAG"
+            exit 0
+          fi
           TOKEN=$(echo "${{ secrets.GITHUB_TOKEN }}" | base64)
           TAGS=$(curl -s -H "Authorization: Bearer ${TOKEN}" \
             "https://ghcr.io/v2/maikroservice/tracecat-ui/tags/list" | jq -r '.tags[]?' 2>/dev/null || echo "")

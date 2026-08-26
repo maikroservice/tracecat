@@ -36,10 +36,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: blacksmith-8vcpu-ubuntu-2404
+          - runner: ubuntu-latest
             platform: linux/amd64
             platform_tag: linux-amd64
-          - runner: blacksmith-8vcpu-ubuntu-2404-arm
+          - runner: ubuntu-24.04-arm
             platform: linux/arm64
             platform_tag: linux-arm64
     steps:
@@ -76,11 +76,11 @@ jobs:
             type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Set up Docker builder
-        uses: useblacksmith/setup-docker-builder@78f41686563c732ccc097f7baac2f092f67538f0 # v1
+        uses: docker/setup-buildx-action@v3
 
       - name: Build and push by digest
         id: build
-        uses: useblacksmith/build-push-action@30c71162f16ea2c27c3e21523255d209b8b538c1 # v2
+        uses: docker/build-push-action@v6
         with:
           context: .
           target: production
@@ -113,7 +113,7 @@ jobs:
         github.triggering_actor || github.actor
       )
     needs: build-and-push-api
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
       - name: Download digests
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -178,10 +178,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: blacksmith-8vcpu-ubuntu-2404
+          - runner: ubuntu-latest
             platform: linux/amd64
             platform_tag: linux-amd64
-          - runner: blacksmith-8vcpu-ubuntu-2404-arm
+          - runner: ubuntu-24.04-arm
             platform: linux/arm64
             platform_tag: linux-arm64
     steps:
@@ -218,11 +218,11 @@ jobs:
             type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Set up Docker builder
-        uses: useblacksmith/setup-docker-builder@78f41686563c732ccc097f7baac2f092f67538f0 # v1
+        uses: docker/setup-buildx-action@v3
 
       - name: Build and push by digest
         id: build
-        uses: useblacksmith/build-push-action@30c71162f16ea2c27c3e21523255d209b8b538c1 # v2
+        uses: docker/build-push-action@v6
         env:
           NEXT_PUBLIC_API_URL: http://localhost:8000
           NEXT_PUBLIC_APP_ENV: production
@@ -267,7 +267,7 @@ jobs:
         github.triggering_actor || github.actor
       )
     needs: build-and-push-ui
-    runs-on: blacksmith-8vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
       - name: Download digests
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4

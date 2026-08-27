@@ -27,7 +27,7 @@ permissions:
 
 jobs:
   ruff:
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -35,17 +35,17 @@ jobs:
       - uses: astral-sh/ruff-action@4919ec5cf1f49eff0871dbcea0da843445b837e6 # v3
         with:
           src: "tracecat/ tests/ packages/ alembic/"
-          version: latest
+          version: "0.15.0"
           args: check --no-fix
 
       - uses: astral-sh/ruff-action@4919ec5cf1f49eff0871dbcea0da843445b837e6 # v3
         with:
           src: "tracecat/ tests/ packages/ alembic/"
-          version: latest
+          version: "0.15.0"
           args: format --diff
 
   pyright:
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

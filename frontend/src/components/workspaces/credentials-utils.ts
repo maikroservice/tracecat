@@ -4,7 +4,10 @@ import type { WorkspaceSecretListItem } from "@/lib/hooks"
 export type CredentialConnectionFilter = "all" | "connected" | "not_connected"
 
 /** Secret types available on the workspace credentials page. */
-export type WorkspaceSecretType = Exclude<SecretType, "github_app" | "gitlab_token">
+export type WorkspaceSecretType = Exclude<
+  SecretType,
+  "github_app" | "gitlab_token"
+>
 export type CredentialSecretTypeFilter = "all" | WorkspaceSecretType
 
 export interface CredentialGroup {

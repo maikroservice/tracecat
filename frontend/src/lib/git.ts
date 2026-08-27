@@ -149,8 +149,9 @@ export function validateGitRepoUrl(
     return
   }
 
-  // scp-style colon (git@host:org/repo.git) is a common copy-paste mistake
-  if (/^git\+ssh:\/\/[^/@]+@[^/:]+:(?!\d)/.test(url)) {
+  // scp-style colon (git@host:org/repo.git) is a common copy-paste mistake;
+  // a colon followed by "/" or a digit is a port form, not scp syntax
+  if (/^git\+ssh:\/\/[^/@]+@[^/:]+:(?![\d/])/.test(url)) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message:

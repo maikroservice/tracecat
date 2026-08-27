@@ -150,6 +150,7 @@ async def test_runner_passes_resolved_commit_sha_to_discovery(
         commit_sha="requested-sha",
         ssh_key="fake-ssh-key",
         work_dir=mocker.ANY,
+        token=None,
     )
     discover_actions.assert_awaited_once_with(
         repository_id=request.repository_id,

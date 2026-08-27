@@ -1,8 +1,15 @@
 name: Build and push fork images
 
+# Each architecture builds NATIVELY on its own runner (amd64 on ubuntu-latest,
+# arm64 on GitHub's free-for-public-repos ubuntu-24.04-arm) and pushes by
+# digest; a final job stitches the multi-arch manifest with imagetools.
+# This replaces the old single-runner QEMU cross-build, which emulated the
+# entire arm64 build (30+ min Next.js builds, OOM failures).
+
 on:
   push:
     branches: ["main"]
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
@@ -17,14 +24,16 @@ jobs:
   detect-changes:
     runs-on: ubuntu-latest
     outputs:
-      api: ${{ steps.filter.outputs.api }}
-      ui: ${{ steps.filter.outputs.ui }}
+      # Manual dispatch builds everything; pushes build only what changed
+      api: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.api }}
+      ui: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.ui }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Detect changed paths
         id: filter
+        if: github.event_name == 'push'
         uses: dorny/paths-filter@v3
         with:
           filters: |
@@ -39,18 +48,18 @@ jobs:
             ui:
               - 'frontend/**'
 
-  build-and-push-api:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.api == 'true'
+  version:
     runs-on: ubuntu-latest
+    outputs:
+      api: ${{ steps.api.outputs.version }}
+      ui: ${{ steps.ui.outputs.version }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Get next version
-        id: version
+      - name: Get next API version
+        id: api
         run: |
-          # Fetch the latest tag from GHCR and bump the patch number
           TOKEN=$(echo "${{ secrets.GITHUB_TOKEN }}" | base64)
           TAGS=$(curl -s -H "Authorization: Bearer ${TOKEN}" \
             "https://ghcr.io/v2/maikroservice/tracecat/tags/list" | jq -r '.tags[]?' 2>/dev/null || echo "")
@@ -68,45 +77,11 @@ jobs:
           fi
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Next version: $version"
+          echo "Next API version: $version"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push API
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          target: production
-          push: true
-          no-cache: true
-          tags: |
-            ${{ env.API_IMAGE }}:${{ steps.version.outputs.version }}
-            ${{ env.API_IMAGE }}:latest
-
-  build-and-push-ui:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.ui == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Get next version
-        id: version
+      - name: Get next UI version
+        id: ui
         run: |
-          # Fetch the latest tag from GHCR and bump the patch number
           TOKEN=$(echo "${{ secrets.GITHUB_TOKEN }}" | base64)
           TAGS=$(curl -s -H "Authorization: Bearer ${TOKEN}" \
             "https://ghcr.io/v2/maikroservice/tracecat-ui/tags/list" | jq -r '.tags[]?' 2>/dev/null || echo "")
@@ -124,10 +99,29 @@ jobs:
           fi
 
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Next version: $version"
+          echo "Next UI version: $version"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+  build-api:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.api == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Prepare platform slug
+        run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+        env:
+          PLATFORM: ${{ matrix.platform }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -139,20 +133,154 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push UI
+      - name: Build and push API by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: production
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=api-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,scope=api-${{ env.PLATFORM_PAIR }},mode=max
+          outputs: type=image,name=${{ env.API_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-api-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-api:
+    needs: [build-api, version]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-api-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t "$API_IMAGE:${{ needs.version.outputs.api }}" \
+            -t "$API_IMAGE:latest" \
+            $(printf "$API_IMAGE@sha256:%s " *)
+
+      - name: Inspect manifest
+        run: docker buildx imagetools inspect "$API_IMAGE:${{ needs.version.outputs.api }}"
+
+  build-ui:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.ui == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Prepare platform slug
+        run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+        env:
+          PLATFORM: ${{ matrix.platform }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push UI by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: frontend
           file: frontend/Dockerfile.prod
-          platforms: linux/amd64,linux/arm64
-          push: true
-          no-cache: true
+          platforms: ${{ matrix.platform }}
+          cache-from: type=gha,scope=ui-${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,scope=ui-${{ env.PLATFORM_PAIR }},mode=max
           build-args: |
             NEXT_PUBLIC_API_URL=http://localhost:8000
             NEXT_PUBLIC_APP_URL=http://localhost:3000
             NEXT_SERVER_API_URL=http://localhost:8000
             NEXT_PUBLIC_APP_ENV=production
             NODE_ENV=production
-          tags: |
-            ${{ env.UI_IMAGE }}:${{ steps.version.outputs.version }}
-            ${{ env.UI_IMAGE }}:latest
+          outputs: type=image,name=${{ env.UI_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-ui-${{ env.PLATFORM_PAIR }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-ui:
+    needs: [build-ui, version]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-ui-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t "$UI_IMAGE:${{ needs.version.outputs.ui }}" \
+            -t "$UI_IMAGE:latest" \
+            $(printf "$UI_IMAGE@sha256:%s " *)
+
+      - name: Inspect manifest
+        run: docker buildx imagetools inspect "$UI_IMAGE:${{ needs.version.outputs.ui }}"

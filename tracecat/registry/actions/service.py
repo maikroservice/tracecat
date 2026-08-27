@@ -81,7 +81,7 @@ from tracecat.tiers.enums import Entitlement
 from tracecat.tiers.service import TierService
 
 if TYPE_CHECKING:
-    from tracecat.ssh import SshEnv
+    from tracecat.git.types import GitAuthEnv
 
 # NamedTuple types for UNION ALL query results.
 # Used with typing_cast since SQLAlchemy's Row objects support attribute access.
@@ -1234,7 +1234,7 @@ class RegistryActionsService(BaseOrgService):
         target_version: str | None = None,
         target_commit_sha: str | None = None,
         git_repo_package_name: str | None = None,
-        ssh_env: SshEnv | None = None,
+        ssh_env: GitAuthEnv | None = None,
     ) -> tuple[str | None, str | None]:
         """Sync actions from a repository using the versioned flow.
 

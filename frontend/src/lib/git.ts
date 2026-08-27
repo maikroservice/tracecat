@@ -6,13 +6,16 @@ export const GIT_SSH_URL_REGEX =
 export const GIT_HTTPS_URL_REGEX =
   /^https:\/\/(?<hostname>[^/:]+)(?::(?<port>\d+))?\/(?<path>[^/@]+(?:\/[^/@]+)+)(?:\.git)?(?:@(?<ref>[^/@]+))?$/
 
+export const GIT_PLUS_HTTPS_URL_REGEX =
+  /^git\+https:\/\/(?<hostname>[^/:@]+)(?::(?<port>\d+))?\/(?<path>[^/@]+(?:\/[^/@]+)+)(?:\.git)?(?:@(?<ref>[^@]+))?$/
+
 // Mirrors the backend validation in tracecat/git/constants.py but enforces at least
 // an <org>/<repo> path structure on the client.
 
 /**
- * Extract the `<org>/<repo>` display name from a Git SSH URL.
+ * Extract the `<org>/<repo>` display name from a Git repository URL.
  *
- * @param url - A `git+ssh://` repository URL.
+ * @param url - A `git+ssh://` or `git+https://` repository URL.
  * @returns The `<org>/<repo>` path without the `.git` suffix, or `null` if the
  *   URL cannot be parsed.
  */
@@ -20,7 +23,8 @@ export function getRepoDisplayName(
   url: string | null | undefined
 ): string | null {
   if (!url) return null
-  const match = GIT_SSH_URL_REGEX.exec(url)
+  const match =
+    GIT_SSH_URL_REGEX.exec(url) ?? GIT_PLUS_HTTPS_URL_REGEX.exec(url)
   const path = match?.groups?.path
   if (!path) return null
   // The `path` capture group is greedy and includes a trailing `.git`.
@@ -113,6 +117,49 @@ export function validateGitSshUrl(
     message:
       "Must be a valid Git SSH URL (e.g., git+ssh://<user>@github.com/org/repo.git)",
   })
+}
+
+/**
+ * Validates a git repository URL for custom registries.
+ * Accepts pip-style git+ssh:// and git+https:// schemes.
+ */
+export function validateGitRepoUrl(
+  url: string | null | undefined,
+  ctx: z.RefinementCtx
+) {
+  if (!url) return
+
+  if (url.startsWith("git+https://")) {
+    if (GIT_PLUS_HTTPS_URL_REGEX.test(url)) return
+
+    if (url.includes("@") && /git\+https:\/\/[^/]*@/.test(url)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "Do not embed credentials in the URL. Configure a 'git-access-token' organization credential instead.",
+      })
+      return
+    }
+
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        "Must be a valid Git HTTPS URL (e.g., git+https://gitlab.com/org/repo.git)",
+    })
+    return
+  }
+
+  // scp-style colon (git@host:org/repo.git) is a common copy-paste mistake
+  if (/^git\+ssh:\/\/[^/@]+@[^/:]+:(?!\d)/.test(url)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message:
+        "Use a slash after the hostname, not the scp-style colon (git+ssh://git@github.com/org/repo.git)",
+    })
+    return
+  }
+
+  validateGitSshUrl(url, ctx)
 }
 
 /**

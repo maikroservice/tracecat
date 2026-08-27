@@ -17,7 +17,7 @@ import {
   FormMessage,
 } from "@/components/ui/form"
 import { Input } from "@/components/ui/input"
-import { validateGitSshUrl } from "@/lib/git"
+import { validateGitRepoUrl } from "@/lib/git"
 import { useOrgGitSettings } from "@/lib/hooks"
 
 export const gitFormSchema = z.object({
@@ -32,7 +32,7 @@ export const gitFormSchema = z.object({
     .nullish()
     // Empty string signals removal
     .transform((url) => url?.trim() || null)
-    .superRefine((url, ctx) => validateGitSshUrl(url, ctx)),
+    .superRefine((url, ctx) => validateGitRepoUrl(url, ctx)),
   git_repo_package_name: z
     .string()
     .nullish()
@@ -113,15 +113,42 @@ export function OrgSettingsCustomRegistryForm() {
               </FormControl>
               <FormDescription className="flex flex-col gap-2">
                 <span>
-                  The pip git URL of the remote repository, which uses the{" "}
-                  <span className="font-mono tracking-tighter">git+ssh</span>{" "}
+                  The pip git URL of the remote repository, using the{" "}
+                  <span className="font-mono tracking-tighter">git+ssh</span> or{" "}
+                  <span className="font-mono tracking-tighter">git+https</span>{" "}
                   scheme. Supports nested groups and custom ports.
                 </span>
                 <span>
-                  Format:{" "}
+                  Formats:{" "}
                   <span className="font-mono tracking-tight">
                     {"git+ssh://<user>@<hostname>[:<port>]/<org>/<repo>.git"}
+                  </span>{" "}
+                  or{" "}
+                  <span className="font-mono tracking-tight">
+                    {"git+https://<hostname>[:<port>]/<org>/<repo>.git"}
                   </span>
+                </span>
+                <span>
+                  With <span className="font-mono tracking-tighter">git+ssh</span>
+                  , authentication uses the{" "}
+                  <span className="font-mono tracking-tighter">
+                    github-ssh-key
+                  </span>{" "}
+                  organization credential. With{" "}
+                  <span className="font-mono tracking-tighter">git+https</span>,
+                  private repositories authenticate with an optional{" "}
+                  <span className="font-mono tracking-tighter">
+                    git-access-token
+                  </span>{" "}
+                  organization credential (keys:{" "}
+                  <span className="font-mono tracking-tighter">token</span> and
+                  optionally{" "}
+                  <span className="font-mono tracking-tighter">username</span>,
+                  e.g. a GitLab project access token with{" "}
+                  <span className="font-mono tracking-tighter">
+                    read_repository
+                  </span>{" "}
+                  scope).
                 </span>
               </FormDescription>
               <FormMessage />

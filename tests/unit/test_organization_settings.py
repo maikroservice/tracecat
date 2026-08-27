@@ -339,6 +339,9 @@ async def test_update_audit_payload_attribute_setting(
         "git+ssh://git@github.com/org/repo",  # Without .git suffix
         "git+ssh://git@example.com/very/deep/nested/org/repo.git",
         "git+ssh://someuser@git.example.com/very/deep/nested/org/repo.git",
+        "git+https://gitlab.com/org/repo.git",
+        "git+https://gitlab.example.com:8443/org/team/repo.git@main",
+        "git+https://github.com/org/repo",  # Without .git suffix
     ],
 )
 async def test_git_settings_valid_ssh_urls(
@@ -374,22 +377,24 @@ async def test_git_settings_valid_ssh_urls(
         "git+ssh://git@github.com:not_a_port/org/repo.git",  # Non numeric port
         "git+ssh://git@github.com:/org/repo.git",  # Missing port after colon
         "git+ssh://git@github.com/repo.git",  # Missing org segment
+        "git+https://user:token@gitlab.com/org/repo.git",  # Embedded credentials
+        "git+https://gitlab.com/repo.git",  # Missing org segment
     ],
 )
 async def test_git_settings_invalid_ssh_urls(
     settings_service_with_defaults: SettingsService,
     invalid_url: str,
 ) -> None:
-    """Test that invalid Git SSH URLs are rejected."""
+    """Test that invalid Git URLs are rejected."""
     from pydantic import ValidationError
 
     # This should raise a ValidationError
     with pytest.raises(ValidationError) as exc_info:
         GitSettingsUpdate(git_repo_url=invalid_url)
 
-    # Verify the error message mentions Git SSH URL
+    # Verify the error message mentions Git URL
     error_detail = str(exc_info.value)
-    assert "Must be a valid Git SSH URL" in error_detail
+    assert "Must be a valid Git URL" in error_detail
 
 
 @pytest.mark.anyio

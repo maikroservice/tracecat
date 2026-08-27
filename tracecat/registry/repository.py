@@ -34,6 +34,8 @@ from tracecat.db.engine import get_async_session_context_manager
 from tracecat.exceptions import RegistryError
 from tracecat.expressions.expectations import create_expectation_model
 from tracecat.expressions.validation import TemplateValidator
+from tracecat.git.auth import https_token_context
+from tracecat.git.types import GitAuthEnv
 from tracecat.git.utils import GitUrl, get_git_repository_sha, parse_git_url
 from tracecat.logger import logger
 from tracecat.parse import safe_url
@@ -56,7 +58,7 @@ from tracecat.registry.fields import (
 from tracecat.registry.repositories.schemas import RegistryRepositoryCreate
 from tracecat.registry.repositories.service import RegistryReposService
 from tracecat.settings.service import get_setting
-from tracecat.ssh import SshEnv, ssh_context
+from tracecat.ssh import ssh_context
 
 ArgsClsT = type[BaseModel]
 type F = Callable[..., Any]
@@ -493,7 +495,7 @@ class Repository:
                 commit_sha=commit_sha,
             )
             return None
-        elif self._origin.startswith("git+ssh://"):
+        elif self._origin.startswith(("git+ssh://", "git+https://")):
             # Load from remote
             logger.info("Loading UDFs from origin", origin=self._origin)
             allowed_domains = cast(
@@ -515,7 +517,7 @@ class Repository:
                 repo_name = git_url.repo
             except ValueError as e:
                 raise RegistryError(
-                    "Invalid Git repository URL. Please provide a valid Git SSH URL (git+ssh)."
+                    "Invalid Git repository URL. Please provide a valid git+ssh or git+https URL."
                 ) from e
             package_name = (
                 self._package_name_override
@@ -551,6 +553,21 @@ class Repository:
         """Install the remote repository into the filesystem and return the commit sha."""
 
         url = git_url.to_url()
+        if git_url.scheme == "https":
+            async with (
+                get_async_session_context_manager() as session,
+                https_token_context(
+                    role=self.role, git_url=git_url, session=session
+                ) as env,
+            ):
+                if commit_sha is None:
+                    # git does not understand git+https; use the plain https form
+                    commit_sha = await get_git_repository_sha(
+                        git_url.transport_url, env=env
+                    )
+                await install_remote_repository(url, commit_sha=commit_sha, env=env)
+            return commit_sha
+
         async with (
             get_async_session_context_manager() as session,
             ssh_context(role=self.role, git_url=git_url, session=session) as env,
@@ -1072,7 +1089,7 @@ async def ensure_base_repository(
 
 
 async def install_remote_repository(
-    repo_url: str, commit_sha: str, env: SshEnv
+    repo_url: str, commit_sha: str, env: GitAuthEnv | None
 ) -> None:
     """Install a remote repository to the custom registry target directory.
 
@@ -1103,7 +1120,7 @@ async def install_remote_repository(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=os.environ.copy() | env.to_dict(),
+            env=os.environ.copy() | (env.to_dict() if env else {}),
         )
         _, stderr = await process.communicate()
         if process.returncode != 0:

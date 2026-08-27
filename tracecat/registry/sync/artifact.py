@@ -29,7 +29,7 @@ from tracecat.logger import logger
 from tracecat.storage import blob
 
 if TYPE_CHECKING:
-    from tracecat.ssh import SshEnv
+    from tracecat.git.types import GitAuthEnv
 
 
 class RegistryArtifactBuildError(Exception):
@@ -507,7 +507,7 @@ async def build_artifact_from_path(
 async def build_artifact_from_git(
     git_url: str,
     commit_sha: str,
-    env: SshEnv | None = None,
+    env: GitAuthEnv | None = None,
     output_dir: Path | None = None,
     python_version: str = "3.12",
 ) -> RegistryArtifactBuildResult:
@@ -536,7 +536,9 @@ async def build_artifact_from_git(
     ) as clone_dir:
         clone_path = Path(clone_dir)
 
-        clone_url = git_url.replace("git+ssh://", "ssh://")
+        clone_url = git_url.replace("git+ssh://", "ssh://").replace(
+            "git+https://", "https://"
+        )
 
         logger.info(
             "Cloning repository for SquashFS venv build",

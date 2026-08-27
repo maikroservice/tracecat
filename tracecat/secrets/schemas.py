@@ -48,6 +48,13 @@ class SecretKeyValue(BaseModel):
         return SecretKeyValue(key=key, value=SecretStr(value))
 
 
+class GitToken(BaseModel):
+    """HTTPS access token credential for git operations (e.g. GitLab project access tokens)."""
+
+    username: str = "oauth2"
+    token: SecretStr
+
+
 def _normalize_pem_value(value: str, *, required_message: str) -> str:
     normalized = value.strip().replace("\r\n", "\n").replace("\r", "\n")
     if not normalized:

@@ -177,12 +177,23 @@ class RegistrySyncRunner:
                     raise RegistrySyncRunnerError(
                         "git_url is required for git origin type"
                     )
-                ssh_key = await self._fetch_registry_ssh_key(request.organization_id)
+                if request.git_url.startswith("git+https://"):
+                    # Token is optional: public repositories work anonymously
+                    token = await self._fetch_registry_git_token(
+                        request.organization_id
+                    )
+                    ssh_key = None
+                else:
+                    token = None
+                    ssh_key = await self._fetch_registry_ssh_key(
+                        request.organization_id
+                    )
                 package_path, commit_sha = await self._clone_repository(
                     git_url=request.git_url,
                     commit_sha=request.commit_sha,
                     ssh_key=ssh_key,
                     work_dir=work_dir,
+                    token=token,
                 )
             else:
                 raise RegistrySyncRunnerError(
@@ -317,20 +328,53 @@ class RegistrySyncRunner:
                 ) from exc
         return secret.get_secret_value()
 
+    async def _fetch_registry_git_token(
+        self, organization_id: UUID | None
+    ) -> tuple[str, str] | None:
+        """Fetch the org-scoped git access token for git+https origins.
+
+        Returns None when no token secret is configured so public repositories
+        can be cloned anonymously.
+        """
+        if organization_id is None:
+            raise GitCloneError(
+                "Git repository sync requires organization_id to fetch credentials"
+            )
+
+        role = Role(
+            type="service",
+            service_id="tracecat-service",
+            organization_id=organization_id,
+            scopes=SERVICE_PRINCIPAL_SCOPES["tracecat-service"],
+        )
+
+        async with SecretsService.with_session(role=role) as secrets_service:
+            try:
+                git_token = await secrets_service.get_registry_git_token()
+            except Exception as exc:
+                raise GitCloneError(
+                    f"Failed to retrieve git access token: {exc}"
+                ) from exc
+        if git_token is None:
+            return None
+        return git_token.username, git_token.token.get_secret_value()
+
     async def _clone_repository(
         self,
         git_url: str,
         commit_sha: str | None,
         ssh_key: str | None,
         work_dir: Path,
+        token: tuple[str, str] | None = None,
     ) -> tuple[Path, str]:
         """Clone a git repository to a local directory.
 
         Args:
-            git_url: Git SSH URL (git+ssh://...).
+            git_url: Git URL (git+ssh://... or git+https://...).
             commit_sha: Commit SHA to checkout (if None, uses HEAD).
-            ssh_key: SSH private key for authentication.
+            ssh_key: SSH private key for authentication (git+ssh origins).
             work_dir: Working directory for the clone.
+            token: Optional (username, token) pair for git+https origins.
 
         Returns:
             Tuple of (path to cloned repository, resolved commit SHA).
@@ -341,8 +385,10 @@ class RegistrySyncRunner:
         clone_path = work_dir / "repo"
         clone_path.mkdir(parents=True, exist_ok=True)
 
-        # Strip git+ssh:// prefix for git clone
-        clone_url = git_url.replace("git+ssh://", "ssh://")
+        # Strip the pip-style prefix for git clone (git knows ssh:// and https://)
+        clone_url = git_url.replace("git+ssh://", "ssh://").replace(
+            "git+https://", "https://"
+        )
 
         logger.info(
             "Cloning repository",
@@ -364,6 +410,24 @@ class RegistrySyncRunner:
             git_env["GIT_SSH_COMMAND"] = (
                 f"ssh -i {ssh_key_path} -o StrictHostKeyChecking=no -o BatchMode=yes"
             )
+        elif token:
+            # Serve HTTPS credentials via GIT_ASKPASS so the token never
+            # appears in URLs or argv.
+            username, token_value = token
+            askpass_path = work_dir / "git_askpass.sh"
+            _ = askpass_path.write_text(
+                '#!/bin/sh\ncase "$1" in\n'
+                "  [Uu]sername*) printf '%s\\n' \"$GIT_ASKPASS_USERNAME\" ;;\n"
+                "  *) printf '%s\\n' \"$GIT_ASKPASS_TOKEN\" ;;\n"
+                "esac\n"
+            )
+            askpass_path.chmod(0o700)
+            git_env["GIT_ASKPASS"] = str(askpass_path)
+            git_env["GIT_ASKPASS_USERNAME"] = username
+            git_env["GIT_ASKPASS_TOKEN"] = token_value
+
+        # Never fall back to interactive credential prompts
+        git_env["GIT_TERMINAL_PROMPT"] = "0"
 
         # Timeout for git operations (clone, fetch, checkout)
         git_timeout = 120  # 2 minutes

@@ -63,6 +63,47 @@ class TestGitUrl:
 class TestParseGitUrl:
     """Test parse_git_url function."""
 
+    def test_parse_git_https_url(self):
+        """Test parsing a pip-style git+https URL."""
+        url = "git+https://gitlab.com/myorg/myrepo.git"
+        git_url = parse_git_url(url)
+        assert git_url.scheme == "https"
+        assert git_url.host == "gitlab.com"
+        assert git_url.org == "myorg"
+        assert git_url.repo == "myrepo"
+        assert git_url.ref is None
+        assert git_url.to_url() == "git+https://gitlab.com/myorg/myrepo.git"
+        assert git_url.transport_url == "https://gitlab.com/myorg/myrepo.git"
+
+    def test_parse_git_https_url_with_ref_and_nested_groups(self):
+        """Test parsing a git+https URL with nested groups, port, and ref."""
+        url = "git+https://gitlab.example.com:8443/group/subgroup/myrepo.git@develop"
+        git_url = parse_git_url(url)
+        assert git_url.scheme == "https"
+        assert git_url.host == "gitlab.example.com:8443"
+        assert git_url.org == "group/subgroup"
+        assert git_url.repo == "myrepo"
+        assert git_url.ref == "develop"
+
+    def test_parse_git_https_url_rejects_embedded_credentials(self):
+        """Credentials in the netloc must be rejected."""
+        with pytest.raises(ValueError):
+            parse_git_url("git+https://user:token@gitlab.com/myorg/myrepo.git")
+
+    def test_parse_ssh_url_has_ssh_scheme(self):
+        """SSH URLs keep the default ssh scheme and to_url round-trips."""
+        git_url = parse_git_url("git+ssh://git@github.com/myorg/myrepo.git")
+        assert git_url.scheme == "ssh"
+        assert git_url.to_url() == "git+ssh://git@github.com/myorg/myrepo.git"
+
+    def test_parse_git_https_url_allowed_domains(self):
+        """Allowed-domain enforcement applies to git+https URLs too."""
+        with pytest.raises(ValueError, match="not in allowed domains"):
+            parse_git_url(
+                "git+https://gitlab.com/myorg/myrepo.git",
+                allowed_domains={"github.com"},
+            )
+
     def test_parse_valid_url(self):
         """Test parsing a valid Git SSH URL."""
         url = "git+ssh://git@github.com/myorg/myrepo.git"

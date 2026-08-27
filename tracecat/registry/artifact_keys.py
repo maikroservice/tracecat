@@ -40,7 +40,10 @@ def parse_s3_uri(uri: str) -> tuple[str, str]:
 def _slugify_origin(origin: str) -> str:
     """Convert a repository origin to a safe slug for S3 keys."""
     normalized = (
-        origin.replace("git+ssh://", "").replace("https://", "").replace("http://", "")
+        origin.replace("git+ssh://", "")
+        .replace("git+https://", "")
+        .replace("https://", "")
+        .replace("http://", "")
     )
     slug = normalized
     slug = re.sub(r"[^a-zA-Z0-9_-]", "_", slug)

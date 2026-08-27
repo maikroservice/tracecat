@@ -52,7 +52,7 @@ from tracecat.storage import blob
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from tracecat.ssh import SshEnv
+    from tracecat.git.types import GitAuthEnv
 
 
 class RepositoryProtocol(Protocol):
@@ -280,7 +280,7 @@ class BaseRegistrySyncService[
         *,
         target_version: str | None = None,
         target_commit_sha: str | None = None,
-        ssh_env: SshEnv | None = None,
+        ssh_env: GitAuthEnv | None = None,
         git_repo_package_name: str | None = None,
         commit: bool = True,
         bypass_temporal: bool = False,
@@ -535,7 +535,7 @@ class BaseRegistrySyncService[
         origin: str,
         version_string: str,
         commit_sha: str | None,
-        ssh_env: SshEnv | None = None,
+        ssh_env: GitAuthEnv | None = None,
     ) -> ArtifactsBuildResult:
         storage_namespace = self._get_storage_namespace()
         bucket = config.TRACECAT__BLOB_STORAGE_BUCKET_REGISTRY
@@ -566,7 +566,7 @@ class BaseRegistrySyncService[
                 local_path = Path(config.TRACECAT__LOCAL_REPOSITORY_CONTAINER_PATH)
                 artifact_result = await build_artifact_from_path(local_path, output_dir)
 
-            elif origin.startswith("git+ssh://"):
+            elif origin.startswith(("git+ssh://", "git+https://")):
                 if commit_sha is None:
                     raise RegistryArtifactBuildError(
                         "commit_sha is required for git repositories"
@@ -622,7 +622,7 @@ class BaseRegistrySyncService[
             return "builtin"
         if origin == DEFAULT_LOCAL_REGISTRY_ORIGIN:
             return "local"
-        if origin.startswith("git+ssh://"):
+        if origin.startswith(("git+ssh://", "git+https://")):
             return "git"
         raise self._sync_error_cls()(f"Unknown origin type for: {origin}")
 
@@ -632,7 +632,7 @@ class BaseRegistrySyncService[
         *,
         target_version: str | None = None,
         target_commit_sha: str | None = None,
-        ssh_env: SshEnv | None = None,
+        ssh_env: GitAuthEnv | None = None,
         git_repo_package_name: str | None = None,
         commit: bool = True,
         promote: bool = True,
@@ -674,16 +674,20 @@ class BaseRegistrySyncService[
 
             # Validate that the key exists before scheduling the workflow.
             # The worker fetches the value again and the key is not serialized.
-            secrets_service = SecretsService(self.session, role=role)
-            try:
-                await secrets_service.get_org_secret_by_name(
-                    REGISTRY_GIT_SSH_KEY_SECRET_NAME
-                )
-            except TracecatNotFoundError as exc:
-                raise self._sync_error_cls()(
-                    "Git repository sync requires a "
-                    f"'{REGISTRY_GIT_SSH_KEY_SECRET_NAME}' organization secret."
-                ) from exc
+            # git+https origins authenticate with the optional git access token
+            # secret instead (anonymous access works for public repositories),
+            # so no upfront check is required for them.
+            if origin.startswith("git+ssh://"):
+                secrets_service = SecretsService(self.session, role=role)
+                try:
+                    await secrets_service.get_org_secret_by_name(
+                        REGISTRY_GIT_SSH_KEY_SECRET_NAME
+                    )
+                except TracecatNotFoundError as exc:
+                    raise self._sync_error_cls()(
+                        "Git repository sync requires a "
+                        f"'{REGISTRY_GIT_SSH_KEY_SECRET_NAME}' organization secret."
+                    ) from exc
 
         request = RegistrySyncRequest(
             repository_id=repo_id,

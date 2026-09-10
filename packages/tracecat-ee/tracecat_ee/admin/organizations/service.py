@@ -739,6 +739,39 @@ class AdminOrgService(BasePlatformService):
             OrgRegistryVersionRead.model_validate(v) for v in result.scalars().all()
         ]
 
+    async def _skipped_org_sync_response(
+        self,
+        *,
+        repo: RegistryRepository,
+        current_version: RegistryVersion,
+        message: str,
+    ) -> OrgRegistrySyncResponse:
+        """Build the response for a sync that was skipped as a no-op."""
+        self.logger.info(
+            "Skipping registry sync",
+            repository_id=str(repo.id),
+            version=current_version.version,
+            reason=message,
+        )
+        stmt = (
+            select(RegistryRepository)
+            .options(selectinload(RegistryRepository.actions))
+            .where(RegistryRepository.id == repo.id)
+        )
+        result = await self.session.execute(stmt)
+        refreshed_repo = result.scalar_one()
+        return OrgRegistrySyncResponse(
+            success=True,
+            repository_id=repo.id,
+            origin=repo.origin,
+            version=current_version.version,
+            commit_sha=current_version.commit_sha,
+            actions_count=len(refreshed_repo.actions),
+            forced=False,
+            skipped=True,
+            message=message,
+        )
+
     @audit_log(
         resource_type="platform_registry_repository",
         action="sync",
@@ -748,7 +781,8 @@ class AdminOrgService(BasePlatformService):
         self, org_id: uuid.UUID, repository_id: uuid.UUID, force: bool = False
     ) -> OrgRegistrySyncResponse:
         """Sync a registry repository for an organization."""
-        from tracecat.git.utils import parse_git_url
+        from tracecat.git.auth import https_token_context
+        from tracecat.git.utils import parse_git_url, resolve_git_ref
         from tracecat.registry.actions.service import RegistryActionsService
         from tracecat.registry.repositories.schemas import RegistryRepositoryUpdate
         from tracecat.registry.repositories.service import RegistryReposService
@@ -780,59 +814,33 @@ class AdminOrgService(BasePlatformService):
                 f"Repository {repository_id} not found in organization {org_id}"
             )
 
-        # Check if version already exists
         versions_service = RegistryVersionsService(self.session, org_role)
+        current_version = None
         if repo.current_version_id is not None:
             current_version = await versions_service.get_version(
                 repo.current_version_id
             )
-            if current_version and not force:
-                # Skip sync - version already exists
-                self.logger.info(
-                    "Skipping sync: version already exists",
-                    org_id=str(org_id),
-                    repository_id=str(repository_id),
-                    version=current_version.version,
-                )
-                # Get action count
-                stmt = (
-                    select(RegistryRepository)
-                    .options(selectinload(RegistryRepository.actions))
-                    .where(RegistryRepository.id == repository_id)
-                )
-                result = await self.session.execute(stmt)
-                refreshed_repo = result.scalar_one()
-                actions_count = len(refreshed_repo.actions)
 
-                return OrgRegistrySyncResponse(
-                    success=True,
-                    repository_id=repo.id,
-                    origin=repo.origin,
-                    version=current_version.version,
-                    commit_sha=current_version.commit_sha,
-                    actions_count=actions_count,
-                    forced=False,
-                    skipped=True,
-                    message=f"Version {current_version.version} already exists. Use --force to re-sync.",
-                )
-            elif current_version and force:
-                # Force sync: delete current version
-                self.logger.info(
-                    "Force sync: deleting current version",
-                    org_id=str(org_id),
-                    repository_id=str(repository_id),
-                    version_id=str(current_version.id),
-                    version=current_version.version,
-                )
-                await versions_service.delete_version(current_version, commit=False)
-                await self.session.flush()
+        async def _delete_current_version() -> None:
+            if current_version is None:
+                return
+            self.logger.info(
+                "Force sync: deleting current version",
+                org_id=str(org_id),
+                repository_id=str(repository_id),
+                version_id=str(current_version.id),
+                version=current_version.version,
+            )
+            await versions_service.delete_version(current_version, commit=False)
+            await self.session.flush()
 
         actions_service = RegistryActionsService(self.session, org_role)
         last_synced_at = datetime.now(UTC)
 
         is_git_ssh = repo.origin.startswith("git+ssh://")
+        is_git_https = repo.origin.startswith("git+https://")
 
-        if is_git_ssh:
+        if is_git_ssh or is_git_https:
             git_repo_package_name = await get_setting(
                 "git_repo_package_name", role=org_role
             )
@@ -842,7 +850,64 @@ class AdminOrgService(BasePlatformService):
             allowed_domains = allowed_domains_setting or {"github.com"}
             git_url = parse_git_url(repo.origin, allowed_domains=allowed_domains)
 
-            if config.TRACECAT__REGISTRY_SYNC_SANDBOX_ENABLED:
+            needs_probe = current_version is not None and not force
+
+            async def _probe_and_maybe_skip(
+                git_env,
+            ) -> OrgRegistrySyncResponse | None:
+                # Skip only when the remote has nothing new: compare the
+                # remote ref SHA against the currently synced commit.
+                assert current_version is not None
+                remote_sha = await resolve_git_ref(
+                    git_url.transport_url, ref=git_url.ref, env=git_env
+                )
+                if current_version.commit_sha != remote_sha:
+                    return None
+                return await self._skipped_org_sync_response(
+                    repo=repo,
+                    current_version=current_version,
+                    message=(
+                        f"Repository is already up to date at commit "
+                        f"{remote_sha[:7]}. Use --force to rebuild."
+                    ),
+                )
+
+            if is_git_https:
+                # The token context reads an org secret and writes an askpass
+                # file; unlike ssh_context it spawns no agent, so it is safe
+                # to open API-side even in sandboxed sync mode.
+                async with https_token_context(
+                    role=org_role, git_url=git_url, session=self.session
+                ) as token_env:
+                    if needs_probe:
+                        skipped = await _probe_and_maybe_skip(token_env)
+                        if skipped is not None:
+                            return skipped
+                    if force:
+                        await _delete_current_version()
+                    if config.TRACECAT__REGISTRY_SYNC_SANDBOX_ENABLED:
+                        # The registry-sync activity fetches the token inside
+                        # the worker.
+                        sync_outcome = (
+                            await actions_service.sync_actions_from_repository(
+                                repo,
+                                git_repo_package_name=git_repo_package_name,
+                            )
+                        )
+                    else:
+                        sync_outcome = (
+                            await actions_service.sync_actions_from_repository(
+                                repo,
+                                git_repo_package_name=git_repo_package_name,
+                                ssh_env=token_env,
+                            )
+                        )
+            elif config.TRACECAT__REGISTRY_SYNC_SANDBOX_ENABLED:
+                # SSH credentials live in the worker for sandboxed sync; do
+                # not create an API-side agent just for the freshness probe.
+                # Unchanged commits are deduplicated by the versioned sync.
+                if force:
+                    await _delete_current_version()
                 sync_outcome = await actions_service.sync_actions_from_repository(
                     repo,
                     git_repo_package_name=git_repo_package_name,
@@ -851,12 +916,31 @@ class AdminOrgService(BasePlatformService):
                 async with ssh_context(
                     role=org_role, git_url=git_url, session=self.session
                 ) as ssh_env:
+                    if needs_probe:
+                        skipped = await _probe_and_maybe_skip(ssh_env)
+                        if skipped is not None:
+                            return skipped
+                    if force:
+                        await _delete_current_version()
                     sync_outcome = await actions_service.sync_actions_from_repository(
                         repo,
                         git_repo_package_name=git_repo_package_name,
                         ssh_env=ssh_env,
                     )
         else:
+            # Non-git origins have no remote to compare against; preserve the
+            # skip-unless-forced behavior.
+            if current_version and not force:
+                return await self._skipped_org_sync_response(
+                    repo=repo,
+                    current_version=current_version,
+                    message=(
+                        f"Version {current_version.version} already exists. "
+                        "Use --force to re-sync."
+                    ),
+                )
+            if force:
+                await _delete_current_version()
             sync_outcome = await actions_service.sync_actions_from_repository(repo)
 
         # Update repository

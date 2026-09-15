@@ -64,10 +64,15 @@ import type {
   AdminListTiersData,
   AdminListTiersResponse,
   AdminListUsersResponse,
+  AdminMaintenanceGetCaseAgentSessionInteractionBackfillData,
+  AdminMaintenanceGetCaseAgentSessionInteractionBackfillResponse,
+  AdminMaintenanceStartCaseAgentSessionInteractionBackfillResponse,
   AdminPromoteOrgRepositoryVersionData,
   AdminPromoteOrgRepositoryVersionResponse,
   AdminPromoteToSuperuserData,
   AdminPromoteToSuperuserResponse,
+  AdminRegistryDeleteRegistryVersionData,
+  AdminRegistryDeleteRegistryVersionResponse,
   AdminRegistryGetPlatformRepositoryData,
   AdminRegistryGetPlatformRepositoryResponse,
   AdminRegistryGetRegistryStatusResponse,
@@ -86,6 +91,8 @@ import type {
   AdminRevokeOrganizationInvitationResponse,
   AdminSyncOrgRepositoryData,
   AdminSyncOrgRepositoryResponse,
+  AdminTestAuditWebhookData,
+  AdminTestAuditWebhookResponse,
   AdminUpdateAuditSettingsData,
   AdminUpdateAuditSettingsResponse,
   AdminUpdateOrganizationData,
@@ -160,12 +167,18 @@ import type {
   AgentPresetsListPresetTagsResponse,
   AgentPresetsMoveAgentPresetToFolderData,
   AgentPresetsMoveAgentPresetToFolderResponse,
+  AgentPresetsPreviewToolPolicyData,
+  AgentPresetsPreviewToolPolicyResponse,
   AgentPresetsRemovePresetTagData,
   AgentPresetsRemovePresetTagResponse,
   AgentPresetsRestoreAgentPresetVersionData,
   AgentPresetsRestoreAgentPresetVersionResponse,
   AgentPresetsUpdateAgentPresetData,
   AgentPresetsUpdateAgentPresetResponse,
+  AgentRefreshProviderModelsData,
+  AgentRefreshProviderModelsResponse,
+  AgentSessionsCancelSessionData,
+  AgentSessionsCancelSessionResponse,
   AgentSessionsCreateSessionData,
   AgentSessionsCreateSessionResponse,
   AgentSessionsDeleteSessionData,
@@ -304,6 +317,16 @@ import type {
   CaseDurationsUpdateCaseDurationResponse,
   CasesAddTagData,
   CasesAddTagResponse,
+  CasesBatchDeleteCasesData,
+  CasesBatchDeleteCasesResponse,
+  CasesBatchLinkCaseRowsData,
+  CasesBatchLinkCaseRowsResponse,
+  CasesBatchUnlinkCaseRowsData,
+  CasesBatchUnlinkCaseRowsResponse,
+  CasesBatchUpdateCasesData,
+  CasesBatchUpdateCasesResponse,
+  CasesCompareCaseVersionData,
+  CasesCompareCaseVersionResponse,
   CasesCreateCaseData,
   CasesCreateCaseResponse,
   CasesCreateCommentData,
@@ -328,10 +351,14 @@ import type {
   CasesLinkCaseRowResponse,
   CasesListCaseDropdownValuesData,
   CasesListCaseDropdownValuesResponse,
+  CasesListCaseLinkedTablesData,
+  CasesListCaseLinkedTablesResponse,
   CasesListCaseRowsData,
   CasesListCaseRowsResponse,
   CasesListCasesData,
   CasesListCasesResponse,
+  CasesListCaseVersionsData,
+  CasesListCaseVersionsResponse,
   CasesListCommentsData,
   CasesListCommentsResponse,
   CasesListCommentThreadsData,
@@ -346,6 +373,8 @@ import type {
   CasesListTasksResponse,
   CasesRemoveTagData,
   CasesRemoveTagResponse,
+  CasesRestoreCaseVersionData,
+  CasesRestoreCaseVersionResponse,
   CasesSearchCaseAggregatesData,
   CasesSearchCaseAggregatesResponse,
   CasesSearchCasesData,
@@ -455,6 +484,8 @@ import type {
   McpIntegrationsDisconnectMcpIntegrationResponse,
   McpIntegrationsGetMcpIntegrationData,
   McpIntegrationsGetMcpIntegrationResponse,
+  McpIntegrationsGetMcpIntegrationVerificationStatusData,
+  McpIntegrationsGetMcpIntegrationVerificationStatusResponse,
   McpIntegrationsListMcpIntegrationsData,
   McpIntegrationsListMcpIntegrationsResponse,
   McpIntegrationsListPlatformMcpCatalogData,
@@ -490,6 +521,7 @@ import type {
   OrganizationGetInvitationTokenResponse,
   OrganizationGetOrganizationEntitlementsResponse,
   OrganizationGetOrganizationResponse,
+  OrganizationListCurrentUserOrganizationMembershipsResponse,
   OrganizationListInvitationsData,
   OrganizationListInvitationsResponse,
   OrganizationListMyPendingInvitationsResponse,
@@ -677,11 +709,16 @@ import type {
   ServiceAccountsUpdateOrganizationServiceAccountResponse,
   ServiceAccountsUpdateWorkspaceServiceAccountData,
   ServiceAccountsUpdateWorkspaceServiceAccountResponse,
+  SettingsGetAgentOtelSettingsResponse,
   SettingsGetAgentSettingsResponse,
   SettingsGetAppSettingsResponse,
   SettingsGetAuditSettingsResponse,
   SettingsGetGitSettingsResponse,
   SettingsGetSamlSettingsResponse,
+  SettingsTestAuditWebhookData,
+  SettingsTestAuditWebhookResponse,
+  SettingsUpdateAgentOtelSettingsData,
+  SettingsUpdateAgentOtelSettingsResponse,
   SettingsUpdateAgentSettingsData,
   SettingsUpdateAgentSettingsResponse,
   SettingsUpdateAppSettingsData,
@@ -1032,7 +1069,7 @@ export const publicIncomingWebhookWait = (
     },
     errors: {
       413: "Unwrapped workflow result exceeded inline response limits. Use `detail.download_url` to fetch the externalized result.",
-      422: "Validation Error",
+      422: "Invalid request parameters or a user-owned workflow failure.",
     },
   })
 }
@@ -4130,6 +4167,20 @@ export const organizationDeleteOrganization = (
 }
 
 /**
+ * List Current User Organization Memberships
+ * List active organizations the current user belongs to.
+ * @returns tracecat__organization__schemas__OrgRead Successful Response
+ * @throws ApiError
+ */
+export const organizationListCurrentUserOrganizationMemberships =
+  (): CancelablePromise<OrganizationListCurrentUserOrganizationMembershipsResponse> => {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/organization/memberships",
+    })
+  }
+
+/**
  * List Organization Domains
  * List domains assigned to the current organization.
  * @returns tracecat__organization__schemas__OrgDomainRead Successful Response
@@ -4802,6 +4853,29 @@ export const agentDeleteProviderCredentials = (
   return __request(OpenAPI, {
     method: "DELETE",
     url: "/agent/credentials/{provider}",
+    path: {
+      provider: data.provider,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Refresh Provider Models
+ * Re-discover models for a built-in gateway provider (Ollama, vLLM, ...).
+ * @param data The data for the request.
+ * @param data.provider
+ * @returns number Successful Response
+ * @throws ApiError
+ */
+export const agentRefreshProviderModels = (
+  data: AgentRefreshProviderModelsData
+): CancelablePromise<AgentRefreshProviderModelsResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/agent/providers/{provider}/refresh",
     path: {
       provider: data.provider,
     },
@@ -5499,6 +5573,33 @@ export const agentPresetsCreateAgentPreset = (
 }
 
 /**
+ * Preview Tool Policy
+ * Evaluate unsaved tool selections without changing a preset.
+ * @param data The data for the request.
+ * @param data.workspaceId
+ * @param data.requestBody
+ * @returns AgentPresetToolPolicyRead Successful Response
+ * @throws ApiError
+ */
+export const agentPresetsPreviewToolPolicy = (
+  data: AgentPresetsPreviewToolPolicyData
+): CancelablePromise<AgentPresetsPreviewToolPolicyResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/workspaces/{workspace_id}/agent/presets/tool-policy",
+    path: {
+      workspace_id: data.workspaceId,
+    },
+    body: data.requestBody,
+    mediaType: "application/json",
+    errors: {
+      400: "Invalid tool policy selections",
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
  * Get Agent Preset
  * Retrieve an agent preset by ID.
  * @param data The data for the request.
@@ -5571,6 +5672,7 @@ export const agentPresetsDeleteAgentPreset = (
       workspace_id: data.workspaceId,
     },
     errors: {
+      404: "Agent preset not found",
       422: "Validation Error",
     },
   })
@@ -6587,6 +6689,7 @@ export const agentSessionsCreateSession = (
  * @param data.workspaceId
  * @param data.entityType Filter by entity type
  * @param data.entityId Filter by entity ID
+ * @param data.createdBy Filter by session creator. Omit to list the entire workspace.
  * @param data.excludeEntityTypes Entity types to exclude from results
  * @param data.parentSessionId Filter by parent session ID (for finding forked sessions)
  * @param data.limit Maximum number of sessions to return
@@ -6605,6 +6708,7 @@ export const agentSessionsListSessions = (
     query: {
       entity_type: data.entityType,
       entity_id: data.entityId,
+      created_by: data.createdBy,
       exclude_entity_types: data.excludeEntityTypes,
       parent_session_id: data.parentSessionId,
       limit: data.limit,
@@ -6839,6 +6943,34 @@ export const agentSessionsForkSession = (
   return __request(OpenAPI, {
     method: "POST",
     url: "/workspaces/{workspace_id}/agent/sessions/{session_id}/fork",
+    path: {
+      session_id: data.sessionId,
+      workspace_id: data.workspaceId,
+    },
+    body: data.requestBody,
+    mediaType: "application/json",
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Cancel Session
+ * Request graceful cancellation for the active agent session turn.
+ * @param data The data for the request.
+ * @param data.sessionId
+ * @param data.workspaceId
+ * @param data.requestBody
+ * @returns AgentSessionCancelResponse Successful Response
+ * @throws ApiError
+ */
+export const agentSessionsCancelSession = (
+  data: AgentSessionsCancelSessionData
+): CancelablePromise<AgentSessionsCancelSessionResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/workspaces/{workspace_id}/agent/sessions/{session_id}/cancel",
     path: {
       session_id: data.sessionId,
       workspace_id: data.workspaceId,
@@ -7547,6 +7679,28 @@ export const adminUpdateAuditSettings = (
 }
 
 /**
+ * Test Audit Webhook
+ * Probe the submitted platform audit webhook configuration.
+ * @param data The data for the request.
+ * @param data.requestBody
+ * @returns AuditWebhookTestResult Successful Response
+ * @throws ApiError
+ */
+export const adminTestAuditWebhook = (
+  data: AdminTestAuditWebhookData
+): CancelablePromise<AdminTestAuditWebhookResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/admin/settings/audit/test",
+    body: data.requestBody,
+    mediaType: "application/json",
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
  * Get Registry Settings
  * Get platform registry settings.
  * @returns PlatformRegistrySettingsRead Successful Response
@@ -7928,6 +8082,43 @@ export const adminAgentListPlatformCatalog = (
 }
 
 /**
+ * Start Case Agent Session Interaction Backfill
+ * Start or join the durable historical case-mutation backfill.
+ * @returns CaseAgentSessionInteractionBackfillStartResponse Successful Response
+ * @throws ApiError
+ */
+export const adminMaintenanceStartCaseAgentSessionInteractionBackfill =
+  (): CancelablePromise<AdminMaintenanceStartCaseAgentSessionInteractionBackfillResponse> => {
+    return __request(OpenAPI, {
+      method: "POST",
+      url: "/admin/maintenance/case-agent-session-interactions/backfill",
+    })
+  }
+
+/**
+ * Get Case Agent Session Interaction Backfill
+ * Poll a durable historical case-mutation backfill.
+ * @param data The data for the request.
+ * @param data.operationId
+ * @returns CaseAgentSessionInteractionBackfillStatusResponse Successful Response
+ * @throws ApiError
+ */
+export const adminMaintenanceGetCaseAgentSessionInteractionBackfill = (
+  data: AdminMaintenanceGetCaseAgentSessionInteractionBackfillData
+): CancelablePromise<AdminMaintenanceGetCaseAgentSessionInteractionBackfillResponse> => {
+  return __request(OpenAPI, {
+    method: "GET",
+    url: "/admin/maintenance/case-agent-session-interactions/backfill/{operation_id}",
+    path: {
+      operation_id: data.operationId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
  * List Platform Repositories
  * List all platform registry repositories.
  * @returns RegistryRepositoryReadMinimal Successful Response
@@ -8101,6 +8292,31 @@ export const adminRegistryPromoteRegistryVersion = (
 }
 
 /**
+ * Delete Registry Version
+ * Delete an unused, non-current platform registry version.
+ * @param data The data for the request.
+ * @param data.repositoryId
+ * @param data.versionId
+ * @returns void Successful Response
+ * @throws ApiError
+ */
+export const adminRegistryDeleteRegistryVersion = (
+  data: AdminRegistryDeleteRegistryVersionData
+): CancelablePromise<AdminRegistryDeleteRegistryVersionResponse> => {
+  return __request(OpenAPI, {
+    method: "DELETE",
+    url: "/admin/registry/{repository_id}/versions/{version_id}",
+    path: {
+      repository_id: data.repositoryId,
+      version_id: data.versionId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
  * Get Pending Count
  * Get the number of pending inbox items that require attention.
  * @param data The data for the request.
@@ -8137,6 +8353,7 @@ export const inboxGetPendingCount = (
  * @param data.orderBy Column name to order by (created_at, updated_at)
  * @param data.sort Sort direction (asc or desc)
  * @param data.search Case-insensitive search on item title
+ * @param data.caseId Filter items to root sessions associated with this case
  * @param data.group Filter items to a single display group
  * @param data.entityType Filter items to a single entity type
  * @param data.createdAfter Only items created at or after this time (ISO 8601)
@@ -8160,6 +8377,7 @@ export const inboxListItems = (
       order_by: data.orderBy,
       sort: data.sort,
       search: data.search,
+      case_id: data.caseId,
       group: data.group,
       entity_type: data.entityType,
       created_after: data.createdAfter,
@@ -8799,6 +9017,28 @@ export const settingsUpdateAuditSettings = (
 }
 
 /**
+ * Test Audit Webhook
+ * Probe the submitted audit webhook configuration with a marked test event.
+ * @param data The data for the request.
+ * @param data.requestBody
+ * @returns AuditWebhookTestResult Successful Response
+ * @throws ApiError
+ */
+export const settingsTestAuditWebhook = (
+  data: SettingsTestAuditWebhookData
+): CancelablePromise<SettingsTestAuditWebhookResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/settings/audit/test",
+    body: data.requestBody,
+    mediaType: "application/json",
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
  * Get Agent Settings
  * @returns AgentSettingsRead Successful Response
  * @throws ApiError
@@ -8824,6 +9064,40 @@ export const settingsUpdateAgentSettings = (
   return __request(OpenAPI, {
     method: "PATCH",
     url: "/settings/agent",
+    body: data.requestBody,
+    mediaType: "application/json",
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Get Agent Otel Settings
+ * @returns AgentOtelSettingsRead Successful Response
+ * @throws ApiError
+ */
+export const settingsGetAgentOtelSettings =
+  (): CancelablePromise<SettingsGetAgentOtelSettingsResponse> => {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/settings/agent-otel",
+    })
+  }
+
+/**
+ * Update Agent Otel Settings
+ * @param data The data for the request.
+ * @param data.requestBody
+ * @returns void Successful Response
+ * @throws ApiError
+ */
+export const settingsUpdateAgentOtelSettings = (
+  data: SettingsUpdateAgentOtelSettingsData
+): CancelablePromise<SettingsUpdateAgentOtelSettingsResponse> => {
+  return __request(OpenAPI, {
+    method: "PATCH",
+    url: "/settings/agent-otel",
     body: data.requestBody,
     mediaType: "application/json",
     errors: {
@@ -9639,6 +9913,58 @@ export const casesSearchCaseAggregates = (
 }
 
 /**
+ * Batch Update Cases
+ * Update multiple cases with per-case results.
+ * @param data The data for the request.
+ * @param data.workspaceId
+ * @param data.requestBody
+ * @returns CaseBatchResponse Successful Response
+ * @throws ApiError
+ */
+export const casesBatchUpdateCases = (
+  data: CasesBatchUpdateCasesData
+): CancelablePromise<CasesBatchUpdateCasesResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/workspaces/{workspace_id}/cases/batch-update",
+    path: {
+      workspace_id: data.workspaceId,
+    },
+    body: data.requestBody,
+    mediaType: "application/json",
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Batch Delete Cases
+ * Delete multiple cases with per-case results.
+ * @param data The data for the request.
+ * @param data.workspaceId
+ * @param data.requestBody
+ * @returns CaseBatchResponse Successful Response
+ * @throws ApiError
+ */
+export const casesBatchDeleteCases = (
+  data: CasesBatchDeleteCasesData
+): CancelablePromise<CasesBatchDeleteCasesResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/workspaces/{workspace_id}/cases/batch-delete",
+    path: {
+      workspace_id: data.workspaceId,
+    },
+    body: data.requestBody,
+    mediaType: "application/json",
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
  * Get Case
  * Get a specific case.
  * @param data The data for the request.
@@ -9991,13 +10317,104 @@ export const casesDeleteTask = (
 }
 
 /**
+ * List Case Versions
+ * List immutable case field versions newest-first.
+ * @param data The data for the request.
+ * @param data.caseId
+ * @param data.workspaceId
+ * @param data.limit Maximum items per page
+ * @param data.cursor Cursor for pagination
+ * @param data.field Optionally include only summary or description versions
+ * @returns CursorPaginatedResponse_CaseVersionReadMinimal_ Successful Response
+ * @throws ApiError
+ */
+export const casesListCaseVersions = (
+  data: CasesListCaseVersionsData
+): CancelablePromise<CasesListCaseVersionsResponse> => {
+  return __request(OpenAPI, {
+    method: "GET",
+    url: "/workspaces/{workspace_id}/cases/{case_id}/versions",
+    path: {
+      case_id: data.caseId,
+      workspace_id: data.workspaceId,
+    },
+    query: {
+      limit: data.limit,
+      cursor: data.cursor,
+      field: data.field,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Compare Case Version
+ * Return a case field version and its immediate predecessor.
+ * @param data The data for the request.
+ * @param data.caseId
+ * @param data.versionId
+ * @param data.workspaceId
+ * @returns CaseVersionCompareRead Successful Response
+ * @throws ApiError
+ */
+export const casesCompareCaseVersion = (
+  data: CasesCompareCaseVersionData
+): CancelablePromise<CasesCompareCaseVersionResponse> => {
+  return __request(OpenAPI, {
+    method: "GET",
+    url: "/workspaces/{workspace_id}/cases/{case_id}/versions/{version_id}/compare",
+    path: {
+      case_id: data.caseId,
+      version_id: data.versionId,
+      workspace_id: data.workspaceId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Restore Case Version
+ * Restore one historical case field version atomically.
+ * @param data The data for the request.
+ * @param data.caseId
+ * @param data.versionId
+ * @param data.workspaceId
+ * @returns CaseVersionRestoreRead Successful Response
+ * @throws ApiError
+ */
+export const casesRestoreCaseVersion = (
+  data: CasesRestoreCaseVersionData
+): CancelablePromise<CasesRestoreCaseVersionResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/workspaces/{workspace_id}/cases/{case_id}/versions/{version_id}/restore",
+    path: {
+      case_id: data.caseId,
+      version_id: data.versionId,
+      workspace_id: data.workspaceId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
  * List Case Rows
+ * List linked rows.
+ *
+ * ``total_estimate`` is an exact count when ``table_id`` is set, null otherwise.
  * @param data The data for the request.
  * @param data.caseId
  * @param data.workspaceId
  * @param data.limit
  * @param data.cursor
  * @param data.reverse
+ * @param data.tableId Restrict results to one linked table
  * @returns CursorPaginatedResponse_CaseTableRowRead_ Successful Response
  * @throws ApiError
  */
@@ -10015,6 +10432,7 @@ export const casesListCaseRows = (
       limit: data.limit,
       cursor: data.cursor,
       reverse: data.reverse,
+      table_id: data.tableId,
     },
     errors: {
       422: "Validation Error",
@@ -10050,6 +10468,34 @@ export const casesLinkCaseRow = (
 }
 
 /**
+ * List Case Linked Tables
+ * List the tables that have rows linked to a case, with their columns.
+ *
+ * Only ``case:read`` is required: the links, and the column definitions needed
+ * to render them, are case data.
+ * @param data The data for the request.
+ * @param data.caseId
+ * @param data.workspaceId
+ * @returns CaseLinkedTableRead Successful Response
+ * @throws ApiError
+ */
+export const casesListCaseLinkedTables = (
+  data: CasesListCaseLinkedTablesData
+): CancelablePromise<CasesListCaseLinkedTablesResponse> => {
+  return __request(OpenAPI, {
+    method: "GET",
+    url: "/workspaces/{workspace_id}/cases/{case_id}/rows/tables",
+    path: {
+      case_id: data.caseId,
+      workspace_id: data.workspaceId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
  * Insert Case Row
  * @param data The data for the request.
  * @param data.caseId
@@ -10064,6 +10510,62 @@ export const casesInsertCaseRow = (
   return __request(OpenAPI, {
     method: "POST",
     url: "/workspaces/{workspace_id}/cases/{case_id}/rows/insert",
+    path: {
+      case_id: data.caseId,
+      workspace_id: data.workspaceId,
+    },
+    body: data.requestBody,
+    mediaType: "application/json",
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Batch Link Case Rows
+ * Link rows in bulk; conflict handling makes an integrity error unreachable.
+ * @param data The data for the request.
+ * @param data.caseId
+ * @param data.workspaceId
+ * @param data.requestBody
+ * @returns CaseTableRowBatchLinkResponse Successful Response
+ * @throws ApiError
+ */
+export const casesBatchLinkCaseRows = (
+  data: CasesBatchLinkCaseRowsData
+): CancelablePromise<CasesBatchLinkCaseRowsResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/workspaces/{workspace_id}/cases/{case_id}/rows/batch-link",
+    path: {
+      case_id: data.caseId,
+      workspace_id: data.workspaceId,
+    },
+    body: data.requestBody,
+    mediaType: "application/json",
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Batch Unlink Case Rows
+ * Unlink rows in bulk, returning zero for a fully no-op batch.
+ * @param data The data for the request.
+ * @param data.caseId
+ * @param data.workspaceId
+ * @param data.requestBody
+ * @returns CaseTableRowBatchUnlinkResponse Successful Response
+ * @throws ApiError
+ */
+export const casesBatchUnlinkCaseRows = (
+  data: CasesBatchUnlinkCaseRowsData
+): CancelablePromise<CasesBatchUnlinkCaseRowsResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/workspaces/{workspace_id}/cases/{case_id}/rows/batch-unlink",
     path: {
       case_id: data.caseId,
       workspace_id: data.workspaceId,
@@ -10948,7 +11450,7 @@ export const caseDurationsDeleteCaseDurationDefinition = (
 
 /**
  * List Case Durations
- * Sync and list case durations for the provided case.
+ * List materialized case durations for the provided case.
  * @param data The data for the request.
  * @param data.caseId
  * @param data.workspaceId
@@ -11670,6 +12172,7 @@ export const mcpIntegrationsListPlatformMcpCatalog = (
  * @param data The data for the request.
  * @param data.catalogSlug
  * @param data.workspaceId
+ * @param data.requestBody
  * @returns MCPCatalogConnectResponse Successful Response
  * @throws ApiError
  */
@@ -11683,6 +12186,8 @@ export const mcpIntegrationsConnectPlatformMcpCatalog = (
       catalog_slug: data.catalogSlug,
       workspace_id: data.workspaceId,
     },
+    body: data.requestBody,
+    mediaType: "application/json",
     errors: {
       422: "Validation Error",
     },
@@ -11794,6 +12299,31 @@ export const mcpIntegrationsDeleteMcpIntegration = (
 }
 
 /**
+ * Get Mcp Integration Verification Status
+ * Get saved MCP integration verification status.
+ * @param data The data for the request.
+ * @param data.mcpIntegrationId
+ * @param data.workspaceId
+ * @returns MCPVerificationStatusRead Successful Response
+ * @throws ApiError
+ */
+export const mcpIntegrationsGetMcpIntegrationVerificationStatus = (
+  data: McpIntegrationsGetMcpIntegrationVerificationStatusData
+): CancelablePromise<McpIntegrationsGetMcpIntegrationVerificationStatusResponse> => {
+  return __request(OpenAPI, {
+    method: "GET",
+    url: "/workspaces/{workspace_id}/mcp-integrations/{mcp_integration_id}/verification-status",
+    path: {
+      mcp_integration_id: data.mcpIntegrationId,
+      workspace_id: data.workspaceId,
+    },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
  * Update Mcp Integration Tool Policies
  * Update MCP integration tool availability and approval policy.
  * @param data The data for the request.
@@ -11823,10 +12353,10 @@ export const mcpIntegrationsUpdateMcpIntegrationToolPolicies = (
 
 /**
  * Test Mcp Connection Config
- * Test connectivity against an unsaved HTTP MCP configuration.
+ * Test connectivity against an MCP configuration.
  *
- * Ephemeral: nothing is persisted and stored verification state is never
- * touched — use this for testing edited form values before saving.
+ * HTTP tests are ephemeral and never touch stored verification state. Stdio
+ * tests require a saved integration ID and use saved-row verification.
  * @param data The data for the request.
  * @param data.workspaceId
  * @param data.requestBody
@@ -11852,7 +12382,7 @@ export const mcpIntegrationsTestMcpConnectionConfig = (
 
 /**
  * Test Mcp Integration Connection
- * Test connectivity to an HTTP MCP server and refresh its tool listing.
+ * Test connectivity to an MCP server and refresh its tool listing.
  * @param data The data for the request.
  * @param data.mcpIntegrationId
  * @param data.workspaceId

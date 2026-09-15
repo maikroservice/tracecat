@@ -18,6 +18,8 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover"
 import { Switch } from "@/components/ui/switch"
+import { toast } from "@/components/ui/use-toast"
+import { isAgentToolSelectable } from "@/lib/agent-tools"
 import { cn } from "@/lib/utils"
 import type { ChatSurface } from "@/types/chat-surface"
 
@@ -28,7 +30,6 @@ interface ChatToolsPickerProps {
   mcpIntegrations: MCPIntegrationRead[]
   selectedMcpIntegrations: string[]
   onMcpChange: (next: string[]) => void
-  agentAddonsEnabled?: boolean
   mcpEnabled?: boolean
   disabled?: boolean
   /** Selects which chat surface-specific default capabilities are read-only. */
@@ -59,10 +60,19 @@ type CapabilityGroup = {
   id: string
   label: string
   tools: string[]
-  addon?: boolean
 }
 
 const TOOL_SEARCH_LIMIT = 24
+
+/**
+ * Maximum number of extra tools (and, separately, MCP integrations) that can be
+ * attached to a single chat session. Mirrors `max_length=50` on
+ * `AgentSessionCreate`/`AgentSessionUpdate` in
+ * `tracecat/agent/session/schemas.py` and the matching `ChatCreate`/`ChatUpdate`
+ * limits in `tracecat/chat/schemas.py`. Keep in sync with the backend so the
+ * picker blocks overflow before the API rejects it with a 422.
+ */
+export const MAX_SELECTABLE_TOOLS = 50
 
 /**
  * Always-on workspace chat capabilities, grouped for display. Mirrors
@@ -84,6 +94,7 @@ export const DEFAULT_CAPABILITY_GROUPS: CapabilityGroup[] = [
       "core.cases.list_cases",
       "core.cases.get_case",
       "core.cases.search_cases",
+      "core.cases.aggregate_cases",
     ],
   },
   {
@@ -101,6 +112,7 @@ export const DEFAULT_CAPABILITY_GROUPS: CapabilityGroup[] = [
       "core.table.lookup_many",
       "core.table.is_in",
       "core.table.search_rows",
+      "core.table.aggregate_rows",
       "core.table.insert_row",
       "core.table.insert_rows",
       "core.table.update_row",
@@ -123,12 +135,13 @@ export const DEFAULT_CAPABILITY_GROUPS: CapabilityGroup[] = [
       "core.workflow.publish",
       "core.workflow.run",
       "core.workflow.execute",
+      "core.workflow.list_executions",
+      "core.workflow.get_status",
     ],
   },
   {
     id: "presets",
     label: "Agent presets",
-    addon: true,
     tools: [
       "ai.agent.create_preset",
       "ai.agent.get_preset",
@@ -168,7 +181,6 @@ export function ChatToolsPicker({
   mcpIntegrations,
   selectedMcpIntegrations,
   onMcpChange,
-  agentAddonsEnabled = true,
   mcpEnabled = true,
   disabled = false,
   surface = "regular",
@@ -183,6 +195,21 @@ export function ChatToolsPicker({
 
   const addedCount =
     selectedTools.length + (mcpEnabled ? selectedMcpIntegrations.length : 0)
+
+  // The backend caps `tools` (and `mcp_integrations`) at MAX_SELECTABLE_TOOLS
+  // each. Track when either list is full so the picker can block additions and
+  // disable the relevant toggles instead of letting the update 422.
+  const toolsAtLimit = selectedTools.length >= MAX_SELECTABLE_TOOLS
+  const mcpAtLimit =
+    mcpEnabled && selectedMcpIntegrations.length >= MAX_SELECTABLE_TOOLS
+
+  // Only surface a limit message when it matters — at the cap — rather than a
+  // persistent counter that duplicates the trigger button and group counts.
+  const limitMessage = toolsAtLimit
+    ? `You've reached the ${MAX_SELECTABLE_TOOLS}-tool limit. Remove a tool to add another.`
+    : mcpAtLimit
+      ? `You've reached the ${MAX_SELECTABLE_TOOLS}-integration limit. Remove one to add another.`
+      : null
 
   const toggleExpanded = (key: string) => {
     setExpanded((prev) => {
@@ -199,6 +226,7 @@ export function ChatToolsPicker({
   const toolOptions = useMemo<ToolOption[]>(
     () =>
       registryActions
+        .filter((action) => isAgentToolSelectable(action.action))
         .map((action) => ({
           value: action.action,
           label: action.default_title || action.action,
@@ -215,13 +243,8 @@ export function ChatToolsPicker({
   )
 
   const visibleCapabilityGroups = useMemo(
-    () =>
-      isWorkspaceChat
-        ? DEFAULT_CAPABILITY_GROUPS.filter(
-            (group) => !group.addon || agentAddonsEnabled
-          )
-        : [],
-    [agentAddonsEnabled, isWorkspaceChat]
+    () => (isWorkspaceChat ? DEFAULT_CAPABILITY_GROUPS : []),
+    [isWorkspaceChat]
   )
 
   // Tools the user can add: everything except this surface's always-on defaults.
@@ -339,6 +362,13 @@ export function ChatToolsPicker({
       onToolsChange(selectedTools.filter((tool) => tool !== value))
       return
     }
+    if (selectedTools.length >= MAX_SELECTABLE_TOOLS) {
+      toast({
+        title: "Tool limit reached",
+        description: `You can add at most ${MAX_SELECTABLE_TOOLS} tools. Remove one before adding another.`,
+      })
+      return
+    }
     onToolsChange([...selectedTools, value])
   }
 
@@ -354,12 +384,29 @@ export function ChatToolsPicker({
     for (const value of values) {
       next.add(value)
     }
+    // Adding a group is all-or-nothing: if it would push past the cap, add none
+    // and tell the user how many they'd need to make room for.
+    if (next.size > MAX_SELECTABLE_TOOLS) {
+      const additional = next.size - selectedTools.length
+      toast({
+        title: "Tool limit reached",
+        description: `Adding these ${additional} tools would exceed the ${MAX_SELECTABLE_TOOLS}-tool limit. Remove some tools first.`,
+      })
+      return
+    }
     onToolsChange(Array.from(next))
   }
 
   const toggleMcp = (id: string) => {
     if (selectedMcpIntegrations.includes(id)) {
       onMcpChange(selectedMcpIntegrations.filter((value) => value !== id))
+      return
+    }
+    if (selectedMcpIntegrations.length >= MAX_SELECTABLE_TOOLS) {
+      toast({
+        title: "MCP integration limit reached",
+        description: `You can add at most ${MAX_SELECTABLE_TOOLS} MCP integrations. Remove one before adding another.`,
+      })
       return
     }
     onMcpChange([...selectedMcpIntegrations, id])
@@ -370,7 +417,7 @@ export function ChatToolsPicker({
   return (
     <Popover>
       <PopoverTrigger asChild>
-        <PromptInputButton disabled={disabled} className="text-xs">
+        <PromptInputButton disabled={disabled} className="h-7 text-xs">
           <SlidersHorizontalIcon className="size-4" />
           <span>{addedCount > 0 ? `Tools (${addedCount})` : "Tools"}</span>
         </PromptInputButton>
@@ -394,18 +441,22 @@ export function ChatToolsPicker({
             <>
               <GroupLabel>Add tools</GroupLabel>
               {searchResults.length > 0 ? (
-                searchResults.map((tool) => (
-                  <Row
-                    key={tool.value}
-                    dotClassName={
-                      tool.stale ? "bg-muted-foreground" : "bg-amber-500"
-                    }
-                    title={tool.label}
-                    subtitle={tool.group}
-                    checked={selectedTools.includes(tool.value)}
-                    onToggle={() => toggleTool(tool.value)}
-                  />
-                ))
+                searchResults.map((tool) => {
+                  const isSelected = selectedTools.includes(tool.value)
+                  return (
+                    <Row
+                      key={tool.value}
+                      dotClassName={
+                        tool.stale ? "bg-muted-foreground" : "bg-amber-500"
+                      }
+                      title={tool.label}
+                      subtitle={tool.group}
+                      checked={isSelected}
+                      disabled={!isSelected && toolsAtLimit}
+                      onToggle={() => toggleTool(tool.value)}
+                    />
+                  )
+                })
               ) : (
                 <EmptyHint>No tools found.</EmptyHint>
               )}
@@ -431,22 +482,26 @@ export function ChatToolsPicker({
                 <>
                   <GroupLabel>MCP integrations</GroupLabel>
                   {visibleMcpIntegrations.length > 0 ? (
-                    visibleMcpIntegrations.map((integration) => (
-                      <Row
-                        key={integration.id}
-                        dotClassName={
-                          integration.stale
-                            ? "bg-muted-foreground"
-                            : "bg-sky-500"
-                        }
-                        title={integration.name}
-                        subtitle={integration.description}
-                        checked={selectedMcpIntegrations.includes(
-                          integration.id
-                        )}
-                        onToggle={() => toggleMcp(integration.id)}
-                      />
-                    ))
+                    visibleMcpIntegrations.map((integration) => {
+                      const isSelected = selectedMcpIntegrations.includes(
+                        integration.id
+                      )
+                      return (
+                        <Row
+                          key={integration.id}
+                          dotClassName={
+                            integration.stale
+                              ? "bg-muted-foreground"
+                              : "bg-sky-500"
+                          }
+                          title={integration.name}
+                          subtitle={integration.description}
+                          checked={isSelected}
+                          disabled={!isSelected && mcpAtLimit}
+                          onToggle={() => toggleMcp(integration.id)}
+                        />
+                      )
+                    })
                   ) : mcpIntegrationsHref ? (
                     <Link
                       href={mcpIntegrationsHref}
@@ -512,6 +567,7 @@ export function ChatToolsPicker({
                       onToggleGroup={() => toggleGroup(tools)}
                       onToggleTool={toggleTool}
                       selectedTools={selectedTools}
+                      atLimit={toolsAtLimit}
                     />
                   )
                 })
@@ -523,10 +579,15 @@ export function ChatToolsPicker({
           )}
         </div>
 
-        <div className="border-t px-3 py-2 text-[11px] text-muted-foreground">
-          {addedCount} added
-          {isWorkspaceChat ? " · Tracecat defaults always included" : ""}
-        </div>
+        {limitMessage ? (
+          <div className="border-t px-3 py-2 text-[11px] text-muted-foreground">
+            {limitMessage}
+          </div>
+        ) : isWorkspaceChat ? (
+          <div className="border-t px-3 py-2 text-[11px] text-muted-foreground">
+            Tracecat defaults always included
+          </div>
+        ) : null}
       </PopoverContent>
     </Popover>
   )
@@ -578,15 +639,24 @@ function Row({
   subtitle,
   checked,
   onToggle,
+  disabled = false,
 }: {
   dotClassName: string
   title: string
   subtitle?: string
   checked: boolean
   onToggle: () => void
+  disabled?: boolean
 }) {
   return (
-    <label className="flex cursor-pointer items-center gap-2.5 px-3 py-1.5 hover:bg-muted">
+    <label
+      className={cn(
+        "flex items-center gap-2.5 px-3 py-1.5",
+        disabled
+          ? "cursor-not-allowed opacity-50"
+          : "cursor-pointer hover:bg-muted"
+      )}
+    >
       <Dot className={dotClassName} />
       <div className="min-w-0 flex-1">
         <div className="truncate text-[13px] text-foreground/70">{title}</div>
@@ -594,7 +664,11 @@ function Row({
           <p className="truncate text-xs text-muted-foreground">{subtitle}</p>
         ) : null}
       </div>
-      <Switch checked={checked} onCheckedChange={onToggle} />
+      <Switch
+        checked={checked}
+        onCheckedChange={onToggle}
+        disabled={disabled}
+      />
     </label>
   )
 }
@@ -625,7 +699,6 @@ function CapabilityRow({
         </span>
         <span className="text-[11px] text-muted-foreground">
           {toolCountLabel(group.tools.length)}
-          {group.addon ? " · add-on" : ""}
         </span>
       </button>
       {open ? (
@@ -658,6 +731,7 @@ function AddGroupRow({
   onToggleGroup,
   onToggleTool,
   selectedTools,
+  atLimit,
 }: {
   group: string
   tools: ToolOption[]
@@ -668,7 +742,11 @@ function AddGroupRow({
   onToggleGroup: () => void
   onToggleTool: (value: string) => void
   selectedTools: string[]
+  atLimit: boolean
 }) {
+  // At the cap, block adding the whole group (unless it's already fully on, so
+  // it can still be turned off) and any individual unselected tool in it.
+  const groupSwitchDisabled = atLimit && !allSelected
   return (
     <div>
       <div className="flex items-center gap-2.5 px-3 py-1.5 hover:bg-muted">
@@ -688,31 +766,45 @@ function AddGroupRow({
               : toolCountLabel(tools.length)}
           </span>
         </button>
-        <Switch checked={allSelected} onCheckedChange={onToggleGroup} />
+        <Switch
+          checked={allSelected}
+          onCheckedChange={onToggleGroup}
+          disabled={groupSwitchDisabled}
+        />
       </div>
       {open ? (
         <div className="bg-muted/30">
-          {tools.map((tool) => (
-            <label
-              key={tool.value}
-              className="flex cursor-pointer items-center gap-2.5 py-1 pl-9 pr-3 hover:bg-muted"
-            >
-              <div className="min-w-0 flex-1">
-                <div className="truncate text-[13px] text-foreground/70">
-                  {tool.label}
+          {tools.map((tool) => {
+            const isSelected = selectedTools.includes(tool.value)
+            const toolDisabled = atLimit && !isSelected
+            return (
+              <label
+                key={tool.value}
+                className={cn(
+                  "flex items-center gap-2.5 py-1 pl-9 pr-3",
+                  toolDisabled
+                    ? "cursor-not-allowed opacity-50"
+                    : "cursor-pointer hover:bg-muted"
+                )}
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-[13px] text-foreground/70">
+                    {tool.label}
+                  </div>
+                  {tool.description ? (
+                    <p className="truncate text-[11px] text-muted-foreground">
+                      {tool.description}
+                    </p>
+                  ) : null}
                 </div>
-                {tool.description ? (
-                  <p className="truncate text-[11px] text-muted-foreground">
-                    {tool.description}
-                  </p>
-                ) : null}
-              </div>
-              <Switch
-                checked={selectedTools.includes(tool.value)}
-                onCheckedChange={() => onToggleTool(tool.value)}
-              />
-            </label>
-          ))}
+                <Switch
+                  checked={isSelected}
+                  onCheckedChange={() => onToggleTool(tool.value)}
+                  disabled={toolDisabled}
+                />
+              </label>
+            )
+          })}
         </div>
       ) : null}
     </div>

@@ -22,6 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute, Mapped
 from sqlalchemy.sql.base import ExecutableOption
+from sqlalchemy.sql.elements import ColumnElement
 
 from tracecat.auth.types import Role
 from tracecat.db.models import WorkspaceSyncResourceMapping
@@ -273,10 +274,12 @@ class NameSwapPlan[ModelT: _WorkspaceRow]:
     """Attribute scoping name uniqueness (e.g. ``"environment"``), if any."""
     target_scopes: Mapping[str, str] | None = None
     """Desired ``source_id`` -> scope value; set whenever ``scope_attr`` is."""
+    availability_predicates: Sequence[ColumnElement[bool]] = ()
+    """Extra predicates applied when checking whether a target name is free."""
 
     @property
-    def column(self) -> InstrumentedAttribute[str]:
-        """The model's synced name column, e.g. ``AgentPreset.slug``."""
+    def column(self) -> InstrumentedAttribute[str | None]:
+        """The synced column; desired names are non-null even if storage is nullable."""
         return getattr(self.model, self.name_attr)
 
     @property
@@ -306,6 +309,7 @@ class NameSwapPlan[ModelT: _WorkspaceRow]:
             self.model.workspace_id == workspace_service.workspace_id,
             self.column == name,
             self.model.id != row_id,
+            *self.availability_predicates,
         ]
         if (scope_column := self.scope_column) is not None:
             conditions.append(scope_column == scope)
@@ -599,6 +603,7 @@ class ResourceAdapter(ABC):
         source_id: str,
         model: type[ModelT],
         options: Sequence[ExecutableOption] = (),
+        row_predicates: Sequence[ColumnElement[bool]] = (),
     ) -> ModelT | None:
         """Load the ``model`` row mapped to ``source_id``, or ``None`` if unmapped.
 
@@ -612,6 +617,7 @@ class ResourceAdapter(ABC):
         stmt = select(model).where(
             model.workspace_id == workspace_service.workspace_id,
             model.id == local_id,
+            *row_predicates,
         )
         if options:
             stmt = stmt.options(*options)
@@ -623,7 +629,7 @@ class ResourceAdapter(ABC):
         *,
         targets: Mapping[str, str],
         model: type[ModelT],
-        name_column: InstrumentedAttribute[str],
+        name_column: InstrumentedAttribute[str | None],
         noun: str,
         kind_label: str,
         owner_label: str,
@@ -634,6 +640,8 @@ class ResourceAdapter(ABC):
         temp_prefix: str = _TEMP_NAME_PREFIX,
         temp_max_len: int | None = None,
         rename: Callable[[ModelT, str], Awaitable[None]] | None = None,
+        row_predicates: Sequence[ColumnElement[bool]] = (),
+        availability_predicates: Sequence[ColumnElement[bool]] = (),
     ) -> NameSwapPlan[ModelT]:
         """Validate target names and park mapped rows whose names change.
 
@@ -660,7 +668,11 @@ class ResourceAdapter(ABC):
         mapped: dict[str, ModelT] = {}
         for source_id in sorted(targets):
             row = await self._row_by_source_id(
-                workspace_service, source_id=source_id, model=model, options=options
+                workspace_service,
+                source_id=source_id,
+                model=model,
+                options=options,
+                row_predicates=row_predicates,
             )
             if row is not None:
                 mapped[source_id] = row
@@ -678,6 +690,7 @@ class ResourceAdapter(ABC):
             },
             scope_attr=scope_attr,
             target_scopes=target_scopes,
+            availability_predicates=availability_predicates,
         )
         for source_id, row in mapped.items():
             await plan.ensure_available(
@@ -789,7 +802,9 @@ class ResourceAdapter(ABC):
                     )
                 )
             ).all()
-            reserved[None] = set(existing) | set(plan.targets.values())
+            reserved[None] = {name for name in existing if name is not None} | set(
+                plan.targets.values()
+            )
             return reserved
         rows = (
             await workspace_service.session.execute(
@@ -799,7 +814,8 @@ class ResourceAdapter(ABC):
             )
         ).tuples()
         for scope_value, name in rows:
-            reserved.setdefault(scope_value, set()).add(name)
+            if name is not None:
+                reserved.setdefault(scope_value, set()).add(name)
         for source_id, name in plan.targets.items():
             reserved.setdefault(plan.scope_of(source_id), set()).add(name)
         return reserved

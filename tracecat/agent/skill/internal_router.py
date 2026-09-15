@@ -41,6 +41,7 @@ def _raise_skill_validation_error(exc: TracecatValidationError) -> Never:
         "draft_revision_conflict",
         "skill_version_conflict",
         "skill_in_use",
+        "skill_slug_conflict",
     }:
         status_code = status.HTTP_409_CONFLICT
     raise HTTPException(
@@ -296,7 +297,10 @@ async def restore_skill_version(
 @router.delete("/{skill_id}", status_code=status.HTTP_204_NO_CONTENT)
 @require_scope("agent:delete")
 async def archive_skill(
-    *, skill_id: str, role: ExecutorWorkspaceRole, session: AsyncDBSession
+    *,
+    skill_id: str,
+    role: ExecutorWorkspaceRole,
+    session: AsyncDBSession,
 ) -> None:
     service = SkillService(session, role=role)
     resolved_skill_id = await _resolve_skill_id(service, skill_id)

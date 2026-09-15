@@ -1,8 +1,9 @@
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
+from tracecat.agent.otel_config import AgentOtelConfig, validate_otel_header_items
 from tracecat.git.constants import GIT_PLUS_HTTPS_URL_REGEX, GIT_SSH_URL_REGEX
 
 
@@ -82,11 +83,6 @@ class SAMLSettingsUpdate(BaseSettingsGroup):
     saml_idp_metadata_url: str | None = Field(default=None)
 
 
-class VersionedResourceResolutionStrategy(StrEnum):
-    PINNED = "pinned"
-    LATEST = "latest"
-
-
 class AppSettingsRead(BaseSettingsGroup):
     """Settings for the app."""
 
@@ -96,9 +92,6 @@ class AppSettingsRead(BaseSettingsGroup):
     app_workflow_export_enabled: bool
     app_create_workspace_on_register: bool
     app_action_form_mode_enabled: bool
-    app_versioned_resource_resolution_strategy: VersionedResourceResolutionStrategy = (
-        VersionedResourceResolutionStrategy.LATEST
-    )
 
 
 class AppSettingsUpdate(BaseSettingsGroup):
@@ -126,15 +119,6 @@ class AppSettingsUpdate(BaseSettingsGroup):
     app_action_form_mode_enabled: bool = Field(
         default=True,
         description="Whether to enable form mode for action inputs. When disabled, only YAML mode is available, preserving raw YAML formatting.",
-    )
-    app_versioned_resource_resolution_strategy: VersionedResourceResolutionStrategy = (
-        Field(
-            default=VersionedResourceResolutionStrategy.LATEST,
-            description=(
-                "How versioned resource references are resolved when a feature "
-                "supports both pinned and latest dependency resolution."
-            ),
-        )
     )
 
 
@@ -169,8 +153,9 @@ class AuditSettingsUpdate(BaseSettingsGroup):
     audit_webhook_custom_payload: dict[str, Any] | None = Field(
         default=None,
         description=(
-            "Custom JSON payload merged into streamed audit event payloads. "
-            "Custom keys override default audit event keys."
+            "Custom JSON fields merged into streamed audit event payloads. "
+            "Canonical audit event fields take precedence; conflicting custom "
+            "keys are ignored."
         ),
     )
     audit_webhook_payload_attribute: str | None = Field(
@@ -187,6 +172,21 @@ class AuditSettingsUpdate(BaseSettingsGroup):
             "Disable only for trusted on-prem/self-signed endpoints."
         ),
     )
+
+
+AuditWebhookTestErrorCategory = Literal[
+    "receiver_error",
+    "timeout",
+    "request_error",
+]
+
+
+class AuditWebhookTestResult(BaseModel):
+    """Result of a synchronous audit webhook test-fire request."""
+
+    ok: bool
+    receiver_status_code: int | None = None
+    error_category: AuditWebhookTestErrorCategory | None = None
 
 
 class AgentSettingsRead(BaseSettingsGroup):
@@ -215,6 +215,32 @@ class AgentSettingsUpdate(BaseSettingsGroup):
         default=False,
         description="Whether to automatically inject case content into agent prompts when a case_id is available.",
     )
+
+
+class AgentOtelSettingsRead(BaseSettingsGroup):
+    agent_otel_config: AgentOtelConfig = Field(default_factory=AgentOtelConfig)
+
+
+class AgentOtelSettingsUpdate(BaseSettingsGroup):
+    agent_otel_config: AgentOtelConfig = Field(
+        default_factory=AgentOtelConfig,
+        description="Claude Code OTel telemetry configuration for agent runs.",
+    )
+    agent_otel_headers: dict[str, str] | None = Field(
+        default=None,
+        description=(
+            "Encrypted headers for the Claude Code OTLP exporter. Omitted values "
+            "leave existing headers unchanged."
+        ),
+    )
+
+    @field_validator("agent_otel_headers", mode="before")
+    @classmethod
+    def validate_agent_otel_headers(cls, value: Any) -> Any:
+        if value is None or not isinstance(value, dict):
+            return value
+        validate_otel_header_items(cast(dict[str, Any], value))
+        return value
 
 
 class ValueType(StrEnum):

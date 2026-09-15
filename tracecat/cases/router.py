@@ -23,11 +23,18 @@ from tracecat.auth.schemas import UserRead
 from tracecat.auth.users import search_users
 from tracecat.authz.controls import require_scope
 from tracecat.cases.dropdowns.service import CaseDropdownValuesService
-from tracecat.cases.enums import CasePriority, CaseSeverity, CaseStatus
+from tracecat.cases.enums import (
+    CasePriority,
+    CaseSeverity,
+    CaseStatus,
+)
 from tracecat.cases.filters import parse_assignee_filter
 from tracecat.cases.rows.service import CaseTableRowsService
 from tracecat.cases.schemas import (
     AssigneeChangedEventRead,
+    CaseBatchDelete,
+    CaseBatchResponse,
+    CaseBatchUpdate,
     CaseCommentCreate,
     CaseCommentRead,
     CaseCommentThreadRead,
@@ -59,6 +66,7 @@ from tracecat.cases.tags.service import CaseTagsService
 from tracecat.db.dependencies import AsyncDBSession
 from tracecat.exceptions import (
     TracecatAuthorizationError,
+    TracecatConflictError,
     TracecatNotFoundError,
     TracecatValidationError,
 )
@@ -502,6 +510,44 @@ async def search_case_aggregates(
             status_code=HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to retrieve case aggregate counts",
         ) from e
+
+
+@cases_router.post("/batch-update")
+@require_scope("case:update")
+async def batch_update_cases(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    params: CaseBatchUpdate,
+) -> CaseBatchResponse:
+    """Update multiple cases with per-case results."""
+    service = CasesService(session, role)
+    try:
+        return await service.batch_update_cases(params.case_ids, params.update)
+    except TracecatConflictError as exc:
+        raise HTTPException(
+            status_code=HTTP_409_CONFLICT,
+            detail=exc.detail or str(exc),
+        ) from exc
+
+
+@cases_router.post("/batch-delete")
+@require_scope("case:delete")
+async def batch_delete_cases(
+    *,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    params: CaseBatchDelete,
+) -> CaseBatchResponse:
+    """Delete multiple cases with per-case results."""
+    service = CasesService(session, role)
+    try:
+        return await service.batch_delete_cases(params.case_ids)
+    except TracecatConflictError as exc:
+        raise HTTPException(
+            status_code=HTTP_409_CONFLICT,
+            detail=exc.detail or str(exc),
+        ) from exc
 
 
 @cases_router.get("/{case_id}")

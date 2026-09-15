@@ -11,6 +11,7 @@ import {
   GitPullRequestIcon,
   LayersPlusIcon,
   MoreHorizontal,
+  PencilIcon,
   PlayIcon,
   SquarePlay,
   Trash2Icon,
@@ -30,6 +31,7 @@ import type {
 import { ApiError } from "@/client"
 import { ExportMenuItem } from "@/components/export-workflow-dropdown-item"
 import { Spinner } from "@/components/loading/spinner"
+import { FolderPathBreadcrumb } from "@/components/nav/folder-path-breadcrumb"
 import {
   AlertDialog,
   AlertDialogAction,
@@ -42,13 +44,6 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog"
 import { Badge } from "@/components/ui/badge"
-import {
-  Breadcrumb,
-  BreadcrumbItem,
-  BreadcrumbLink,
-  BreadcrumbList,
-  BreadcrumbSeparator,
-} from "@/components/ui/breadcrumb"
 import { Button } from "@/components/ui/button"
 import {
   DropdownMenu,
@@ -82,6 +77,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip"
+import { toast } from "@/components/ui/use-toast"
 import { ValidationErrorView } from "@/components/validation-errors"
 import {
   buildRandomSyncBranchName,
@@ -98,6 +94,7 @@ import { useRepositoryBranches } from "@/hooks/use-workspace-sync"
 import type { TracecatApiError } from "@/lib/errors"
 import {
   useCreateDraftWorkflowExecution,
+  useFolders,
   useGitLabCredentialsStatus,
   useOrgAppSettings,
   useWorkflowManager,
@@ -112,20 +109,131 @@ import { useWorkflow } from "@/providers/workflow"
 import { useWorkspaceId } from "@/providers/workspace-id"
 
 /**
- * Parse a materialized folder path (e.g. "/parent/child/") into breadcrumb segments.
- * Each segment includes the folder name and the full path up to that point.
+ * Inline-editable workflow title for the builder breadcrumb.
+ *
+ * Double-click the title (or click the hover pencil) to edit. Enter or blur
+ * saves, Escape cancels. Empty, too-short (< 3 chars), or unchanged values
+ * revert without a request, matching the backend's 3–100 char title rule.
  */
-function getFolderSegments(
-  folderPath: string
-): Array<{ name: string; path: string }> {
-  const parts = folderPath.split("/").filter(Boolean)
-  const segments: Array<{ name: string; path: string }> = []
-  let accumulated = "/"
-  for (const part of parts) {
-    accumulated += `${part}/`
-    segments.push({ name: part, path: accumulated })
+function EditableWorkflowTitle({
+  title,
+  onRename,
+}: {
+  title: string
+  onRename: (title: string) => Promise<void>
+}) {
+  const [isEditing, setIsEditing] = React.useState(false)
+  const [value, setValue] = React.useState(title)
+  const inputRef = React.useRef<HTMLInputElement>(null)
+  // Enter commits while the input is still mounted and focused, so a click
+  // elsewhere during the request would otherwise fire a second commit on blur.
+  const isSavingRef = React.useRef(false)
+
+  // Keep local state in sync when the workflow title changes elsewhere, but
+  // never while the user is typing: a background refetch would otherwise
+  // overwrite the in-progress edit.
+  React.useEffect(() => {
+    if (!isEditing) {
+      setValue(title)
+    }
+  }, [title, isEditing])
+
+  React.useEffect(() => {
+    if (isEditing) {
+      inputRef.current?.focus()
+      inputRef.current?.select()
+    }
+  }, [isEditing])
+
+  const cancel = () => {
+    // A save already in flight cannot be recalled, so ignore the cancel rather
+    // than showing the old title and then flipping to the new one on refetch.
+    if (isSavingRef.current) return
+    setValue(title)
+    setIsEditing(false)
   }
-  return segments
+
+  const commit = async () => {
+    if (isSavingRef.current) return
+    const next = value.trim()
+    if (next === title) {
+      cancel()
+      return
+    }
+    if (next.length < 3) {
+      // Reverting without explanation reads as the rename being ignored.
+      toast({
+        title: "Name too short",
+        description: "Workflow names must be at least 3 characters.",
+      })
+      cancel()
+      return
+    }
+    isSavingRef.current = true
+    try {
+      await onRename(next)
+    } catch {
+      // The provider surfaces errors via toast; revert the local edit.
+      setValue(title)
+    } finally {
+      isSavingRef.current = false
+    }
+    setIsEditing(false)
+  }
+
+  if (isEditing) {
+    return (
+      <Input
+        ref={inputRef}
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onBlur={() => void commit()}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault()
+            void commit()
+          } else if (e.key === "Escape") {
+            e.preventDefault()
+            cancel()
+          }
+        }}
+        maxLength={100}
+        aria-label="Workflow name"
+        className="h-6 w-64 max-w-full px-2 py-1 text-sm"
+      />
+    )
+  }
+
+  return (
+    <span className="group/title flex min-w-0 items-center gap-1">
+      <button
+        type="button"
+        onDoubleClick={() => setIsEditing(true)}
+        onClick={(e) => {
+          // Keyboard and screen reader activation arrives as a click with no
+          // pointer detail. Real mouse clicks (detail >= 1) must not start
+          // editing, since double-click is the mouse affordance.
+          if (e.detail === 0) {
+            setIsEditing(true)
+          }
+        }}
+        title={title}
+        className="truncate bg-transparent p-0 text-left text-sm text-foreground"
+      >
+        {title}
+      </button>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        onClick={() => setIsEditing(true)}
+        aria-label="Rename workflow"
+        className="size-5 shrink-0 opacity-0 transition-opacity group-hover/title:opacity-100 group-focus-within/title:opacity-100"
+      >
+        <PencilIcon className="size-3 text-muted-foreground" />
+      </Button>
+    </span>
+  )
 }
 
 export function BuilderNav() {
@@ -135,6 +243,7 @@ export function BuilderNav() {
     workflowId,
     commitWorkflow,
     publishWorkflow,
+    updateWorkflow,
     validationErrors,
     setValidationErrors,
   } = useWorkflow()
@@ -144,6 +253,12 @@ export function BuilderNav() {
   const { credentialsStatus: gitLabCredentialsStatus } =
     useGitLabCredentialsStatus()
   const workflowTitle = workflow?.title ?? "Untitled workflow"
+  const { folders } = useFolders(workspaceId, {
+    enabled: Boolean(workflow?.folder_id),
+  })
+  const folderPath = workflow?.folder_id
+    ? folders?.find((folder) => folder.id === workflow.folder_id)?.path
+    : null
 
   // Track if there are pending workflow updates (e.g., title/description changes)
   const pendingUpdates = useIsMutating({
@@ -198,53 +313,29 @@ export function BuilderNav() {
   return (
     <div className="flex w-full items-center">
       <div className="mr-4 min-w-0 flex-1">
-        <Breadcrumb>
-          <BreadcrumbList className="flex-nowrap overflow-hidden whitespace-nowrap">
-            <BreadcrumbItem>
-              <BreadcrumbLink asChild>
-                <Link href={`/workspaces/${workspaceId}/workflows`}>
-                  {workspace.name}
-                </Link>
-              </BreadcrumbLink>
-            </BreadcrumbItem>
-            {/* Folder breadcrumb segments */}
-            {workflow.folder_path &&
-              getFolderSegments(workflow.folder_path).map((segment) => (
-                <React.Fragment key={segment.path}>
-                  <BreadcrumbSeparator className="shrink-0 font-semibold">
-                    {"/"}
-                  </BreadcrumbSeparator>
-                  <BreadcrumbItem>
-                    <BreadcrumbLink asChild>
-                      <Link
-                        href={`/workspaces/${workspaceId}/workflows?path=${encodeURIComponent(segment.path)}`}
-                      >
-                        {segment.name}
-                      </Link>
-                    </BreadcrumbLink>
-                  </BreadcrumbItem>
-                </React.Fragment>
-              ))}
-            <BreadcrumbSeparator className="shrink-0 font-semibold">
-              {"/"}
-            </BreadcrumbSeparator>
-            <BreadcrumbItem>
-              <div className="flex min-w-0 items-center gap-2">
-                <span className="truncate text-sm text-foreground">
-                  {workflowTitle}
-                </span>
-                {workflow.alias && (
-                  <Badge
-                    variant="secondary"
-                    className="font-mono text-xs font-normal tracking-tighter text-muted-foreground hover:cursor-default"
-                  >
-                    {workflow.alias}
-                  </Badge>
-                )}
-              </div>
-            </BreadcrumbItem>
-          </BreadcrumbList>
-        </Breadcrumb>
+        <FolderPathBreadcrumb
+          rootLabel={workspace.name}
+          rootHref={`/workspaces/${workspaceId}/workflows`}
+          folderPath={folderPath}
+          currentPage={
+            <span className="flex min-w-0 items-center gap-2">
+              <EditableWorkflowTitle
+                title={workflowTitle}
+                onRename={async (title) => {
+                  await updateWorkflow({ title })
+                }}
+              />
+              {workflow.alias && (
+                <Badge
+                  variant="secondary"
+                  className="font-mono text-xs font-normal tracking-tighter text-muted-foreground hover:cursor-default"
+                >
+                  {workflow.alias}
+                </Badge>
+              )}
+            </span>
+          }
+        />
       </div>
 
       <div className="flex items-center justify-end space-x-6">

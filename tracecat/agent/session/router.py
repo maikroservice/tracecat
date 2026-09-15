@@ -17,6 +17,8 @@ from tracecat import config
 from tracecat.agent.adapter import vercel
 from tracecat.agent.session.schemas import (
     AgentSessionArtifactsRead,
+    AgentSessionCancelRequest,
+    AgentSessionCancelResponse,
     AgentSessionCreate,
     AgentSessionForkRequest,
     AgentSessionRead,
@@ -25,7 +27,11 @@ from tracecat.agent.session.schemas import (
     AgentSessionUpdate,
 )
 from tracecat.agent.session.service import AgentSessionService
-from tracecat.agent.session.types import AgentSessionEntity, TurnLifecycle
+from tracecat.agent.session.types import (
+    AgentSessionEntity,
+    TurnLifecycle,
+    is_session_readonly,
+)
 from tracecat.agent.stream.artifacts import artifact_stream_event
 from tracecat.agent.stream.connector import AgentStream
 from tracecat.agent.stream.events import StreamFormat
@@ -42,10 +48,36 @@ from tracecat.chat.schemas import (
     ContinueRunRequest,
 )
 from tracecat.db.dependencies import AsyncDBSession
-from tracecat.exceptions import EntitlementRequired, TracecatNotFoundError
+from tracecat.db.models import AgentSession
+from tracecat.exceptions import (
+    EntitlementRequired,
+    TracecatConflictError,
+    TracecatNotFoundError,
+)
 from tracecat.logger import logger
+from tracecat.observability.otel import set_current_span_attributes
 
 router = APIRouter(prefix="/agent/sessions", tags=["agent-sessions"])
+
+SSE_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "Transfer-Encoding": "chunked",
+    "Connection": "keep-alive",
+    "Keep-Alive": "timeout=120",
+    "Pragma": "no-cache",
+    "X-Accel-Buffering": "no",
+}
+VERCEL_SSE_HEADERS = {
+    **SSE_HEADERS,
+    "x-vercel-ai-ui-message-stream": "v1",
+}
+
+
+def _sse_headers(format: StreamFormat) -> dict[str, str]:
+    """Return SSE headers for the requested stream format."""
+    if format == "vercel":
+        return dict(VERCEL_SSE_HEADERS)
+    return dict(SSE_HEADERS)
 
 
 def _bubble_id(session_id: uuid.UUID, curr_run_id: uuid.UUID | None) -> str | None:
@@ -56,6 +88,22 @@ def _bubble_id(session_id: uuid.UUID, curr_run_id: uuid.UUID | None) -> str | No
     bubble.
     """
     return f"{session_id}:{curr_run_id}" if curr_run_id else None
+
+
+def _require_session_write_access(
+    role: WorkspaceActorRouteRole,
+    agent_session: AgentSession,
+) -> None:
+    """Reject writes to sessions owned by another workspace actor."""
+    if not is_session_readonly(role, agent_session.created_by):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={
+            "code": "session_read_only",
+            "message": "Teammate sessions are read-only.",
+        },
+    )
 
 
 async def _require_workspace_chat_entitlement_for_session_tree(
@@ -112,6 +160,10 @@ async def list_sessions(
         None, description="Filter by entity type"
     ),
     entity_id: uuid.UUID | None = Query(None, description="Filter by entity ID"),
+    created_by: uuid.UUID | None = Query(
+        None,
+        description="Filter by session creator. Omit to list the entire workspace.",
+    ),
     exclude_entity_types: list[AgentSessionEntity] | None = Query(
         None, description="Entity types to exclude from results"
     ),
@@ -143,8 +195,7 @@ async def list_sessions(
         ]
     svc = AgentSessionService(session, role)
     return await svc.list_sessions(
-        created_by=role.user_id,
-        filter_created_by_none=role.type == "service_account",
+        created_by=created_by,
         entity_type=entity_type,
         entity_id=entity_id,
         exclude_entity_types=exclude_entity_types,
@@ -182,6 +233,7 @@ async def get_session(
             workspace_id=agent_session.workspace_id,
             title=agent_session.title,
             created_by=agent_session.created_by,
+            is_readonly=is_session_readonly(role, agent_session.created_by),
             entity_type=AgentSessionEntity(agent_session.entity_type),
             entity_id=agent_session.entity_id,
             channel_context=agent_session.channel_context,
@@ -265,6 +317,7 @@ async def get_session_vercel(
             workspace_id=agent_session.workspace_id,
             title=agent_session.title,
             created_by=agent_session.created_by,
+            is_readonly=is_session_readonly(role, agent_session.created_by),
             entity_type=AgentSessionEntity(agent_session.entity_type),
             entity_id=agent_session.entity_id,
             channel_context=agent_session.channel_context,
@@ -342,6 +395,8 @@ async def update_session(
             detail="Session not found",
         )
 
+    _require_session_write_access(role, agent_session)
+
     await require_workspace_chat_entitlement_for_entity(
         session=session,
         role=role,
@@ -374,6 +429,7 @@ async def remove_session_artifact(
         agent_session = await svc.get_session(session_id)
         if agent_session is None:
             raise TracecatNotFoundError(f"Session {session_id} not found")
+        _require_session_write_access(role, agent_session)
         await require_workspace_chat_entitlement_for_entity(
             session=session,
             role=role,
@@ -417,6 +473,8 @@ async def delete_session(
             detail="Session not found",
         )
 
+    _require_session_write_access(role, agent_session)
+
     await require_workspace_chat_entitlement_for_entity(
         session=session,
         role=role,
@@ -449,6 +507,13 @@ async def send_message(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Workspace access required",
             )
+        set_current_span_attributes(
+            {
+                "tracecat.organization.id": role.organization_id,
+                "tracecat.workspace.id": workspace_id,
+                "tracecat.agent.session.id": session_id,
+            }
+        )
 
         message_id: str | None = None
         async with AgentSessionService.with_session(role=role) as svc:
@@ -463,6 +528,7 @@ async def send_message(
                 session_id=session_id,
                 request=request,
             )
+            _require_session_write_access(role, agent_session)
             await _require_workspace_chat_entitlement_for_session_tree(
                 svc=svc,
                 session=svc.session,
@@ -470,30 +536,54 @@ async def send_message(
                 agent_session=agent_session,
             )
 
+            is_first_prompt: bool | None = None
             if isinstance(request, ContinueRunRequest):
-                # Continuations resume the same workflow + per-turn stream. Reuse
-                # the existing stream id and follow only newly appended events;
-                # resuming from "0-0" would replay the approval request the active
-                # client already rendered before clicking approve/deny.
-                stream_id = agent_session.active_stream_id
+                turn_response = await svc.run_turn(
+                    session_id=session_id,
+                    request=request,
+                    active_stream_id=None,
+                )
+                rotated_stream_id = (
+                    turn_response.active_stream_id
+                    if turn_response is not None
+                    else None
+                )
+
+                run_id = (
+                    turn_response.curr_run_id
+                    if turn_response is not None
+                    else agent_session.curr_run_id
+                )
+                set_current_span_attributes({"tracecat.agent.run.id": run_id})
+                message_id = _bubble_id(session_id, run_id)
+
+                if rotated_stream_id is None:
+                    logger.info(
+                        "No-op continuation; returning finished stream",
+                        session_id=session_id,
+                    )
+                    return StreamingResponse(
+                        AgentStream.finished_sse(
+                            format="vercel", message_id=message_id
+                        ),
+                        media_type="text/event-stream",
+                        headers=_sse_headers("vercel"),
+                    )
+
                 stream = await AgentStream.new(
                     session_id=session_id,
                     workspace_id=workspace_id,
-                    stream_id=stream_id,
+                    stream_id=rotated_stream_id,
                 )
-                start_id = "$"
             else:
-                # Mint the per-turn stream id at the HTTP layer (turn start) so the
-                # seed artifact and the worker producer both write to the same
-                # fresh per-turn key. No reset/reuse of a prior turn's buffer.
                 stream_id = uuid.uuid4()
                 stream = await AgentStream.new(
                     session_id=session_id,
                     workspace_id=workspace_id,
                     stream_id=stream_id,
                 )
-                start_id = "0-0"
-                if await svc.should_seed_initial_artifact(agent_session) and (
+                is_first_prompt = await svc.is_first_prompt_for_session(session_id)
+                if is_first_prompt and (
                     artifact := await svc.build_initial_artifact(agent_session)
                 ):
                     await svc.apply_artifact_side_effects(
@@ -502,19 +592,14 @@ async def send_message(
                     )
                     await stream.append(artifact_stream_event("upsert", artifact))
 
-            # Run session turn (spawns DurableAgentWorkflow)
-            try:
-                turn_response = await svc.run_turn(
-                    session_id=session_id,
-                    request=request,
-                    active_stream_id=stream_id,
-                )
-            except Exception as turn_exc:
-                if not isinstance(request, ContinueRunRequest):
-                    # Startup failed after we minted the stream: surface a terminal
-                    # frame so reconnecting clients don't hang, and clear pointers.
-                    # Non-continue turns always mint a fresh per-turn stream id.
-                    assert stream_id is not None
+                try:
+                    turn_response = await svc.run_turn(
+                        session_id=session_id,
+                        request=request,
+                        active_stream_id=stream_id,
+                        is_first_prompt=is_first_prompt,
+                    )
+                except Exception as turn_exc:
                     logger.warning(
                         "Failed to start agent turn",
                         session_id=session_id,
@@ -534,49 +619,45 @@ async def send_message(
                             session_id=session_id,
                             error=str(rollback_exc),
                         )
-                raise
+                    raise
 
-            # Build a bubble id stable for this turn. Prefer the run id returned by
-            # run_turn (new turns) — terminal cleanup may already have nulled the
-            # session row on a fast turn. Continuations return None and reuse the
-            # in-progress run id still pinned on the session row.
-            if turn_response is not None and turn_response.curr_run_id is not None:
-                run_id = turn_response.curr_run_id
-            else:
-                refreshed = await svc.get_session(session_id)
-                run_id = refreshed.curr_run_id if refreshed else None
-            message_id = _bubble_id(session_id, run_id)
+                if turn_response is None:
+                    raise RuntimeError(
+                        "New agent turn completed without a stream response"
+                    )
+                set_current_span_attributes(
+                    {"tracecat.agent.run.id": turn_response.curr_run_id}
+                )
+                message_id = _bubble_id(session_id, turn_response.curr_run_id)
 
         logger.info(
             "Starting Vercel streaming session",
             session_id=session_id,
-            start_id=start_id,
+            start_id="0-0",
         )
 
         # Create stream and return with Vercel format
         return StreamingResponse(
             stream.sse(
                 http_request.is_disconnected,
-                last_id=start_id,
+                last_id="0-0",
                 format="vercel",
                 message_id=message_id,
             ),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache, no-transform",
-                "Transfer-Encoding": "chunked",
-                "Content-Encoding": "none",
-                "Connection": "keep-alive",
-                "Keep-Alive": "timeout=120",
-                "Pragma": "no-cache",
-                "X-Accel-Buffering": "no",  # Disable nginx buffering
-                "x-vercel-ai-ui-message-stream": "v1",
-            },
+            headers=_sse_headers("vercel"),
         )
     except TracecatNotFoundError as e:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e),
+        ) from e
+    except TracecatConflictError as e:
+        # A decision contradicting one already recorded: the client is acting on
+        # stale state and should refresh, not retry.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=e.detail or str(e),
         ) from e
     except ValueError as e:
         raise HTTPException(
@@ -584,6 +665,8 @@ async def send_message(
             detail=str(e),
         ) from e
     except EntitlementRequired:
+        raise
+    except HTTPException:
         raise
     except Exception as e:
         logger.error(
@@ -620,15 +703,7 @@ async def stream_session_events(
             detail="Workspace access required",
         )
 
-    headers = {
-        "Cache-Control": "no-cache, no-transform",
-        "Connection": "keep-alive",
-        "Keep-Alive": "timeout=120",
-        "Pragma": "no-cache",
-        "X-Accel-Buffering": "no",  # Disable nginx buffering
-    }
-    if format == "vercel":
-        headers["x-vercel-ai-ui-message-stream"] = "v1"
+    headers = _sse_headers(format)
 
     last_event_id = request.headers.get("Last-Event-ID")
 
@@ -669,26 +744,23 @@ async def stream_session_events(
             role=role,
             agent_session=agent_session,
         )
-        active_stream_id = agent_session.active_stream_id
-        lifecycle, curr_run_id = await svc.get_turn_lifecycle(agent_session)
+        stream_state = await svc.get_stream_resume_state(agent_session)
 
-    message_id = _bubble_id(session_id, curr_run_id)
+    message_id = _bubble_id(session_id, stream_state.curr_run_id)
 
-    # FAILED | TERMINATED (incl. failed-to-start): the workflow will not produce a
-    # terminal frame, so emit one ourselves and let the client refetch DB history.
-    if lifecycle is TurnLifecycle.FAILED:
-        finished = await AgentStream.new(
-            session_id=session_id, workspace_id=workspace_id, stream_id=active_stream_id
-        )
+    # FAILED | TERMINATED (incl. failed-to-start) | CANCELLED: the workflow will
+    # not produce a terminal frame, so emit one ourselves and let the client
+    # refetch DB history.
+    if stream_state.lifecycle in (TurnLifecycle.FAILED, TurnLifecycle.CANCELLED):
         return StreamingResponse(
-            finished.finished_sse(format=format, message_id=message_id),
+            AgentStream.finished_sse(format=format, message_id=message_id),
             media_type="text/event-stream",
             headers=headers,
         )
 
     # No live run, or the run is already COMPLETED: nothing to attach to. The
     # canonical assistant message is in DB history; the client refetches.
-    if lifecycle is not TurnLifecycle.RUNNING:
+    if not stream_state.has_live_stream:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     # RUNNING: join the per-turn Redis stream and always replay the whole active
@@ -699,7 +771,9 @@ async def stream_session_events(
     # (Cursor/frame-precise resume is intentionally not used here; revisit if we
     # reconcile committed partial rows with the live stream id.)
     stream = await AgentStream.new(
-        session_id=session_id, workspace_id=workspace_id, stream_id=active_stream_id
+        session_id=session_id,
+        workspace_id=workspace_id,
+        stream_id=stream_state.active_stream_id,
     )
     start_id = "0-0"
     resume_from: str | None = None
@@ -744,6 +818,7 @@ async def fork_session(
             raise TracecatNotFoundError(
                 f"Parent session with ID {session_id} not found"
             )
+        _require_session_write_access(role, parent_session)
         await _require_workspace_chat_entitlement_for_session_tree(
             svc=svc,
             session=session,
@@ -764,4 +839,39 @@ async def fork_session(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(e),
+        ) from e
+
+
+@router.post("/{session_id}/cancel")
+@require_scope("agent:execute")
+async def cancel_session(
+    session_id: uuid.UUID,
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    request: AgentSessionCancelRequest | None = None,
+) -> AgentSessionCancelResponse:
+    """Request graceful cancellation for the active agent session turn."""
+    svc = AgentSessionService(session, role)
+    reason = request.reason if request else "user_cancel"
+    try:
+        agent_session = await svc.get_session(session_id)
+        if agent_session is None:
+            raise TracecatNotFoundError(f"Session with ID {session_id} not found")
+        _require_session_write_access(role, agent_session)
+        await _require_workspace_chat_entitlement_for_session_tree(
+            svc=svc,
+            session=session,
+            role=role,
+            agent_session=agent_session,
+        )
+        return await svc.request_cancel(session_id, reason=reason)
+    except TracecatNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        ) from e
+    except TracecatConflictError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=e.detail or str(e),
         ) from e

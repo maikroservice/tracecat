@@ -6,8 +6,8 @@ Terminology:
 """
 
 import uuid
-from datetime import datetime
-from typing import Annotated, Any, Literal, Self, TypedDict
+from datetime import UTC, datetime
+from typing import Annotated, Any, Literal, NamedTuple, Self, TypedDict
 from urllib.parse import urlparse
 
 from pydantic import (
@@ -20,6 +20,7 @@ from pydantic import (
     ValidationError,
     computed_field,
     field_validator,
+    model_validator,
 )
 
 from tracecat.expressions.patterns import STANDALONE_TEMPLATE
@@ -257,6 +258,10 @@ class ProviderMetadata(BaseModel):
         default=True,
         description="Whether this provider is available for use",
     )
+    service_account_json: bool = Field(
+        default=False,
+        description="Whether the client secret is a service account JSON key instead of an OAuth client secret",
+    )
     api_docs_url: str | None = Field(
         default=None, description="URL to API documentation"
     )
@@ -430,10 +435,38 @@ class MCPHttpIntegrationCreate(_MCPIntegrationCreateBase):
     custom_credentials: SecretStr | None = Field(
         default=None,
         description=(
-            "Custom credentials as JSON headers. Required for custom auth type; "
+            "HTTP headers as a JSON object. Required for custom auth type; "
             "optional additional headers for OAuth2 auth type."
         ),
     )
+    oauth_client_credentials: SecretStr | None = Field(
+        default=None,
+        description=(
+            "OAuth client credentials as a JSON object (client_id / "
+            "client_secret) for catalog OAuth2 rows that declare an "
+            "'oauth_client' credential. Kept separate from custom_credentials "
+            "so one connect can carry both a user-created OAuth client and "
+            "extra HTTP headers."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_oauth_client_credentials(self) -> Self:
+        # Blank means "not supplied": the service branches on ``is None`` to
+        # decide whether custom_credentials is headers or a legacy client.
+        if (
+            self.oauth_client_credentials is not None
+            and not self.oauth_client_credentials.get_secret_value().strip()
+        ):
+            self.oauth_client_credentials = None
+        if (
+            self.oauth_client_credentials is not None
+            and self.auth_type != MCPAuthType.OAUTH2
+        ):
+            raise ValueError(
+                "oauth_client_credentials is only valid for OAuth 2.0 MCP servers"
+            )
+        return self
 
     @field_validator("server_uri", mode="before")
     @classmethod
@@ -602,7 +635,31 @@ PlatformMCPCatalogState = Literal[
     "not_configured",
     "configured",
     "connected",
+    "reauth_required",
     "error",
+]
+
+
+class OAuthTokenState(NamedTuple):
+    """Credential columns needed to derive connection state without the full row."""
+
+    encrypted_access_token: bytes | None
+    encrypted_refresh_token: bytes | None
+    expires_at: datetime | None
+
+
+def credential_reauth_required(
+    *, has_refresh_token: bool, expires_at: datetime | None
+) -> bool:
+    """Dead credential: expired with no refresh token to revive it."""
+    if has_refresh_token:
+        return False
+    return expires_at is not None and datetime.now(UTC) >= expires_at
+
+
+MCPCatalogConnectStatus = Literal["configured", "connected", "oauth_redirect"]
+MCPVerificationStatus = Literal[
+    "idle", "verifying", "succeeded", "failed", "superseded"
 ]
 MCPToolStatus = Literal["available", "missing"]
 
@@ -688,6 +745,12 @@ class MCPHTTPOAuth2ConnectionSpec(_MCPConnectionSpecBase):
     auth_type: Literal[MCPAuthType.OAUTH2] = MCPAuthType.OAUTH2
     server_uri: str
     scopes: list[str] = Field(default_factory=list)
+    oauth_resource: str | None = None
+    """OAuth resource indicator pinned by the repo-owned catalog row.
+
+    This may differ from ``server_uri`` when a provider protects every MCP
+    route under one origin-level audience.
+    """
     oauth_authorization_endpoint: str | None = None
     """Known OAuth authorization endpoint pinned by the repo-owned catalog row.
 
@@ -697,6 +760,14 @@ class MCPHTTPOAuth2ConnectionSpec(_MCPConnectionSpecBase):
     without relaxing same-host validation globally.
     """
     oauth_token_endpoint: str | None = None
+    oauth_authorize_params: dict[str, str] = Field(default_factory=dict)
+    """Extra authorization-request parameters pinned by the repo-owned catalog row.
+
+    Some providers only issue a refresh token when the authorize request
+    carries vendor parameters (e.g. Google's ``access_type=offline`` and
+    ``prompt=consent``). Reserved OAuth parameters (client_id, redirect_uri,
+    response_type, state, scope, resource, PKCE) are never overridable.
+    """
 
 
 class MCPHTTPCustomConnectionSpec(_MCPConnectionSpecBase):
@@ -827,9 +898,6 @@ class PlatformMCPCatalogRead(BaseModel):
     provider_id: str | None
     connection_spec: MCPConnectionSpec | None
     connection_options: list[MCPConnectionOption] = Field(default_factory=list)
-    locked: bool = Field(
-        description="Whether this platform MCP catalog row is locked by entitlement.",
-    )
     state: PlatformMCPCatalogState
     mcp_integration_id: UUID4 | None
     mcp_server_type: MCPServerType | None = None
@@ -877,15 +945,29 @@ class MCPIntegrationRead(BaseModel):
     updated_at: datetime
 
 
-class MCPIntegrationTestConnectionRequest(BaseModel):
-    """Request to test connectivity against an unsaved HTTP MCP configuration.
+class MCPVerificationStatusRead(BaseModel):
+    """Response model for saved MCP verification status."""
 
-    Carries the (possibly edited, not yet persisted) form values. When
+    status: MCPVerificationStatus
+    error: str | None = None
+
+
+class _MCPIntegrationTestConnectionRequestBase(BaseModel):
+    """Common fields for testing an MCP configuration.
+
+    HTTP tests carry the possibly edited, not yet persisted form values. When
     ``mcp_integration_id`` is set, stored secrets from that row are used as a
     fallback for fields the caller leaves blank (e.g. unchanged credentials).
     """
 
     mcp_integration_id: UUID4 | None = None
+    timeout: int | None = Field(default=None, ge=1, le=300)
+
+
+class MCPHttpIntegrationTestConnectionRequest(_MCPIntegrationTestConnectionRequestBase):
+    """Request to test connectivity against an unsaved HTTP MCP configuration."""
+
+    server_type: Literal["http"] = Field(default="http")
     server_uri: str = Field(..., min_length=1, max_length=2048)
     auth_type: MCPAuthType = MCPAuthType.NONE
     oauth_integration_id: UUID4 | None = None
@@ -893,7 +975,6 @@ class MCPIntegrationTestConnectionRequest(BaseModel):
         default=None,
         description="JSON object of custom headers; falls back to stored headers when omitted",
     )
-    timeout: int | None = Field(default=None, ge=1, le=300)
 
     @field_validator("server_uri", mode="before")
     @classmethod
@@ -920,6 +1001,36 @@ class MCPIntegrationTestConnectionRequest(BaseModel):
         return value
 
 
+class MCPStdioIntegrationTestConnectionRequest(BaseModel):
+    """Request to test connectivity against a saved stdio MCP integration."""
+
+    model_config = {"extra": "forbid"}
+
+    mcp_integration_id: UUID4
+    server_type: Literal["stdio"] = Field(default="stdio")
+
+
+def _discriminate_mcp_test_connection_server_type(value: Any) -> str:
+    """Infer MCP test server type, defaulting legacy payloads to HTTP."""
+    if isinstance(value, MCPHttpIntegrationTestConnectionRequest):
+        return "http"
+    if isinstance(value, MCPStdioIntegrationTestConnectionRequest):
+        return "stdio"
+    if isinstance(value, dict):
+        if "server_type" in value:
+            server_type = value.get("server_type")
+            if isinstance(server_type, str):
+                return server_type
+    return "http"
+
+
+type MCPIntegrationTestConnectionRequest = Annotated[
+    Annotated[MCPHttpIntegrationTestConnectionRequest, Tag("http")]
+    | Annotated[MCPStdioIntegrationTestConnectionRequest, Tag("stdio")],
+    Discriminator(_discriminate_mcp_test_connection_server_type),
+]
+
+
 class MCPIntegrationTestConnectionResponse(BaseModel):
     """Response for testing connectivity to an MCP server."""
 
@@ -930,10 +1041,24 @@ class MCPIntegrationTestConnectionResponse(BaseModel):
     error: str | None = None
 
 
+class MCPCatalogConnectRequest(BaseModel):
+    """Request for one-click connecting a platform MCP catalog entry.
+
+    Carries no connection fields, so the recipe cannot be inferred from the
+    payload; the caller names the connection option it offered.
+    """
+
+    connection_option_id: str | None = Field(
+        default=None,
+        max_length=80,
+        description="Platform MCP catalog connection option to connect",
+    )
+
+
 class MCPCatalogConnectResponse(BaseModel):
     """Response for connecting a platform MCP catalog entry."""
 
-    status: Literal["connected", "oauth_redirect"]
+    status: MCPCatalogConnectStatus
     mcp_integration: MCPIntegrationRead | None = None
     auth_url: str | None = None
     provider_id: str | None = None

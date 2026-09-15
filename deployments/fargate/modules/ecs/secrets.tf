@@ -285,7 +285,9 @@ locals {
     local.temporal_auth_client_secret_secret,
   )
 
-  executor_secrets = local.tracecat_temporal_secrets
+  worker_secrets       = local.tracecat_temporal_secrets
+  agent_worker_secrets = local.tracecat_temporal_secrets
+  executor_secrets     = local.tracecat_temporal_secrets
 
   litellm_secrets = local.tracecat_base_secrets
 

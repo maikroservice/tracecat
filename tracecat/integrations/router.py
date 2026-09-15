@@ -42,7 +42,9 @@ from tracecat.integrations.schemas import (
     IntegrationReadMinimal,
     IntegrationTestConnectionResponse,
     IntegrationUpdate,
+    MCPCatalogConnectRequest,
     MCPCatalogConnectResponse,
+    MCPCatalogConnectStatus,
     MCPHttpIntegrationCreate,
     MCPIntegrationCreate,
     MCPIntegrationRead,
@@ -52,6 +54,7 @@ from tracecat.integrations.schemas import (
     MCPIntegrationUpdate,
     MCPToolPolicyUpdateRequest,
     MCPToolSummary,
+    MCPVerificationStatusRead,
     PlatformMCPCatalogListResponse,
     PlatformMCPCatalogState,
     PlatformMCPCatalogStatus,
@@ -69,8 +72,6 @@ from tracecat.integrations.service import (
 from tracecat.integrations.types import MCPServerType
 from tracecat.logger import logger
 from tracecat.pagination import CursorPaginationParams
-from tracecat.tiers.access import is_org_entitled
-from tracecat.tiers.enums import Entitlement
 
 integrations_router = APIRouter(prefix="/integrations", tags=["integrations"])
 """Routes for managing dynamic integration states."""
@@ -119,21 +120,20 @@ async def _gate_mcp_connect_verification(
     *,
     delete_on_failure: bool = True,
 ) -> None:
-    """Verify HTTP MCP connectivity as part of connect/save.
+    """Verify MCP connectivity as part of connect/save.
 
-    When the row was created by this request, a failed verification deletes it
-    so that retries don't accumulate orphaned rows. Pre-existing rows returned
-    by idempotent connects are kept (``delete_on_failure=False``) so a
-    transient outage doesn't destroy a saved integration. Either way the
-    failure surfaces as an HTTP error so the connect/save does not report
-    success.
+    HTTP verification remains a hard gate. Stdio verification is started in the
+    background because the sandboxed probe can take too long for the connect
+    request; the row stays ``configured`` until the verifier persists tools.
     """
-    if mcp_integration.server_type != "http":
-        return
     if await svc.mcp_oauth_authorization_pending(mcp_integration=mcp_integration):
         # No access token exists until the user completes the OAuth redirect;
         # the OAuth callback runs its own verification after token exchange.
         return
+    if mcp_integration.server_type == "stdio":
+        await svc.start_mcp_stdio_verification(mcp_integration=mcp_integration)
+        return
+
     result = await svc.verify_mcp_integration(mcp_integration=mcp_integration)
     if not result.success:
         if delete_on_failure:
@@ -143,6 +143,18 @@ async def _gate_mcp_connect_verification(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=detail,
         )
+
+
+def _mcp_connect_status(
+    *,
+    mcp_read: MCPIntegrationRead | None,
+    oauth_connect: IntegrationOAuthConnect | None,
+) -> MCPCatalogConnectStatus:
+    if oauth_connect:
+        return "oauth_redirect"
+    if mcp_read is not None and mcp_read.state == "connected":
+        return "connected"
+    return "configured"
 
 
 async def _mcp_catalog_connect_response(
@@ -169,7 +181,7 @@ async def _mcp_catalog_connect_response(
             state=await svc.mcp_integration_state(mcp_integration=mcp_integration),
         )
     return MCPCatalogConnectResponse(
-        status="oauth_redirect" if oauth_connect else "connected",
+        status=_mcp_connect_status(mcp_read=mcp_read, oauth_connect=oauth_connect),
         mcp_integration=mcp_read,
         auth_url=oauth_connect.auth_url if oauth_connect else None,
         provider_id=oauth_connect.provider_id if oauth_connect else None,
@@ -543,6 +555,13 @@ async def get_integration(
                     provider_id=integration.provider_id,
                 )
 
+    # Defaults apply only when scopes were never configured; an explicitly
+    # empty stored set (e.g. narrowed by a DCR echo) is reported as empty.
+    if integration.requested_scopes is None:
+        requested_scopes = provider_info.impl.scopes.default
+    else:
+        requested_scopes = [s for s in integration.requested_scopes.split(" ") if s]
+
     return IntegrationRead(
         id=integration.id,
         user_id=integration.user_id,
@@ -550,9 +569,7 @@ async def get_integration(
         token_type=integration.token_type,
         expires_at=integration.expires_at,
         granted_scopes=integration.scope.split(" ") if integration.scope else None,
-        requested_scopes=integration.requested_scopes.split(" ")
-        if integration.requested_scopes
-        else provider_info.impl.scopes.default,
+        requested_scopes=requested_scopes,
         authorization_endpoint=authorization_endpoint,
         token_endpoint=token_endpoint,
         created_at=integration.created_at,
@@ -953,7 +970,7 @@ async def get_provider(
 
 
 @mcp_router.post("", status_code=status.HTTP_201_CREATED)
-@require_scope("integration:create")
+@require_scope("integration:create", "integration:read")
 async def create_mcp_integration(
     role: WorkspaceActorRouteRole,
     session: AsyncDBSession,
@@ -1044,13 +1061,9 @@ async def list_platform_mcp_catalog(
             detail="Organization ID is required",
         )
 
-    agent_addons_entitled = await is_org_entitled(
-        session, role.organization_id, Entitlement.AGENT_ADDONS
-    )
     svc = PlatformMCPCatalogService(session)
     items, next_cursor = await svc.list_catalog(
         workspace_id=role.workspace_id,
-        agent_addons_entitled=agent_addons_entitled,
         q=q,
         category=category,
         status=catalog_status,
@@ -1060,11 +1073,12 @@ async def list_platform_mcp_catalog(
 
 
 @mcp_router.post("/catalog/{catalog_slug}/connect", status_code=status.HTTP_201_CREATED)
-@require_scope("integration:create")
+@require_scope("integration:create", "integration:read")
 async def connect_platform_mcp_catalog(
     role: WorkspaceActorRouteRole,
     session: AsyncDBSession,
     catalog_slug: str,
+    params: Annotated[MCPCatalogConnectRequest | None, Body()] = None,
 ) -> MCPCatalogConnectResponse:
     """Create or return a workspace MCP integration from catalog defaults."""
     if role.workspace_id is None:
@@ -1076,7 +1090,8 @@ async def connect_platform_mcp_catalog(
     svc = IntegrationService(session, role=role)
     try:
         connect_result = await svc.connect_platform_mcp_catalog(
-            catalog_slug=catalog_slug
+            catalog_slug=catalog_slug,
+            connection_option_id=params.connection_option_id if params else None,
         )
     except Exception as exc:
         _raise_mcp_connect_http_error(exc)
@@ -1085,7 +1100,7 @@ async def connect_platform_mcp_catalog(
 
 
 @mcp_router.post("/connect", status_code=status.HTTP_201_CREATED)
-@require_scope("integration:create")
+@require_scope("integration:create", "integration:read")
 async def connect_mcp_integration(
     role: WorkspaceActorRouteRole,
     session: AsyncDBSession,
@@ -1113,12 +1128,13 @@ async def connect_mcp_integration(
         _raise_mcp_connect_http_error(exc)
 
     await _gate_mcp_connect_verification(svc, mcp_integration)
+    mcp_read = _mcp_integration_read(
+        mcp_integration,
+        state=await svc.mcp_integration_state(mcp_integration=mcp_integration),
+    )
     return MCPCatalogConnectResponse(
-        status="connected",
-        mcp_integration=_mcp_integration_read(
-            mcp_integration,
-            state=await svc.mcp_integration_state(mcp_integration=mcp_integration),
-        ),
+        status=_mcp_connect_status(mcp_read=mcp_read, oauth_connect=None),
+        mcp_integration=mcp_read,
     )
 
 
@@ -1150,6 +1166,31 @@ async def get_mcp_integration(
     )
 
 
+@mcp_router.get("/{mcp_integration_id}/verification-status")
+@require_scope("integration:read")
+async def get_mcp_integration_verification_status(
+    role: WorkspaceActorRouteRole,
+    session: AsyncDBSession,
+    mcp_integration_id: uuid.UUID,
+) -> MCPVerificationStatusRead:
+    """Get saved MCP integration verification status."""
+    if role.workspace_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Workspace ID is required",
+        )
+
+    svc = IntegrationService(session, role=role)
+    integration = await svc.get_mcp_integration(mcp_integration_id=mcp_integration_id)
+    if integration is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="MCP integration not found",
+        )
+
+    return await svc.get_stdio_mcp_verification_status(mcp_integration=integration)
+
+
 @mcp_router.put("/{mcp_integration_id}")
 @require_scope("integration:update")
 async def update_mcp_integration(
@@ -1167,8 +1208,8 @@ async def update_mcp_integration(
 
     svc = IntegrationService(session, role=role)
     try:
-        # Verification runs against the merged config BEFORE anything is
-        # persisted — a failed update never disturbs the existing connection.
+        # HTTP verification runs against the merged config before persistence.
+        # Stdio config is persisted first, then verified by saved row ID.
         integration = await svc.update_mcp_integration(
             mcp_integration_id=mcp_integration_id,
             params=params,
@@ -1242,10 +1283,10 @@ async def test_mcp_connection_config(
     session: AsyncDBSession,
     params: Annotated[MCPIntegrationTestConnectionRequest, Body(...)],
 ) -> MCPIntegrationTestConnectionResponse:
-    """Test connectivity against an unsaved HTTP MCP configuration.
+    """Test connectivity against an MCP configuration.
 
-    Ephemeral: nothing is persisted and stored verification state is never
-    touched — use this for testing edited form values before saving.
+    HTTP tests are ephemeral and never touch stored verification state. Stdio
+    tests require a saved integration ID and use saved-row verification.
     """
     if role.workspace_id is None:
         raise HTTPException(
@@ -1254,7 +1295,7 @@ async def test_mcp_connection_config(
         )
 
     svc = IntegrationService(session, role=role)
-    return await svc.test_mcp_http_connection(params=params)
+    return await svc.test_mcp_connection(params=params)
 
 
 @mcp_router.post("/{mcp_integration_id}/test")
@@ -1264,7 +1305,7 @@ async def test_mcp_integration_connection(
     session: AsyncDBSession,
     mcp_integration_id: uuid.UUID,
 ) -> MCPIntegrationTestConnectionResponse:
-    """Test connectivity to an HTTP MCP server and refresh its tool listing."""
+    """Test connectivity to an MCP server and refresh its tool listing."""
     if role.workspace_id is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1278,12 +1319,6 @@ async def test_mcp_integration_connection(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="MCP integration not found",
         )
-    if integration.server_type != "http":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Connection testing is only supported for HTTP MCP servers",
-        )
-
     return await svc.verify_mcp_integration(mcp_integration=integration)
 
 

@@ -21,9 +21,9 @@ import {
   WorkflowIcon,
 } from "lucide-react"
 import Link from "next/link"
-import { useParams, usePathname } from "next/navigation"
+import { usePathname } from "next/navigation"
 import type * as React from "react"
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useMemo, useState } from "react"
 import { useScopeCheck } from "@/components/auth/scope-guard"
 import {
   LockedFeatureChip,
@@ -52,7 +52,6 @@ import {
   SidebarMenuSubButton,
   SidebarMenuSubItem,
   SidebarRail,
-  useSidebar,
 } from "@/components/ui/sidebar"
 import { useEntitlements } from "@/hooks/use-entitlements"
 import { usePendingApprovalsCount } from "@/hooks/use-pending-approvals-count"
@@ -88,27 +87,8 @@ type NavItem = {
 export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   const pathname = usePathname()
   const workspaceId = useWorkspaceId()
-  const params = useParams<{ caseId?: string }>()
-  const { setOpen: setSidebarOpen } = useSidebar()
-  const setSidebarOpenRef = useRef(setSidebarOpen)
   const basePath = `/workspaces/${workspaceId}`
-  const caseId = params?.caseId
-  const casesListPath = `${basePath}/cases`
-  const isCasesList = pathname === casesListPath
   const [lockedFeatureDialogOpen, setLockedFeatureDialogOpen] = useState(false)
-
-  useEffect(() => {
-    setSidebarOpenRef.current = setSidebarOpen
-  }, [setSidebarOpen])
-
-  useEffect(() => {
-    const updateSidebarOpen = setSidebarOpenRef.current
-    if (caseId) {
-      updateSidebarOpen(false)
-    } else if (isCasesList) {
-      updateSidebarOpen(true)
-    }
-  }, [caseId, isCasesList])
 
   // Scope checks for sidebar items
   const canViewWorkflows = useScopeCheck("workflow:read")
@@ -188,12 +168,6 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         icon: MousePointerClickIcon,
         isActive: pathname?.startsWith(`${basePath}/agents`),
         visible: canViewAgents === true,
-        isLocked: entitlementsKnown && !agentAddonsEnabled,
-        isPendingEntitlement: !entitlementsKnown,
-        onSelect:
-          entitlementsKnown && !agentAddonsEnabled
-            ? () => setLockedFeatureDialogOpen(true)
-            : undefined,
       },
       {
         title: "Tables",
@@ -235,12 +209,6 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
         url: `${basePath}/skills`,
         icon: Pyramid,
         isActive: pathname?.startsWith(`${basePath}/skills`),
-        isLocked: entitlementsKnown && !agentAddonsEnabled,
-        isPendingEntitlement: !entitlementsKnown,
-        onSelect:
-          entitlementsKnown && !agentAddonsEnabled
-            ? () => setLockedFeatureDialogOpen(true)
-            : undefined,
         visible: canViewAgents === true,
       },
       {
@@ -262,7 +230,6 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
       canViewSecrets,
       canViewIntegrations,
       entitlementsKnown,
-      agentAddonsEnabled,
       workspaceChatEnabled,
       canViewAgents,
       canViewActions,
@@ -317,7 +284,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                         <SidebarMenuItem key={item.title}>
                           {item.items ? (
                             <SidebarMenuItem>
-                              <div className="flex w-full items-center gap-2 overflow-hidden rounded-md py-1.5 px-2 text-left text-[13px] text-zinc-700 dark:text-zinc-300">
+                              <div className="flex w-full items-center gap-2 overflow-hidden rounded-md py-1.5 px-2 text-left text-[13px] text-sidebar-foreground">
                                 <item.icon className="size-4 shrink-0" />
                                 <span className="font-medium">
                                   {item.title}
@@ -464,7 +431,9 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                   title: "MCP access",
                   href: `${basePath}/mcp`,
                   icon: TerminalIcon,
-                  isActive: pathname?.startsWith(`${basePath}/mcp`),
+                  isActive:
+                    pathname === `${basePath}/mcp` ||
+                    pathname?.startsWith(`${basePath}/mcp/`),
                 }
               : null,
           ].filter((item) => item !== null)}

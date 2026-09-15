@@ -24,6 +24,7 @@ INITIAL_WORKSPACE_SCOPED_TABLES = (
     "tables",
     "case",
     "case_comment",
+    "case_comment_mention",
     "case_event",
     "case_task",
     "case_tag",
@@ -71,7 +72,10 @@ INITIAL_ORG_OPTIONAL_WORKSPACE_SCOPED_TABLES = (
 # Tables introduced after the initial RLS rollout. Their creating or follow-up
 # revisions must apply policy SQL explicitly.
 POST_RLS_WORKSPACE_SCOPED_TABLES = (
+    "case_agent_session_interaction",
     "case_table_row",
+    "case_version",
+    "case_comment_agent_invocation",
     "agent_channel_token",
     "agent_preset_version",
     "agent_folder",
@@ -82,6 +86,8 @@ POST_RLS_WORKSPACE_SCOPED_TABLES = (
     "skill_draft_file",
     "skill_version",
     "skill_version_file",
+    "skill_version_tool",
+    "skill_version_mcp_tool",
     "agent_preset_skill",
     "agent_preset_version_skill",
     "workspace_sync_resource_mapping",

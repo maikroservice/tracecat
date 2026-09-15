@@ -4,20 +4,33 @@
 FROM debian:bookworm-slim AS nsjail-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
-# Build from specific commit that includes pasta/user_net support
-ENV NSJAIL_COMMIT=b24be32d38a26656568491c2c5fcffa6e77341d6
+# Pin NsJail 4.0 source with the in-process NSTUN policy backend.
+ENV NSJAIL_COMMIT=388b9655a696e88df3185d09e36c0378a8532904
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git gcc g++ make pkg-config bison flex \
     libprotobuf-dev protobuf-compiler libnl-route-3-dev ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+COPY docker/nsjail/nstun-bounded-memory.patch /tmp/nstun-bounded-memory.patch
+
 RUN git clone https://github.com/google/nsjail.git /tmp/nsjail && \
     cd /tmp/nsjail && git checkout "${NSJAIL_COMMIT}" && \
+    git apply --check /tmp/nstun-bounded-memory.patch && \
+    git apply /tmp/nstun-bounded-memory.patch && \
     git submodule update --init --recursive && \
     make -j"$(nproc)" && \
     install -m 0755 nsjail /usr/local/bin/nsjail && \
     rm -rf /tmp/nsjail
+
+COPY docker/loop-device-sync.cc /tmp/loop-device-sync.cc
+
+RUN g++ -std=c++20 -O2 -Wall -Wextra -Werror -Wformat=2 \
+        -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE -pie \
+        -Wl,-z,relro,-z,now \
+        /tmp/loop-device-sync.cc -o /usr/local/bin/tracecat-loop-device-sync && \
+    strip /usr/local/bin/tracecat-loop-device-sync && \
+    rm /tmp/loop-device-sync.cc
 
 # ====================
 # Stage 2: Create minimal sandbox rootfs
@@ -29,7 +42,8 @@ ARG TARGETARCH
 ARG DUCKDB_VERSION=1.4.3
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl wget jq iputils-ping && rm -rf /var/lib/apt/lists/*
+    ca-certificates curl wget jq iputils-ping git openssh-client squashfs-tools \
+    && rm -rf /var/lib/apt/lists/*
 
 # This rootfs is shared by run_python and agent sandboxes; CLI additions here
 # are intentionally available to both. DuckDB is not available from Bookworm
@@ -120,7 +134,7 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     acl git openssh-client xmlsec1 libmagic1 curl ca-certificates jq \
     libnl-route-3-200 libprotobuf32 libcap2-bin util-linux \
-    passt squashfs-tools \
+    squashfs-tools \
     && apt-get -y upgrade \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
@@ -131,13 +145,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # binaries are not stored twice in the image. The Python package loads
 # extensions from this directory instead of autoinstalling over the network.
 ENV TRACECAT__DUCKDB_EXTENSION_DIRECTORY=/usr/local/lib/duckdb/extensions
-
-# Allow the non-root executor process to invoke mount/umount when the container
-# runtime grants the needed bounding capabilities. Without these file caps,
-# privileged Docker containers still run apiuser with no effective capabilities.
-RUN chmod u-s /usr/bin/mount /usr/bin/umount && \
-    setcap cap_sys_admin,cap_dac_override+ep /usr/bin/mount && \
-    setcap cap_sys_admin,cap_dac_override+ep /usr/bin/umount
 
 # Copy sandbox rootfs
 COPY --from=sandbox-rootfs /usr /var/lib/tracecat/sandbox-rootfs/usr
@@ -186,7 +193,7 @@ RUN mkdir -p /var/lib/tracecat/sandbox-rootfs/tmp \
         /var/lib/tracecat/sandbox-rootfs/home/sandbox && \
     chmod 1777 /var/lib/tracecat/sandbox-rootfs/tmp
 
-# Create apiuser for non-root runtime (required for pasta userspace networking)
+# Create apiuser for the non-root runtime.
 RUN groupadd -g 1001 apiuser && useradd -m -u 1001 -g apiuser apiuser && \
     mkdir -p /home/apiuser/.cache/uv /home/apiuser/.cache/s3 /home/apiuser/.cache/tmp /home/apiuser/.local/bin && \
     chown -R apiuser:apiuser /home/apiuser
@@ -194,10 +201,95 @@ RUN groupadd -g 1001 apiuser && useradd -m -u 1001 -g apiuser apiuser && \
 # Create MCP socket directory for apiuser
 RUN mkdir -p /var/run/tracecat && chown 1001:1001 /var/run/tracecat
 
+# Allow the non-root executor process to invoke mount/umount and synchronize
+# kernel-confirmed loop nodes when the runtime grants the needed bounding
+# capabilities. The fixed-purpose sync helper cannot create arbitrary devices.
+COPY --from=nsjail-builder /usr/local/bin/tracecat-loop-device-sync /usr/local/bin/tracecat-loop-device-sync
+
+RUN chmod u-s /usr/bin/mount /usr/bin/umount && \
+    setcap cap_sys_admin,cap_dac_override+ep /usr/bin/mount && \
+    setcap cap_sys_admin,cap_dac_override+ep /usr/bin/umount && \
+    setcap cap_mknod,cap_dac_override,cap_setuid+ep /usr/local/bin/tracecat-loop-device-sync
+
 WORKDIR /app
 
 # ====================
-# Stage 4: Development app
+# Stage 4: Fetch workspace-chat copilot skills
+# ====================
+FROM base AS plugin-skills
+
+ARG TRACECAT_PLUGINS_REF=a41bbdbb4ad3d5e5cf15eda8a6e3d8c3018393cd
+ARG TRACECAT_PLUGINS_ARCHIVE_SHA256=e3c67cc4ae2cf0319fe4455b507d0500999600de4f52d93c7c673d9b00a2096f
+
+# Pinned to a tracecat-plugins commit on main. Bump both values when the
+# vendored skills change so the trusted payload is verified before extraction.
+RUN set -eux; \
+    mkdir -p /skills /tmp/tracecat-plugins; \
+    curl -fsSL \
+        "https://github.com/TracecatHQ/tracecat-plugins/archive/${TRACECAT_PLUGINS_REF}.tar.gz" \
+        -o /tmp/tracecat-plugins.tar.gz; \
+    echo "${TRACECAT_PLUGINS_ARCHIVE_SHA256}  /tmp/tracecat-plugins.tar.gz" \
+        | sha256sum -c -; \
+    tar -xzf /tmp/tracecat-plugins.tar.gz \
+        -C /tmp/tracecat-plugins \
+        --strip-components=1; \
+    for skill in \
+        tracecat-workspace-chat \
+        tracecat-automation-best-practices \
+        tracecat-slackbot-best-practices; do \
+        source="/tmp/tracecat-plugins/plugins/tracecat/skills/${skill}"; \
+        test -d "${source}"; \
+        test -f "${source}/SKILL.md"; \
+        cp -a "${source}" /skills/; \
+    done; \
+    test "$(find /skills -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 3; \
+    rm -rf /tmp/tracecat-plugins /tmp/tracecat-plugins.tar.gz
+
+# Workspace Chat reads platform guidance from docs built from this same commit.
+# Keep source structure so docs.json and MDX imports remain useful navigation.
+COPY ./docs /tmp/tracecat-docs
+
+RUN set -eux; \
+    docs_source=/tmp/tracecat-docs; \
+    docs_target=/skills/tracecat-workspace-chat/references/docs; \
+    mkdir -p "${docs_target}"; \
+    cd "${docs_source}"; \
+    find . -type f \( \
+        -name '*.mdx' -o \
+        -name 'docs.json' -o \
+        -path './automations/core-actions/_examples.yaml' -o \
+        -path './automations/core-actions/_manifest.yaml' \
+    \) -exec cp --parents '{}' "${docs_target}" \;; \
+    source_count="$(find "${docs_source}" -type f \( \
+        -name '*.mdx' -o \
+        -name 'docs.json' -o \
+        -path '*/automations/core-actions/_examples.yaml' -o \
+        -path '*/automations/core-actions/_manifest.yaml' \
+    \) | wc -l)"; \
+    target_count="$(find "${docs_target}" -type f | wc -l)"; \
+    test "${source_count}" -gt 0; \
+    test "${source_count}" -eq "${target_count}"; \
+    test -f "${docs_target}/docs.json"; \
+    test -f "${docs_target}/agents/workspace-chat.mdx"; \
+    test -f "${docs_target}/automations/workflows.mdx"; \
+    test -f "${docs_target}/automations/core-actions/_examples.yaml"; \
+    test -f "${docs_target}/automations/core-actions/_manifest.yaml"; \
+    test -z "$(find "${docs_target}" -type f \( \
+        -iname '*.gif' -o -iname '*.jpeg' -o -iname '*.jpg' -o \
+        -iname '*.png' -o -iname '*.svg' -o -iname '*.webp' \
+    \) -print -quit)"; \
+    rm -rf "${docs_source}"
+
+# ====================
+# Stage 5: Prepare development source without bundled docs
+# ====================
+FROM base AS development-source
+
+COPY . /source/
+RUN rm -rf /source/docs
+
+# ====================
+# Stage 6: Development app
 # ====================
 FROM base AS development-app
 
@@ -214,7 +306,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=packages,target=packages \
     uv sync --locked --no-install-project --no-dev --no-editable
 
-COPY --chown=apiuser:apiuser . /app/
+COPY --from=development-source --chown=apiuser:apiuser /source/ /app/
+COPY --from=plugin-skills --chown=apiuser:apiuser /skills/ /var/lib/tracecat/copilot-skills/
 
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-dev
 
@@ -226,25 +319,21 @@ ENV PYTHONPATH="/home/apiuser/.local"
 
 RUN mkdir -p /home/apiuser/.local/bin && ln -s $(which uv) /home/apiuser/.local/bin/uv
 
-COPY docker/scripts/entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
-
-# Switch to non-root user (matches production, required for pasta userspace networking)
+# Switch to the non-root user used in production.
 USER apiuser
 
-ENTRYPOINT ["/app/entrypoint.sh"]
 EXPOSE $PORT
 CMD ["sh", "-c", "python3 -m uvicorn tracecat.api.app:app --host $HOST --port $PORT --reload"]
 
 # ====================
-# Stage 5: Development registry manifest
+# Stage 7: Development registry manifest
 # ====================
 FROM development-app AS development-registry-manifest
 
 RUN /app/.venv/bin/python -m tracecat.registry.sync.prebuild
 
 # ====================
-# Stage 6: Development target
+# Stage 8: Development target
 # ====================
 FROM development-app AS development
 
@@ -253,7 +342,7 @@ FROM development-app AS development
 COPY --from=development-registry-manifest --chown=apiuser:apiuser /app/.registry-artifacts /app/.registry-artifacts
 
 # ====================
-# Stage 7: Test target (development + pytest)
+# Stage 9: Test target (development + pytest)
 # ====================
 FROM development AS test
 
@@ -263,7 +352,7 @@ RUN --mount=type=cache,target=/home/apiuser/.cache/uv,uid=1001,gid=1001 uv sync 
 CMD ["python", "-m", "pytest"]
 
 # ====================
-# Stage 8: Production app
+# Stage 10: Production app
 # ====================
 FROM base AS production-app
 
@@ -293,10 +382,9 @@ RUN --mount=type=cache,target=/home/apiuser/.cache/uv,uid=1001,gid=1001 \
 
 COPY --chown=apiuser:apiuser ./tracecat /app/tracecat
 COPY --chown=apiuser:apiuser ./packages /app/packages
+COPY --from=plugin-skills --chown=apiuser:apiuser /skills/ /var/lib/tracecat/copilot-skills/
 COPY --chown=apiuser:apiuser ./pyproject.toml ./uv.lock ./.python-version ./README.md ./LICENSE ./alembic.ini /app/
 COPY --chown=apiuser:apiuser ./alembic /app/alembic
-COPY --chown=apiuser:apiuser docker/scripts/entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
 
 RUN --mount=type=cache,target=/home/apiuser/.cache/uv,uid=1001,gid=1001 \
     uv sync --locked --no-dev --no-editable
@@ -306,14 +394,14 @@ ENV PATH="/app/.venv/bin:/home/apiuser/.local/bin:/usr/local/bin:/usr/bin:/bin"
 RUN ln -sf $(which uv) /home/apiuser/.local/bin/uv
 
 # ====================
-# Stage 9: Production registry manifest
+# Stage 11: Production registry manifest
 # ====================
 FROM production-app AS registry-manifest
 
 RUN /app/.venv/bin/python -m tracecat.registry.sync.prebuild
 
 # ====================
-# Stage 10: Production target
+# Stage 12: Production target
 # ====================
 FROM production-app AS production
 
@@ -325,5 +413,4 @@ COPY --from=registry-manifest --chown=apiuser:apiuser /app/.registry-artifacts /
 RUN nsjail --help > /dev/null 2>&1 && echo "nsjail available"
 
 EXPOSE $PORT
-ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["sh", "-c", "python3 -m uvicorn tracecat.api.app:app --host $HOST --port $PORT"]

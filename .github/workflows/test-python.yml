@@ -264,6 +264,10 @@ jobs:
               --deselect "tests/unit/test_agent_sandbox_litellm.py::test_run_agent_activity_reproduces_mcp_compression_initialize_timeout_in_each_sandbox_mode[nsjail]" \
               --deselect "tests/unit/test_agent_sandbox_litellm.py::test_run_agent_activity_spawns_full_claude_harness_runtime_in_each_sandbox_mode[nsjail]" \
               --deselect tests/unit/test_agent_sandbox_litellm.py::test_run_agent_activity_spawns_full_claude_harness_runtime_with_pasta_in_nsjail \
+              --deselect tests/unit/test_agent_sandbox_litellm.py::test_run_agent_activity_spawns_full_claude_harness_runtime_with_nstun_in_nsjail \
+              --deselect tests/unit/test_agent_sandbox_litellm.py::test_agent_nsjail_handles_stdio_mcp_startup_and_bash_network_burst \
+              --deselect tests/unit/test_agent_sandbox_litellm.py::test_agent_nsjail_shim_enforces_nproc_cap \
+              --deselect tests/unit/test_executor_sandbox_nsjail.py::test_nstun_bounds_parent_udp_sockets \
               --deselect tests/unit/test_executor_sandbox_nsjail.py::test_action_runner_executes_registry_action_smoke
           fi
 

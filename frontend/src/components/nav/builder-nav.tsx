@@ -1,7 +1,6 @@
 "use client"
 
 import { zodResolver } from "@hookform/resolvers/zod"
-import { useIsMutating } from "@tanstack/react-query"
 import {
   AlertTriangleIcon,
   ChevronDownIcon,
@@ -99,6 +98,7 @@ import {
   useOrgAppSettings,
   useWorkflowManager,
 } from "@/lib/hooks"
+import { useIsMutating } from "@/lib/query"
 import { cn, copyToClipboard } from "@/lib/utils"
 import {
   parseTriggerPayload,

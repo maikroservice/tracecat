@@ -33,6 +33,10 @@ export type ActionControlFlow = {
    * If true, redact this action's result in workflow execution API responses while preserving internal workflow data flow between actions.
    */
   mask_output?: boolean
+  /**
+   * UNSAFE: if true, surface this action's original error message even when secrets are in scope, instead of the generic 'Details withheld' message. Known secret values are still masked.
+   */
+  unsafe_disable_secret_error_withholding?: boolean
 }
 
 export type ActionCreate = {
@@ -129,7 +133,11 @@ export type ActionRetryPolicy = {
   retry_until?: string | null
 }
 
-export type ActionStatement = {
+export type ActionStatement_Input = {
+  /**
+   * The action ID. If this is populated means there is a corresponding actionin the database `Action` table.
+   */
+  id?: string | null
   /**
    * Unique reference for the task
    */
@@ -185,6 +193,72 @@ export type ActionStatement = {
    * If true, redact this action's result in workflow execution API responses while preserving internal workflow data flow between actions.
    */
   mask_output?: boolean
+  /**
+   * UNSAFE: if true, surface this action's original error message even when secrets are in scope, instead of the generic 'Details withheld' message. Known secret values are still masked, but the original text may echo transformed secret values that exact-string masking cannot catch.
+   */
+  unsafe_disable_secret_error_withholding?: boolean
+}
+
+export type ActionStatement_Output = {
+  /**
+   * Unique reference for the task
+   */
+  ref: string
+  description?: string
+  /**
+   * Action type. Equivalent to the UDF key.
+   */
+  action: string
+  /**
+   * Arguments for the action
+   */
+  args?: {
+    [key: string]: unknown
+  }
+  /**
+   * Task dependencies
+   */
+  depends_on?: Array<string>
+  /**
+   * Whether the action is interactive.
+   */
+  interaction?: ResponseInteraction | ApprovalInteraction | null
+  /**
+   * Condition to run the task
+   */
+  run_if?: string | null
+  /**
+   * Iterate over a list of items and run the task for each item.
+   */
+  for_each?: string | Array<string> | null
+  /**
+   * Retry policy for the action.
+   */
+  retry_policy?: ActionRetryPolicy
+  /**
+   * Delay before starting the action in seconds. If `wait_until` is also provided, the `wait_until` timer will take precedence.
+   */
+  start_delay?: number
+  /**
+   * Wait until a specific date and time before starting. Overrides `start_delay` if both are provided.
+   */
+  wait_until?: string | null
+  /**
+   * The strategy to use when joining on this task. By default, all branches must complete successfully before the join task can complete.
+   */
+  join_strategy?: JoinStrategy
+  /**
+   * Override environment for this action's execution. Can be a template expression.
+   */
+  environment?: string | null
+  /**
+   * If true, redact this action's result in workflow execution API responses while preserving internal workflow data flow between actions.
+   */
+  mask_output?: boolean
+  /**
+   * UNSAFE: if true, surface this action's original error message even when secrets are in scope, instead of the generic 'Details withheld' message. Known secret values are still masked, but the original text may echo transformed secret values that exact-string masking cannot catch.
+   */
+  unsafe_disable_secret_error_withholding?: boolean
 }
 
 export type ActionStep = {
@@ -1204,6 +1278,7 @@ export type AppSettingsRead = {
   app_workflow_export_enabled: boolean
   app_create_workspace_on_register: boolean
   app_action_form_mode_enabled: boolean
+  app_unsafe_disable_secret_error_withholding_workspace_ids?: Array<string>
 }
 
 /**
@@ -1234,6 +1309,10 @@ export type AppSettingsUpdate = {
    * Whether to enable form mode for action inputs. When disabled, only YAML mode is available, preserving raw YAML formatting.
    */
   app_action_form_mode_enabled?: boolean
+  /**
+   * UNSAFE: workspaces whose actions may opt into showing their original error message when secrets are in scope. Each action must still enable 'Show error details' individually. Known secret values are still masked.
+   */
+  app_unsafe_disable_secret_error_withholding_workspace_ids?: Array<string>
 }
 
 /**
@@ -2266,6 +2345,10 @@ export type CaseFieldCreate = {
   type: SqlType
   nullable?: boolean
   default?: unknown | null
+  /**
+   * Whether to create a unique index on the column
+   */
+  is_index?: boolean
   options?: Array<string> | null
   display_name?: string | null
   kind?: CaseFieldKind | null
@@ -2598,13 +2681,19 @@ export type CaseTaskUpdate = {
   } | null
 }
 
-export type CaseTriggerCreate = {
+export type CaseTriggerConfig = {
   status?: "online" | "offline"
   event_types?: Array<CaseEventType>
   tag_filters?: Array<string>
 }
 
 export type status2 = "online" | "offline"
+
+export type CaseTriggerCreate = {
+  status?: "online" | "offline"
+  event_types?: Array<CaseEventType>
+  tag_filters?: Array<string>
+}
 
 export type CaseTriggerRead = {
   id: string
@@ -3692,7 +3781,20 @@ export type DSLConfig_Output = {
   timeout?: number
 }
 
-export type DSLEntrypoint = {
+export type DSLEntrypoint_Input = {
+  /**
+   * The entrypoint action ref
+   */
+  ref?: string | null
+  /**
+   * Expected trigger input schema. Use this to specify the expected shape of the trigger input.
+   */
+  expects?: {
+    [key: string]: ExpectedField_Input
+  } | null
+}
+
+export type DSLEntrypoint_Output = {
   /**
    * The entrypoint action ref
    */
@@ -3732,8 +3834,8 @@ export type DSLEnvironment = {
 export type DSLInput = {
   title: string
   description: string
-  entrypoint: DSLEntrypoint
-  actions: Array<ActionStatement>
+  entrypoint: DSLEntrypoint_Output
+  actions: Array<ActionStatement_Output>
   config?: DSLConfig_Output
   triggers?: Array<Trigger>
   /**
@@ -4250,7 +4352,7 @@ export type GetWorkflowDefinitionActivityInputs = {
   role: Role
   workflow_id: string
   version?: number | null
-  task?: ActionStatement | null
+  task?: ActionStatement_Output | null
 }
 
 /**
@@ -4692,6 +4794,38 @@ export type HealthResponse = {
 }
 
 /**
+ * A named group of allowed IP addresses or CIDR ranges.
+ */
+export type IPAllowlist = {
+  /**
+   * Human-readable name, e.g. 'Corporate VPN'.
+   */
+  name: string
+  /**
+   * Optional note on what this allowlist covers and who owns it.
+   */
+  description?: string | null
+  /**
+   * IPv4 or IPv6 addresses or CIDR ranges.
+   */
+  cidrs: Array<string>
+}
+
+/**
+ * Check whether an IP address would be admitted by the saved allowlist.
+ */
+export type IPAllowlistCheckRequest = {
+  ip_address: string
+}
+
+export type IPAllowlistCheckResult = {
+  allowed: boolean
+  matched_cidr?: string | null
+  matched_allowlist?: string | null
+  enforced: boolean
+}
+
+/**
  * Display groups for inbox items.
  *
  * Groups are derived from approval state and live workflow execution status,
@@ -4896,6 +5030,7 @@ export type IntegrationRead = {
 export type IntegrationReadMinimal = {
   id: string
   provider_id: string
+  grant_type: OAuthGrantType
   status: IntegrationStatus
   is_expired: boolean
 }
@@ -5041,6 +5176,29 @@ export type IssuedServiceAccountApiKey = {
 export type JoinStrategy = "any" | "all"
 
 export type JsonValue = unknown
+
+export type LayoutActionPosition = {
+  ref: string
+  x?: number | null
+  y?: number | null
+  position?: {
+    [key: string]: number
+  } | null
+}
+
+export type LayoutPosition = {
+  x?: number | null
+  y?: number | null
+  position?: {
+    [key: string]: number
+  } | null
+}
+
+export type LayoutViewport = {
+  x?: number | null
+  y?: number | null
+  zoom?: number | null
+}
 
 /**
  * Authentication type for MCP integrations.
@@ -6968,7 +7126,7 @@ export type RoleUpdate = {
  * This object contains all the information needed to execute an action.
  */
 export type RunActionInput = {
-  task: ActionStatement
+  task: ActionStatement_Output
   exec_context: ExecutionContext
   run_context: RunContext
   interaction_context?: InteractionContext | null
@@ -7175,6 +7333,10 @@ export type ScheduleUpdate = {
    */
   end_at?: string | null
   status?: "online" | "offline" | null
+  /**
+   * The maximum number of seconds to wait for the workflow to complete
+   */
+  timeout?: number | null
 }
 
 /**
@@ -7350,6 +7512,28 @@ export type SecretValidationResult = {
   ref?: string | null
 }
 
+/**
+ * Organization security settings.
+ */
+export type SecuritySettingsRead = {
+  ip_allowlist_enabled: boolean
+  ip_allowlists: Array<IPAllowlist>
+}
+
+/**
+ * Organization security settings.
+ */
+export type SecuritySettingsUpdate = {
+  /**
+   * Restrict organization API access to the configured IP allowlists. Has no effect while no allowlists exist.
+   */
+  ip_allowlist_enabled?: boolean
+  /**
+   * Named groups of allowed IP addresses or CIDR ranges.
+   */
+  ip_allowlists?: Array<IPAllowlist>
+}
+
 export type Select = {
   component_id?: "select"
   options?: Array<string> | null
@@ -7433,6 +7617,9 @@ export type SessionRead = {
   created_at: string
   user_id: string
   user_email: string
+  ip_address?: string | null
+  user_agent?: string | null
+  last_seen_at?: string | null
 }
 
 export type Session_Any_ = {
@@ -7908,6 +8095,10 @@ export type TableColumnCreate = {
   type: SqlType
   nullable?: boolean
   default?: unknown | null
+  /**
+   * Whether to create a unique index on the column
+   */
+  is_index?: boolean
   options?: Array<string> | null
 }
 
@@ -9331,6 +9522,31 @@ export type WorkflowDirectoryItem = {
   type: "workflow"
 }
 
+/**
+ * Canonical editable draft document plus its content-hash revision.
+ */
+export type WorkflowDraftRead = {
+  workflow_id: string
+  draft_revision: string
+  document: WorkflowEditDocument_Output
+}
+
+/**
+ * Wholesale replacement of a workflow draft.
+ *
+ * ``document`` is the full desired draft state (metadata, definition, layout,
+ * schedules, case trigger). ``schedules`` is optional: when omitted, the
+ * workflow's existing schedules are left untouched so they can be owned by
+ * the standalone ``/schedules`` resource; when present, they are replaced.
+ * Other omitted sections fall back to their defaults and are treated as
+ * changed. When ``base_revision`` is set, the update is rejected with 409 if
+ * the current draft revision differs.
+ */
+export type WorkflowDraftUpdate = {
+  document: WorkflowEditDocument_Input
+  base_revision?: string | null
+}
+
 export type WorkflowDslPublish = {
   message?: string | null
   branch?: string | null
@@ -9350,6 +9566,44 @@ export type WorkflowDslPublishResult = {
 }
 
 export type status10 = "committed" | "no_op"
+
+export type WorkflowEditDefinition_Input = {
+  entrypoint?: DSLEntrypoint_Input
+  actions?: Array<ActionStatement_Input>
+  config?: DSLConfig_Input
+  returns?: unknown | null
+}
+
+export type WorkflowEditDefinition_Output = {
+  entrypoint?: DSLEntrypoint_Output
+  actions?: Array<ActionStatement_Output>
+  config?: DSLConfig_Output
+  returns?: unknown | null
+}
+
+export type WorkflowEditDocument_Input = {
+  metadata: WorkflowEditMetadata
+  definition: WorkflowEditDefinition_Input
+  layout?: WorkflowLayout
+  schedules?: Array<WorkflowSchedule>
+  case_trigger?: CaseTriggerConfig | null
+}
+
+export type WorkflowEditDocument_Output = {
+  metadata: WorkflowEditMetadata
+  definition: WorkflowEditDefinition_Output
+  layout?: WorkflowLayout
+  schedules?: Array<WorkflowSchedule>
+  case_trigger?: CaseTriggerConfig | null
+}
+
+export type WorkflowEditMetadata = {
+  title: string
+  description: string
+  status: "online" | "offline"
+  alias?: string | null
+  error_handler?: string | null
+}
 
 export type WorkflowEntrypointValidationRequest = {
   expects?: {
@@ -9846,6 +10100,12 @@ export type WorkflowFolderUpdate = {
   name?: string | null
 }
 
+export type WorkflowLayout = {
+  trigger?: LayoutPosition | null
+  viewport?: LayoutViewport | null
+  actions?: Array<LayoutActionPosition>
+}
+
 export type WorkflowMoveToFolder = {
   folder_path?: string | null
 }
@@ -9957,6 +10217,19 @@ export type WorkflowRunReadMinimal = {
    * Workflow alias from workspace metadata or execution search attributes.
    */
   workflow_alias?: string | null
+}
+
+export type WorkflowSchedule = {
+  status?: "online" | "offline"
+  inputs?: {
+    [key: string]: unknown
+  } | null
+  cron?: string | null
+  every?: string | null
+  offset?: string | null
+  start_at?: string | null
+  end_at?: string | null
+  timeout?: number
 }
 
 /**
@@ -10096,6 +10369,10 @@ export type WorkspaceRead = {
   name: string
   settings?: WorkspaceSettingsRead | null
   organization_id: string
+  /**
+   * Whether the organization lets this workspace's actions opt into showing original error details when secrets are in scope.
+   */
+  unsafe_disable_secret_error_withholding_allowed?: boolean
 }
 
 export type WorkspaceReadMinimal = {
@@ -10507,7 +10784,7 @@ export type WorkspacesUpdateWorkspaceData = {
   workspaceId: string
 }
 
-export type WorkspacesUpdateWorkspaceResponse = void
+export type WorkspacesUpdateWorkspaceResponse = WorkspaceRead
 
 export type WorkspacesDeleteWorkspaceData = {
   workspaceId: string
@@ -10533,7 +10810,8 @@ export type WorkspacesCreateWorkspaceMembershipData = {
   workspaceId: string
 }
 
-export type WorkspacesCreateWorkspaceMembershipResponse = unknown
+export type WorkspacesCreateWorkspaceMembershipResponse =
+  WorkspaceMembershipRead
 
 export type WorkspacesGetWorkspaceMembershipData = {
   userId: string
@@ -10723,7 +11001,7 @@ export type WorkflowsUpdateWorkflowData = {
   workspaceId: string
 }
 
-export type WorkflowsUpdateWorkflowResponse = void
+export type WorkflowsUpdateWorkflowResponse = WorkflowRead
 
 export type WorkflowsDeleteWorkflowData = {
   workflowId: string
@@ -10782,12 +11060,20 @@ export type WorkflowsGetWorkflowDefinitionData = {
 
 export type WorkflowsGetWorkflowDefinitionResponse = WorkflowDefinitionRead
 
-export type WorkflowsCreateWorkflowDefinitionData = {
+export type WorkflowsGetWorkflowDraftData = {
   workflowId: string
   workspaceId: string
 }
 
-export type WorkflowsCreateWorkflowDefinitionResponse = WorkflowDefinitionRead
+export type WorkflowsGetWorkflowDraftResponse = WorkflowDraftRead
+
+export type WorkflowsReplaceWorkflowDraftData = {
+  requestBody: WorkflowDraftUpdate
+  workflowId: string
+  workspaceId: string
+}
+
+export type WorkflowsReplaceWorkflowDraftResponse = WorkflowDraftRead
 
 export type TriggersCreateWebhookData = {
   requestBody: WebhookCreate
@@ -10795,7 +11081,7 @@ export type TriggersCreateWebhookData = {
   workspaceId: string
 }
 
-export type TriggersCreateWebhookResponse = unknown
+export type TriggersCreateWebhookResponse = WebhookRead
 
 export type TriggersGetWebhookData = {
   workflowId: string
@@ -10810,7 +11096,7 @@ export type TriggersUpdateWebhookData = {
   workspaceId: string
 }
 
-export type TriggersUpdateWebhookResponse = void
+export type TriggersUpdateWebhookResponse = WebhookRead
 
 export type TriggersCreateCaseTriggerData = {
   requestBody: CaseTriggerCreate
@@ -10833,7 +11119,7 @@ export type TriggersUpdateCaseTriggerData = {
   workspaceId: string
 }
 
-export type TriggersUpdateCaseTriggerResponse = void
+export type TriggersUpdateCaseTriggerResponse = CaseTriggerRead
 
 export type TriggersGenerateWebhookApiKeyData = {
   workflowId: string
@@ -11199,7 +11485,7 @@ export type SecretsCreateSecretData = {
   workspaceId: string
 }
 
-export type SecretsCreateSecretResponse = unknown
+export type SecretsCreateSecretResponse = SecretReadMinimal
 
 export type SecretsListSecretDefinitionsData = {
   workspaceId: string
@@ -11226,7 +11512,7 @@ export type SecretsUpdateSecretByIdData = {
   workspaceId: string
 }
 
-export type SecretsUpdateSecretByIdResponse = void
+export type SecretsUpdateSecretByIdResponse = SecretReadMinimal
 
 export type SecretsDeleteSecretByIdData = {
   secretId: string
@@ -12832,6 +13118,20 @@ export type SettingsUpdateAuditSettingsData = {
 
 export type SettingsUpdateAuditSettingsResponse = void
 
+export type SettingsGetSecuritySettingsResponse = SecuritySettingsRead
+
+export type SettingsUpdateSecuritySettingsData = {
+  requestBody: SecuritySettingsUpdate
+}
+
+export type SettingsUpdateSecuritySettingsResponse = void
+
+export type SettingsCheckIpAllowlistData = {
+  requestBody: IPAllowlistCheckRequest
+}
+
+export type SettingsCheckIpAllowlistResponse = IPAllowlistCheckResult
+
 export type SettingsTestAuditWebhookData = {
   requestBody: AuditSettingsUpdate
 }
@@ -12867,7 +13167,7 @@ export type OrganizationSecretsCreateOrgSecretData = {
   requestBody: SecretCreate
 }
 
-export type OrganizationSecretsCreateOrgSecretResponse = unknown
+export type OrganizationSecretsCreateOrgSecretResponse = SecretReadMinimal
 
 export type OrganizationSecretsGetOrgSecretByNameData = {
   environment?: string | null
@@ -12882,7 +13182,7 @@ export type OrganizationSecretsUpdateOrgSecretByIdData = {
   secretId: string
 }
 
-export type OrganizationSecretsUpdateOrgSecretByIdResponse = void
+export type OrganizationSecretsUpdateOrgSecretByIdResponse = SecretReadMinimal
 
 export type OrganizationSecretsDeleteOrgSecretByIdData = {
   secretId: string
@@ -12901,7 +13201,7 @@ export type TablesCreateTableData = {
   workspaceId: string
 }
 
-export type TablesCreateTableResponse = unknown
+export type TablesCreateTableResponse = TableRead
 
 export type TablesGetTableData = {
   tableId: string
@@ -12916,7 +13216,7 @@ export type TablesUpdateTableData = {
   workspaceId: string
 }
 
-export type TablesUpdateTableResponse = void
+export type TablesUpdateTableResponse = TableRead
 
 export type TablesDeleteTableData = {
   tableId: string
@@ -12931,7 +13231,7 @@ export type TablesCreateColumnData = {
   workspaceId: string
 }
 
-export type TablesCreateColumnResponse = unknown
+export type TablesCreateColumnResponse = TableColumnRead
 
 export type TablesUpdateColumnData = {
   columnId: string
@@ -12940,7 +13240,7 @@ export type TablesUpdateColumnData = {
   workspaceId: string
 }
 
-export type TablesUpdateColumnResponse = void
+export type TablesUpdateColumnResponse = TableColumnRead
 
 export type TablesDeleteColumnData = {
   columnId: string
@@ -12974,7 +13274,7 @@ export type TablesInsertRowData = {
   workspaceId: string
 }
 
-export type TablesInsertRowResponse = unknown
+export type TablesInsertRowResponse = TableRowRead
 
 export type TablesGetRowData = {
   rowId: string
@@ -12982,7 +13282,7 @@ export type TablesGetRowData = {
   workspaceId: string
 }
 
-export type TablesGetRowResponse = unknown
+export type TablesGetRowResponse = TableRowRead
 
 export type TablesDeleteRowData = {
   rowId: string
@@ -13094,7 +13394,7 @@ export type CasesCreateCaseData = {
   workspaceId: string
 }
 
-export type CasesCreateCaseResponse = unknown
+export type CasesCreateCaseResponse = CaseRead
 
 export type CasesSearchCasesData = {
   /**
@@ -13270,11 +13570,15 @@ export type CasesGetCaseResponse = CaseRead
 
 export type CasesUpdateCaseData = {
   caseId: string
+  /**
+   * Include linked table rows
+   */
+  includeRows?: boolean
   requestBody: CaseUpdate
   workspaceId: string
 }
 
-export type CasesUpdateCaseResponse = void
+export type CasesUpdateCaseResponse = CaseRead
 
 export type CasesDeleteCaseData = {
   caseId: string
@@ -13296,7 +13600,7 @@ export type CasesCreateCommentData = {
   workspaceId: string
 }
 
-export type CasesCreateCommentResponse = unknown
+export type CasesCreateCommentResponse = CaseCommentRead
 
 export type CasesListCommentThreadsData = {
   caseId: string
@@ -13312,7 +13616,7 @@ export type CasesUpdateCommentData = {
   workspaceId: string
 }
 
-export type CasesUpdateCommentResponse = void
+export type CasesUpdateCommentResponse = CaseCommentRead
 
 export type CasesDeleteCommentData = {
   caseId: string
@@ -13471,7 +13775,7 @@ export type CasesCreateFieldData = {
   workspaceId: string
 }
 
-export type CasesCreateFieldResponse = unknown
+export type CasesCreateFieldResponse = CaseFieldReadMinimal
 
 export type CasesUpdateFieldData = {
   fieldId: string
@@ -13479,7 +13783,7 @@ export type CasesUpdateFieldData = {
   workspaceId: string
 }
 
-export type CasesUpdateFieldResponse = void
+export type CasesUpdateFieldResponse = CaseFieldReadMinimal
 
 export type CasesDeleteFieldData = {
   fieldId: string
@@ -14518,7 +14822,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        204: void
+        200: WorkspaceRead
         /**
          * Validation Error
          */
@@ -14574,7 +14878,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        201: unknown
+        201: WorkspaceMembershipRead
         /**
          * Validation Error
          */
@@ -14903,7 +15207,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        204: void
+        200: WorkflowRead
         /**
          * Validation Error
          */
@@ -14998,13 +15302,28 @@ export type $OpenApiTs = {
         422: HTTPValidationError
       }
     }
-    post: {
-      req: WorkflowsCreateWorkflowDefinitionData
+  }
+  "/workspaces/{workspace_id}/workflows/{workflow_id}/draft": {
+    get: {
+      req: WorkflowsGetWorkflowDraftData
       res: {
         /**
          * Successful Response
          */
-        200: WorkflowDefinitionRead
+        200: WorkflowDraftRead
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+    put: {
+      req: WorkflowsReplaceWorkflowDraftData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: WorkflowDraftRead
         /**
          * Validation Error
          */
@@ -15019,7 +15338,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        201: unknown
+        201: WebhookRead
         /**
          * Validation Error
          */
@@ -15045,7 +15364,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        204: void
+        200: WebhookRead
         /**
          * Validation Error
          */
@@ -15086,7 +15405,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        204: void
+        200: CaseTriggerRead
         /**
          * Validation Error
          */
@@ -15670,7 +15989,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        201: unknown
+        201: SecretReadMinimal
         /**
          * Validation Error
          */
@@ -15730,7 +16049,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        204: void
+        200: SecretReadMinimal
         /**
          * Validation Error
          */
@@ -18794,6 +19113,44 @@ export type $OpenApiTs = {
       }
     }
   }
+  "/settings/security": {
+    get: {
+      res: {
+        /**
+         * Successful Response
+         */
+        200: SecuritySettingsRead
+      }
+    }
+    patch: {
+      req: SettingsUpdateSecuritySettingsData
+      res: {
+        /**
+         * Successful Response
+         */
+        204: void
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
+  "/settings/security/ip-allowlist/check": {
+    post: {
+      req: SettingsCheckIpAllowlistData
+      res: {
+        /**
+         * Successful Response
+         */
+        200: IPAllowlistCheckResult
+        /**
+         * Validation Error
+         */
+        422: HTTPValidationError
+      }
+    }
+  }
   "/settings/audit/test": {
     post: {
       req: SettingsTestAuditWebhookData
@@ -18875,7 +19232,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        201: unknown
+        201: SecretReadMinimal
         /**
          * Validation Error
          */
@@ -18905,7 +19262,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        204: void
+        200: SecretReadMinimal
         /**
          * Validation Error
          */
@@ -18946,7 +19303,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        201: unknown
+        201: TableRead
         /**
          * Validation Error
          */
@@ -18974,7 +19331,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        204: void
+        200: TableRead
         /**
          * Validation Error
          */
@@ -19002,7 +19359,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        201: unknown
+        201: TableColumnRead
         /**
          * Validation Error
          */
@@ -19017,7 +19374,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        204: void
+        200: TableColumnRead
         /**
          * Validation Error
          */
@@ -19058,7 +19415,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        201: unknown
+        201: TableRowRead
         /**
          * Validation Error
          */
@@ -19073,7 +19430,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        200: unknown
+        200: TableRowRead
         /**
          * Validation Error
          */
@@ -19202,7 +19559,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        201: unknown
+        201: CaseRead
         /**
          * Validation Error
          */
@@ -19290,7 +19647,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        204: void
+        200: CaseRead
         /**
          * Validation Error
          */
@@ -19331,7 +19688,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        201: unknown
+        201: CaseCommentRead
         /**
          * Validation Error
          */
@@ -19361,7 +19718,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        204: void
+        200: CaseCommentRead
         /**
          * Validation Error
          */
@@ -19621,7 +19978,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        201: unknown
+        201: CaseFieldReadMinimal
         /**
          * Validation Error
          */
@@ -19636,7 +19993,7 @@ export type $OpenApiTs = {
         /**
          * Successful Response
          */
-        204: void
+        200: CaseFieldReadMinimal
         /**
          * Validation Error
          */

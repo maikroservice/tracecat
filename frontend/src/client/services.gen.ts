@@ -709,12 +709,15 @@ import type {
   ServiceAccountsUpdateOrganizationServiceAccountResponse,
   ServiceAccountsUpdateWorkspaceServiceAccountData,
   ServiceAccountsUpdateWorkspaceServiceAccountResponse,
+  SettingsCheckIpAllowlistData,
+  SettingsCheckIpAllowlistResponse,
   SettingsGetAgentOtelSettingsResponse,
   SettingsGetAgentSettingsResponse,
   SettingsGetAppSettingsResponse,
   SettingsGetAuditSettingsResponse,
   SettingsGetGitSettingsResponse,
   SettingsGetSamlSettingsResponse,
+  SettingsGetSecuritySettingsResponse,
   SettingsTestAuditWebhookData,
   SettingsTestAuditWebhookResponse,
   SettingsUpdateAgentOtelSettingsData,
@@ -729,6 +732,8 @@ import type {
   SettingsUpdateGitSettingsResponse,
   SettingsUpdateSamlSettingsData,
   SettingsUpdateSamlSettingsResponse,
+  SettingsUpdateSecuritySettingsData,
+  SettingsUpdateSecuritySettingsResponse,
   TablesBatchDeleteRowsData,
   TablesBatchDeleteRowsResponse,
   TablesBatchInsertRowsData,
@@ -887,8 +892,6 @@ import type {
   WorkflowsCommitWorkflowData,
   WorkflowsCommitWorkflowResponse,
   WorkflowsCreateWorkflowData,
-  WorkflowsCreateWorkflowDefinitionData,
-  WorkflowsCreateWorkflowDefinitionResponse,
   WorkflowsCreateWorkflowResponse,
   WorkflowsDeleteWorkflowData,
   WorkflowsDeleteWorkflowResponse,
@@ -899,6 +902,8 @@ import type {
   WorkflowsGetWorkflowData,
   WorkflowsGetWorkflowDefinitionData,
   WorkflowsGetWorkflowDefinitionResponse,
+  WorkflowsGetWorkflowDraftData,
+  WorkflowsGetWorkflowDraftResponse,
   WorkflowsGetWorkflowResponse,
   WorkflowsListTagsData,
   WorkflowsListTagsResponse,
@@ -922,6 +927,8 @@ import type {
   WorkflowsPullWorkflowsResponse,
   WorkflowsRemoveTagData,
   WorkflowsRemoveTagResponse,
+  WorkflowsReplaceWorkflowDraftData,
+  WorkflowsReplaceWorkflowDraftResponse,
   WorkflowsRestoreWorkflowDefinitionData,
   WorkflowsRestoreWorkflowDefinitionResponse,
   WorkflowsUpdateWorkflowData,
@@ -1301,7 +1308,7 @@ export const workspacesGetWorkspace = (
  * @param data The data for the request.
  * @param data.workspaceId
  * @param data.requestBody
- * @returns void Successful Response
+ * @returns WorkspaceRead Successful Response
  * @throws ApiError
  */
 export const workspacesUpdateWorkspace = (
@@ -1396,7 +1403,7 @@ export const workspacesListWorkspaceMemberships = (
  * @param data The data for the request.
  * @param data.workspaceId
  * @param data.requestBody
- * @returns unknown Successful Response
+ * @returns WorkspaceMembershipRead Successful Response
  * @throws ApiError
  */
 export const workspacesCreateWorkspaceMembership = (
@@ -2016,7 +2023,7 @@ export const workflowsGetWorkflow = (
  * @param data.workspaceId
  * @param data.workflowId
  * @param data.requestBody
- * @returns void Successful Response
+ * @returns WorkflowRead Successful Response
  * @throws ApiError
  */
 export const workflowsUpdateWorkflow = (
@@ -2213,24 +2220,62 @@ export const workflowsGetWorkflowDefinition = (
 }
 
 /**
- * Create Workflow Definition
- * Get the latest version of a workflow definition.
+ * Get Workflow Draft
+ * Return the workflow's current draft as a canonical editable document.
+ *
+ * The document has the same shape accepted by ``PUT /workflows/{id}/draft``
+ * (metadata, definition, layout, schedules, case trigger), and
+ * ``draft_revision`` is a content hash suitable for optimistic concurrency.
  * @param data The data for the request.
  * @param data.workspaceId
  * @param data.workflowId
- * @returns WorkflowDefinitionRead Successful Response
+ * @returns WorkflowDraftRead Successful Response
  * @throws ApiError
  */
-export const workflowsCreateWorkflowDefinition = (
-  data: WorkflowsCreateWorkflowDefinitionData
-): CancelablePromise<WorkflowsCreateWorkflowDefinitionResponse> => {
+export const workflowsGetWorkflowDraft = (
+  data: WorkflowsGetWorkflowDraftData
+): CancelablePromise<WorkflowsGetWorkflowDraftResponse> => {
   return __request(OpenAPI, {
-    method: "POST",
-    url: "/workspaces/{workspace_id}/workflows/{workflow_id}/definition",
+    method: "GET",
+    url: "/workspaces/{workspace_id}/workflows/{workflow_id}/draft",
     path: {
       workspace_id: data.workspaceId,
       workflow_id: data.workflowId,
     },
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Replace Workflow Draft
+ * Replace the workflow's draft with the supplied document.
+ *
+ * Validates the definition, then rewrites the action graph, layout,
+ * schedules, and case trigger in one transaction. Omit ``schedules`` from
+ * the document to leave the workflow's schedules untouched (they can be
+ * managed independently via ``/schedules``). Publishing is separate: call
+ * ``POST /workflows/{id}/commit`` afterwards to create a new version.
+ * @param data The data for the request.
+ * @param data.workspaceId
+ * @param data.workflowId
+ * @param data.requestBody
+ * @returns WorkflowDraftRead Successful Response
+ * @throws ApiError
+ */
+export const workflowsReplaceWorkflowDraft = (
+  data: WorkflowsReplaceWorkflowDraftData
+): CancelablePromise<WorkflowsReplaceWorkflowDraftResponse> => {
+  return __request(OpenAPI, {
+    method: "PUT",
+    url: "/workspaces/{workspace_id}/workflows/{workflow_id}/draft",
+    path: {
+      workspace_id: data.workspaceId,
+      workflow_id: data.workflowId,
+    },
+    body: data.requestBody,
+    mediaType: "application/json",
     errors: {
       422: "Validation Error",
     },
@@ -2244,7 +2289,7 @@ export const workflowsCreateWorkflowDefinition = (
  * @param data.workspaceId
  * @param data.workflowId
  * @param data.requestBody
- * @returns unknown Successful Response
+ * @returns WebhookRead Successful Response
  * @throws ApiError
  */
 export const triggersCreateWebhook = (
@@ -2297,7 +2342,7 @@ export const triggersGetWebhook = (
  * @param data.workspaceId
  * @param data.workflowId
  * @param data.requestBody
- * @returns void Successful Response
+ * @returns WebhookRead Successful Response
  * @throws ApiError
  */
 export const triggersUpdateWebhook = (
@@ -2378,7 +2423,7 @@ export const triggersGetCaseTrigger = (
  * @param data.workspaceId
  * @param data.workflowId
  * @param data.requestBody
- * @returns void Successful Response
+ * @returns CaseTriggerRead Successful Response
  * @throws ApiError
  */
 export const triggersUpdateCaseTrigger = (
@@ -3513,7 +3558,7 @@ export const secretsListSecrets = (
  * @param data The data for the request.
  * @param data.workspaceId
  * @param data.requestBody
- * @returns unknown Successful Response
+ * @returns SecretReadMinimal Successful Response
  * @throws ApiError
  */
 export const secretsCreateSecret = (
@@ -3611,7 +3656,7 @@ export const secretsGetSecretByName = (
  * @param data.workspaceId
  * @param data.secretId
  * @param data.requestBody
- * @returns void Successful Response
+ * @returns SecretReadMinimal Successful Response
  * @throws ApiError
  */
 export const secretsUpdateSecretById = (
@@ -9017,6 +9062,66 @@ export const settingsUpdateAuditSettings = (
 }
 
 /**
+ * Get Security Settings
+ * @returns SecuritySettingsRead Successful Response
+ * @throws ApiError
+ */
+export const settingsGetSecuritySettings =
+  (): CancelablePromise<SettingsGetSecuritySettingsResponse> => {
+    return __request(OpenAPI, {
+      method: "GET",
+      url: "/settings/security",
+    })
+  }
+
+/**
+ * Update Security Settings
+ * Update the organization IP allowlist.
+ *
+ * Enabling a non-empty allowlist that excludes the caller's own IP is
+ * rejected so an admin cannot lock themselves out of the organization.
+ * @param data The data for the request.
+ * @param data.requestBody
+ * @returns void Successful Response
+ * @throws ApiError
+ */
+export const settingsUpdateSecuritySettings = (
+  data: SettingsUpdateSecuritySettingsData
+): CancelablePromise<SettingsUpdateSecuritySettingsResponse> => {
+  return __request(OpenAPI, {
+    method: "PATCH",
+    url: "/settings/security",
+    body: data.requestBody,
+    mediaType: "application/json",
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
+ * Check Ip Allowlist
+ * Report whether an IP address is admitted by the saved allowlist.
+ * @param data The data for the request.
+ * @param data.requestBody
+ * @returns IPAllowlistCheckResult Successful Response
+ * @throws ApiError
+ */
+export const settingsCheckIpAllowlist = (
+  data: SettingsCheckIpAllowlistData
+): CancelablePromise<SettingsCheckIpAllowlistResponse> => {
+  return __request(OpenAPI, {
+    method: "POST",
+    url: "/settings/security/ip-allowlist/check",
+    body: data.requestBody,
+    mediaType: "application/json",
+    errors: {
+      422: "Validation Error",
+    },
+  })
+}
+
+/**
  * Test Audit Webhook
  * Probe the submitted audit webhook configuration with a marked test event.
  * @param data The data for the request.
@@ -9134,7 +9239,7 @@ export const organizationSecretsListOrgSecrets = (
  * Create an organization secret.
  * @param data The data for the request.
  * @param data.requestBody
- * @returns unknown Successful Response
+ * @returns SecretReadMinimal Successful Response
  * @throws ApiError
  */
 export const organizationSecretsCreateOrgSecret = (
@@ -9184,7 +9289,7 @@ export const organizationSecretsGetOrgSecretByName = (
  * @param data The data for the request.
  * @param data.secretId
  * @param data.requestBody
- * @returns void Successful Response
+ * @returns SecretReadMinimal Successful Response
  * @throws ApiError
  */
 export const organizationSecretsUpdateOrgSecretById = (
@@ -9256,7 +9361,7 @@ export const tablesListTables = (
  * @param data The data for the request.
  * @param data.workspaceId
  * @param data.requestBody
- * @returns unknown Successful Response
+ * @returns TableRead Successful Response
  * @throws ApiError
  */
 export const tablesCreateTable = (
@@ -9308,7 +9413,7 @@ export const tablesGetTable = (
  * @param data.tableId
  * @param data.workspaceId
  * @param data.requestBody
- * @returns void Successful Response
+ * @returns TableRead Successful Response
  * @throws ApiError
  */
 export const tablesUpdateTable = (
@@ -9361,7 +9466,7 @@ export const tablesDeleteTable = (
  * @param data.tableId
  * @param data.workspaceId
  * @param data.requestBody
- * @returns unknown Successful Response
+ * @returns TableColumnRead Successful Response
  * @throws ApiError
  */
 export const tablesCreateColumn = (
@@ -9390,7 +9495,7 @@ export const tablesCreateColumn = (
  * @param data.columnId
  * @param data.workspaceId
  * @param data.requestBody
- * @returns void Successful Response
+ * @returns TableColumnRead Successful Response
  * @throws ApiError
  */
 export const tablesUpdateColumn = (
@@ -9483,7 +9588,7 @@ export const tablesListRows = (
  * @param data.tableId
  * @param data.workspaceId
  * @param data.requestBody
- * @returns unknown Successful Response
+ * @returns TableRowRead Successful Response
  * @throws ApiError
  */
 export const tablesInsertRow = (
@@ -9511,7 +9616,7 @@ export const tablesInsertRow = (
  * @param data.tableId
  * @param data.rowId
  * @param data.workspaceId
- * @returns unknown Successful Response
+ * @returns TableRowRead Successful Response
  * @throws ApiError
  */
 export const tablesGetRow = (
@@ -9778,7 +9883,7 @@ export const casesListCases = (
  * @param data The data for the request.
  * @param data.workspaceId
  * @param data.requestBody
- * @returns unknown Successful Response
+ * @returns CaseRead Successful Response
  * @throws ApiError
  */
 export const casesCreateCase = (
@@ -10000,7 +10105,8 @@ export const casesGetCase = (
  * @param data.caseId
  * @param data.workspaceId
  * @param data.requestBody
- * @returns void Successful Response
+ * @param data.includeRows Include linked table rows
+ * @returns CaseRead Successful Response
  * @throws ApiError
  */
 export const casesUpdateCase = (
@@ -10012,6 +10118,9 @@ export const casesUpdateCase = (
     path: {
       case_id: data.caseId,
       workspace_id: data.workspaceId,
+    },
+    query: {
+      include_rows: data.includeRows,
     },
     body: data.requestBody,
     mediaType: "application/json",
@@ -10078,7 +10187,7 @@ export const casesListComments = (
  * @param data.caseId
  * @param data.workspaceId
  * @param data.requestBody
- * @returns unknown Successful Response
+ * @returns CaseCommentRead Successful Response
  * @throws ApiError
  */
 export const casesCreateComment = (
@@ -10132,7 +10241,7 @@ export const casesListCommentThreads = (
  * @param data.commentId
  * @param data.workspaceId
  * @param data.requestBody
- * @returns void Successful Response
+ * @returns CaseCommentRead Successful Response
  * @throws ApiError
  */
 export const casesUpdateComment = (
@@ -10635,7 +10744,7 @@ export const casesListFields = (
  * @param data The data for the request.
  * @param data.workspaceId
  * @param data.requestBody
- * @returns unknown Successful Response
+ * @returns CaseFieldReadMinimal Successful Response
  * @throws ApiError
  */
 export const casesCreateField = (
@@ -10662,7 +10771,7 @@ export const casesCreateField = (
  * @param data.fieldId
  * @param data.workspaceId
  * @param data.requestBody
- * @returns void Successful Response
+ * @returns CaseFieldReadMinimal Successful Response
  * @throws ApiError
  */
 export const casesUpdateField = (

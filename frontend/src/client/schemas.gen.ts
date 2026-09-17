@@ -112,6 +112,13 @@ export const $ActionControlFlow = {
         "If true, redact this action's result in workflow execution API responses while preserving internal workflow data flow between actions.",
       default: false,
     },
+    unsafe_disable_secret_error_withholding: {
+      type: "boolean",
+      title: "Unsafe Disable Secret Error Withholding",
+      description:
+        "UNSAFE: if true, surface this action's original error message even when secrets are in scope, instead of the generic 'Details withheld' message. Known secret values are still masked.",
+      default: false,
+    },
   },
   type: "object",
   title: "ActionControlFlow",
@@ -481,7 +488,175 @@ export const $ActionRetryPolicy = {
   title: "ActionRetryPolicy",
 } as const
 
-export const $ActionStatement = {
+export const $ActionStatement_Input = {
+  properties: {
+    id: {
+      anyOf: [
+        {
+          type: "string",
+          format: "uuid",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Id",
+      description:
+        "The action ID. If this is populated means there is a corresponding actionin the database `Action` table.",
+    },
+    ref: {
+      type: "string",
+      pattern: "^[a-z0-9_]+$",
+      title: "Ref",
+      description: "Unique reference for the task",
+    },
+    description: {
+      type: "string",
+      title: "Description",
+      default: "",
+    },
+    action: {
+      type: "string",
+      pattern: "^[a-z0-9_.]+$",
+      title: "Action",
+      description: "Action type. Equivalent to the UDF key.",
+    },
+    args: {
+      additionalProperties: true,
+      type: "object",
+      title: "Args",
+      description: "Arguments for the action",
+    },
+    depends_on: {
+      items: {
+        type: "string",
+      },
+      type: "array",
+      title: "Depends On",
+      description: "Task dependencies",
+    },
+    interaction: {
+      anyOf: [
+        {
+          oneOf: [
+            {
+              $ref: "#/components/schemas/ResponseInteraction",
+            },
+            {
+              $ref: "#/components/schemas/ApprovalInteraction",
+            },
+          ],
+          description: "An interaction configuration",
+          discriminator: {
+            propertyName: "type",
+            mapping: {
+              approval: "#/components/schemas/ApprovalInteraction",
+              response: "#/components/schemas/ResponseInteraction",
+            },
+          },
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Interaction",
+      description: "Whether the action is interactive.",
+    },
+    run_if: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Run If",
+      description: "Condition to run the task",
+    },
+    for_each: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          items: {
+            type: "string",
+          },
+          type: "array",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "For Each",
+      description:
+        "Iterate over a list of items and run the task for each item.",
+    },
+    retry_policy: {
+      $ref: "#/components/schemas/ActionRetryPolicy",
+      description: "Retry policy for the action.",
+    },
+    start_delay: {
+      type: "number",
+      title: "Start Delay",
+      description:
+        "Delay before starting the action in seconds. If `wait_until` is also provided, the `wait_until` timer will take precedence.",
+      default: 0,
+    },
+    wait_until: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Wait Until",
+      description:
+        "Wait until a specific date and time before starting. Overrides `start_delay` if both are provided.",
+    },
+    join_strategy: {
+      $ref: "#/components/schemas/JoinStrategy",
+      description:
+        "The strategy to use when joining on this task. By default, all branches must complete successfully before the join task can complete.",
+      default: "all",
+    },
+    environment: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Environment",
+      description:
+        "Override environment for this action's execution. Can be a template expression.",
+    },
+    mask_output: {
+      type: "boolean",
+      title: "Mask Output",
+      description:
+        "If true, redact this action's result in workflow execution API responses while preserving internal workflow data flow between actions.",
+      default: false,
+    },
+    unsafe_disable_secret_error_withholding: {
+      type: "boolean",
+      title: "Unsafe Disable Secret Error Withholding",
+      description:
+        "UNSAFE: if true, surface this action's original error message even when secrets are in scope, instead of the generic 'Details withheld' message. Known secret values are still masked, but the original text may echo transformed secret values that exact-string masking cannot catch.",
+      default: false,
+    },
+  },
+  type: "object",
+  required: ["ref", "action"],
+  title: "ActionStatement",
+} as const
+
+export const $ActionStatement_Output = {
   properties: {
     ref: {
       type: "string",
@@ -620,6 +795,13 @@ export const $ActionStatement = {
       title: "Mask Output",
       description:
         "If true, redact this action's result in workflow execution API responses while preserving internal workflow data flow between actions.",
+      default: false,
+    },
+    unsafe_disable_secret_error_withholding: {
+      type: "boolean",
+      title: "Unsafe Disable Secret Error Withholding",
+      description:
+        "UNSAFE: if true, surface this action's original error message even when secrets are in scope, instead of the generic 'Details withheld' message. Known secret values are still masked, but the original text may echo transformed secret values that exact-string masking cannot catch.",
       default: false,
     },
   },
@@ -4842,6 +5024,14 @@ export const $AppSettingsRead = {
       type: "boolean",
       title: "App Action Form Mode Enabled",
     },
+    app_unsafe_disable_secret_error_withholding_workspace_ids: {
+      items: {
+        type: "string",
+        format: "uuid",
+      },
+      type: "array",
+      title: "App Unsafe Disable Secret Error Withholding Workspace Ids",
+    },
   },
   type: "object",
   required: [
@@ -4896,6 +5086,16 @@ export const $AppSettingsUpdate = {
       description:
         "Whether to enable form mode for action inputs. When disabled, only YAML mode is available, preserving raw YAML formatting.",
       default: true,
+    },
+    app_unsafe_disable_secret_error_withholding_workspace_ids: {
+      items: {
+        type: "string",
+        format: "uuid",
+      },
+      type: "array",
+      title: "App Unsafe Disable Secret Error Withholding Workspace Ids",
+      description:
+        "UNSAFE: workspaces whose actions may opt into showing their original error message when secrets are in scope. Each action must still enable 'Show error details' individually. Known secret values are still masked.",
     },
   },
   type: "object",
@@ -8406,6 +8606,12 @@ export const $CaseFieldCreate = {
       ],
       title: "Default",
     },
+    is_index: {
+      type: "boolean",
+      title: "Is Index",
+      description: "Whether to create a unique index on the column",
+      default: false,
+    },
     options: {
       anyOf: [
         {
@@ -9644,6 +9850,33 @@ export const $CaseTaskUpdate = {
   },
   type: "object",
   title: "CaseTaskUpdate",
+} as const
+
+export const $CaseTriggerConfig = {
+  properties: {
+    status: {
+      type: "string",
+      enum: ["online", "offline"],
+      title: "Status",
+      default: "offline",
+    },
+    event_types: {
+      items: {
+        $ref: "#/components/schemas/CaseEventType",
+      },
+      type: "array",
+      title: "Event Types",
+    },
+    tag_filters: {
+      items: {
+        type: "string",
+      },
+      type: "array",
+      title: "Tag Filters",
+    },
+  },
+  type: "object",
+  title: "CaseTriggerConfig",
 } as const
 
 export const $CaseTriggerCreate = {
@@ -12603,7 +12836,42 @@ export const $DSLConfig_Output = {
 Activities don't need access to this.`,
 } as const
 
-export const $DSLEntrypoint = {
+export const $DSLEntrypoint_Input = {
+  properties: {
+    ref: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Ref",
+      description: "The entrypoint action ref",
+    },
+    expects: {
+      anyOf: [
+        {
+          additionalProperties: {
+            $ref: "#/components/schemas/ExpectedField-Input",
+          },
+          type: "object",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Expects",
+      description:
+        "Expected trigger input schema. Use this to specify the expected shape of the trigger input.",
+    },
+  },
+  type: "object",
+  title: "DSLEntrypoint",
+} as const
+
+export const $DSLEntrypoint_Output = {
   properties: {
     ref: {
       anyOf: [
@@ -12675,11 +12943,11 @@ export const $DSLInput = {
       title: "Description",
     },
     entrypoint: {
-      $ref: "#/components/schemas/DSLEntrypoint",
+      $ref: "#/components/schemas/DSLEntrypoint-Output",
     },
     actions: {
       items: {
-        $ref: "#/components/schemas/ActionStatement",
+        $ref: "#/components/schemas/ActionStatement-Output",
       },
       type: "array",
       title: "Actions",
@@ -14314,7 +14582,7 @@ export const $GetWorkflowDefinitionActivityInputs = {
     task: {
       anyOf: [
         {
-          $ref: "#/components/schemas/ActionStatement",
+          $ref: "#/components/schemas/ActionStatement-Output",
         },
         {
           type: "null",
@@ -15472,6 +15740,100 @@ export const $HealthResponse = {
   title: "HealthResponse",
 } as const
 
+export const $IPAllowlist = {
+  properties: {
+    name: {
+      type: "string",
+      maxLength: 100,
+      minLength: 1,
+      title: "Name",
+      description: "Human-readable name, e.g. 'Corporate VPN'.",
+    },
+    description: {
+      anyOf: [
+        {
+          type: "string",
+          maxLength: 500,
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Description",
+      description:
+        "Optional note on what this allowlist covers and who owns it.",
+    },
+    cidrs: {
+      items: {
+        type: "string",
+      },
+      type: "array",
+      maxItems: 50,
+      minItems: 1,
+      title: "Cidrs",
+      description: "IPv4 or IPv6 addresses or CIDR ranges.",
+    },
+  },
+  type: "object",
+  required: ["name", "cidrs"],
+  title: "IPAllowlist",
+  description: "A named group of allowed IP addresses or CIDR ranges.",
+} as const
+
+export const $IPAllowlistCheckRequest = {
+  properties: {
+    ip_address: {
+      type: "string",
+      maxLength: 45,
+      minLength: 1,
+      title: "Ip Address",
+    },
+  },
+  type: "object",
+  required: ["ip_address"],
+  title: "IPAllowlistCheckRequest",
+  description:
+    "Check whether an IP address would be admitted by the saved allowlist.",
+} as const
+
+export const $IPAllowlistCheckResult = {
+  properties: {
+    allowed: {
+      type: "boolean",
+      title: "Allowed",
+    },
+    matched_cidr: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Matched Cidr",
+    },
+    matched_allowlist: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Matched Allowlist",
+    },
+    enforced: {
+      type: "boolean",
+      title: "Enforced",
+    },
+  },
+  type: "object",
+  required: ["allowed", "enforced"],
+  title: "IPAllowlistCheckResult",
+} as const
+
 export const $InboxGroup = {
   type: "string",
   enum: ["review_required", "running", "error", "completed"],
@@ -15939,6 +16301,9 @@ export const $IntegrationReadMinimal = {
       type: "string",
       title: "Provider Id",
     },
+    grant_type: {
+      $ref: "#/components/schemas/OAuthGrantType",
+    },
     status: {
       $ref: "#/components/schemas/IntegrationStatus",
     },
@@ -15948,7 +16313,7 @@ export const $IntegrationReadMinimal = {
     },
   },
   type: "object",
-  required: ["id", "provider_id", "status", "is_expired"],
+  required: ["id", "provider_id", "grant_type", "status", "is_expired"],
   title: "IntegrationReadMinimal",
   description: "Response model for user integration.",
 } as const
@@ -16322,6 +16687,137 @@ export const $JoinStrategy = {
 } as const
 
 export const $JsonValue = {} as const
+
+export const $LayoutActionPosition = {
+  properties: {
+    ref: {
+      type: "string",
+      title: "Ref",
+    },
+    x: {
+      anyOf: [
+        {
+          type: "number",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "X",
+    },
+    y: {
+      anyOf: [
+        {
+          type: "number",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Y",
+    },
+    position: {
+      anyOf: [
+        {
+          additionalProperties: {
+            type: "number",
+          },
+          type: "object",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Position",
+    },
+  },
+  type: "object",
+  required: ["ref"],
+  title: "LayoutActionPosition",
+} as const
+
+export const $LayoutPosition = {
+  properties: {
+    x: {
+      anyOf: [
+        {
+          type: "number",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "X",
+    },
+    y: {
+      anyOf: [
+        {
+          type: "number",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Y",
+    },
+    position: {
+      anyOf: [
+        {
+          additionalProperties: {
+            type: "number",
+          },
+          type: "object",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Position",
+    },
+  },
+  type: "object",
+  title: "LayoutPosition",
+} as const
+
+export const $LayoutViewport = {
+  properties: {
+    x: {
+      anyOf: [
+        {
+          type: "number",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "X",
+    },
+    y: {
+      anyOf: [
+        {
+          type: "number",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Y",
+    },
+    zoom: {
+      anyOf: [
+        {
+          type: "number",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Zoom",
+    },
+  },
+  type: "object",
+  title: "LayoutViewport",
+} as const
 
 export const $MCPAuthType = {
   type: "string",
@@ -22858,7 +23354,7 @@ export const $RoleUpdate = {
 export const $RunActionInput = {
   properties: {
     task: {
-      $ref: "#/components/schemas/ActionStatement",
+      $ref: "#/components/schemas/ActionStatement-Output",
     },
     exec_context: {
       $ref: "#/components/schemas/ExecutionContext",
@@ -23565,6 +24061,20 @@ export const $ScheduleUpdate = {
       ],
       title: "Status",
     },
+    timeout: {
+      anyOf: [
+        {
+          type: "number",
+          minimum: 0,
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Timeout",
+      description:
+        "The maximum number of seconds to wait for the workflow to complete",
+    },
   },
   type: "object",
   title: "ScheduleUpdate",
@@ -24175,6 +24685,50 @@ export const $SecretValidationResult = {
   description: "Result of validating credentials.",
 } as const
 
+export const $SecuritySettingsRead = {
+  properties: {
+    ip_allowlist_enabled: {
+      type: "boolean",
+      title: "Ip Allowlist Enabled",
+    },
+    ip_allowlists: {
+      items: {
+        $ref: "#/components/schemas/IPAllowlist",
+      },
+      type: "array",
+      title: "Ip Allowlists",
+    },
+  },
+  type: "object",
+  required: ["ip_allowlist_enabled", "ip_allowlists"],
+  title: "SecuritySettingsRead",
+  description: "Organization security settings.",
+} as const
+
+export const $SecuritySettingsUpdate = {
+  properties: {
+    ip_allowlist_enabled: {
+      type: "boolean",
+      title: "Ip Allowlist Enabled",
+      description:
+        "Restrict organization API access to the configured IP allowlists. Has no effect while no allowlists exist.",
+      default: false,
+    },
+    ip_allowlists: {
+      items: {
+        $ref: "#/components/schemas/IPAllowlist",
+      },
+      type: "array",
+      maxItems: 100,
+      title: "Ip Allowlists",
+      description: "Named groups of allowed IP addresses or CIDR ranges.",
+    },
+  },
+  type: "object",
+  title: "SecuritySettingsUpdate",
+  description: "Organization security settings.",
+} as const
+
 export const $Select = {
   properties: {
     component_id: {
@@ -24640,6 +25194,40 @@ export const $SessionRead = {
       type: "string",
       format: "email",
       title: "User Email",
+    },
+    ip_address: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Ip Address",
+    },
+    user_agent: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "User Agent",
+    },
+    last_seen_at: {
+      anyOf: [
+        {
+          type: "string",
+          format: "date-time",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Last Seen At",
     },
   },
   type: "object",
@@ -26070,6 +26658,12 @@ export const $TableColumnCreate = {
         },
       ],
       title: "Default",
+    },
+    is_index: {
+      type: "boolean",
+      title: "Is Index",
+      description: "Whether to create a unique index on the column",
+      default: false,
     },
     options: {
       anyOf: [
@@ -29341,7 +29935,7 @@ export const $VariableCreate = {
       type: "string",
       maxLength: 255,
       minLength: 1,
-      pattern: "[a-z0-9_]+",
+      pattern: "^[a-z0-9_]+$",
       title: "Name",
     },
     description: {
@@ -29404,7 +29998,6 @@ export const $VariableRead = {
     },
     name: {
       type: "string",
-      pattern: "[a-z0-9_]+",
       title: "Name",
     },
     description: {
@@ -29481,7 +30074,6 @@ export const $VariableReadMinimal = {
     },
     name: {
       type: "string",
-      pattern: "[a-z0-9_]+",
       title: "Name",
     },
     description: {
@@ -29518,7 +30110,7 @@ export const $VariableUpdate = {
           type: "string",
           maxLength: 255,
           minLength: 1,
-          pattern: "[a-z0-9_]+",
+          pattern: "^[a-z0-9_]+$",
         },
         {
           type: "null",
@@ -31182,6 +31774,59 @@ export const $WorkflowDirectoryItem = {
   title: "WorkflowDirectoryItem",
 } as const
 
+export const $WorkflowDraftRead = {
+  properties: {
+    workflow_id: {
+      type: "string",
+      pattern: "wf_[0-9a-zA-Z]+",
+      title: "Workflow Id",
+    },
+    draft_revision: {
+      type: "string",
+      title: "Draft Revision",
+    },
+    document: {
+      $ref: "#/components/schemas/WorkflowEditDocument-Output",
+    },
+  },
+  type: "object",
+  required: ["workflow_id", "draft_revision", "document"],
+  title: "WorkflowDraftRead",
+  description:
+    "Canonical editable draft document plus its content-hash revision.",
+} as const
+
+export const $WorkflowDraftUpdate = {
+  properties: {
+    document: {
+      $ref: "#/components/schemas/WorkflowEditDocument-Input",
+    },
+    base_revision: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Base Revision",
+    },
+  },
+  type: "object",
+  required: ["document"],
+  title: "WorkflowDraftUpdate",
+  description: `Wholesale replacement of a workflow draft.
+
+\`\`document\`\` is the full desired draft state (metadata, definition, layout,
+schedules, case trigger). \`\`schedules\`\` is optional: when omitted, the
+workflow's existing schedules are left untouched so they can be owned by
+the standalone \`\`/schedules\`\` resource; when present, they are replaced.
+Other omitted sections fall back to their defaults and are treated as
+changed. When \`\`base_revision\`\` is set, the update is rejected with 409 if
+the current draft revision differs.`,
+} as const
+
 export const $WorkflowDslPublish = {
   properties: {
     message: {
@@ -31288,6 +31933,183 @@ export const $WorkflowDslPublishResult = {
   type: "object",
   required: ["status", "branch", "base_branch", "message"],
   title: "WorkflowDslPublishResult",
+} as const
+
+export const $WorkflowEditDefinition_Input = {
+  properties: {
+    entrypoint: {
+      $ref: "#/components/schemas/DSLEntrypoint-Input",
+    },
+    actions: {
+      items: {
+        $ref: "#/components/schemas/ActionStatement-Input",
+      },
+      type: "array",
+      title: "Actions",
+    },
+    config: {
+      $ref: "#/components/schemas/DSLConfig-Input",
+    },
+    returns: {
+      anyOf: [
+        {},
+        {
+          type: "null",
+        },
+      ],
+      title: "Returns",
+    },
+  },
+  additionalProperties: false,
+  type: "object",
+  title: "WorkflowEditDefinition",
+} as const
+
+export const $WorkflowEditDefinition_Output = {
+  properties: {
+    entrypoint: {
+      $ref: "#/components/schemas/DSLEntrypoint-Output",
+    },
+    actions: {
+      items: {
+        $ref: "#/components/schemas/ActionStatement-Output",
+      },
+      type: "array",
+      title: "Actions",
+    },
+    config: {
+      $ref: "#/components/schemas/DSLConfig-Output",
+    },
+    returns: {
+      anyOf: [
+        {},
+        {
+          type: "null",
+        },
+      ],
+      title: "Returns",
+    },
+  },
+  additionalProperties: false,
+  type: "object",
+  title: "WorkflowEditDefinition",
+} as const
+
+export const $WorkflowEditDocument_Input = {
+  properties: {
+    metadata: {
+      $ref: "#/components/schemas/WorkflowEditMetadata",
+    },
+    definition: {
+      $ref: "#/components/schemas/WorkflowEditDefinition-Input",
+    },
+    layout: {
+      $ref: "#/components/schemas/WorkflowLayout",
+    },
+    schedules: {
+      items: {
+        $ref: "#/components/schemas/WorkflowSchedule",
+      },
+      type: "array",
+      title: "Schedules",
+    },
+    case_trigger: {
+      anyOf: [
+        {
+          $ref: "#/components/schemas/CaseTriggerConfig",
+        },
+        {
+          type: "null",
+        },
+      ],
+    },
+  },
+  additionalProperties: false,
+  type: "object",
+  required: ["metadata", "definition"],
+  title: "WorkflowEditDocument",
+} as const
+
+export const $WorkflowEditDocument_Output = {
+  properties: {
+    metadata: {
+      $ref: "#/components/schemas/WorkflowEditMetadata",
+    },
+    definition: {
+      $ref: "#/components/schemas/WorkflowEditDefinition-Output",
+    },
+    layout: {
+      $ref: "#/components/schemas/WorkflowLayout",
+    },
+    schedules: {
+      items: {
+        $ref: "#/components/schemas/WorkflowSchedule",
+      },
+      type: "array",
+      title: "Schedules",
+    },
+    case_trigger: {
+      anyOf: [
+        {
+          $ref: "#/components/schemas/CaseTriggerConfig",
+        },
+        {
+          type: "null",
+        },
+      ],
+    },
+  },
+  additionalProperties: false,
+  type: "object",
+  required: ["metadata", "definition"],
+  title: "WorkflowEditDocument",
+} as const
+
+export const $WorkflowEditMetadata = {
+  properties: {
+    title: {
+      type: "string",
+      maxLength: 100,
+      minLength: 3,
+      title: "Title",
+    },
+    description: {
+      type: "string",
+      maxLength: 1000,
+      title: "Description",
+    },
+    status: {
+      type: "string",
+      enum: ["online", "offline"],
+      title: "Status",
+    },
+    alias: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Alias",
+    },
+    error_handler: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Error Handler",
+    },
+  },
+  additionalProperties: false,
+  type: "object",
+  required: ["title", "description", "status"],
+  title: "WorkflowEditMetadata",
 } as const
 
 export const $WorkflowEntrypointValidationRequest = {
@@ -32690,6 +33512,40 @@ export const $WorkflowFolderUpdate = {
   title: "WorkflowFolderUpdate",
 } as const
 
+export const $WorkflowLayout = {
+  properties: {
+    trigger: {
+      anyOf: [
+        {
+          $ref: "#/components/schemas/LayoutPosition",
+        },
+        {
+          type: "null",
+        },
+      ],
+    },
+    viewport: {
+      anyOf: [
+        {
+          $ref: "#/components/schemas/LayoutViewport",
+        },
+        {
+          type: "null",
+        },
+      ],
+    },
+    actions: {
+      items: {
+        $ref: "#/components/schemas/LayoutActionPosition",
+      },
+      type: "array",
+      title: "Actions",
+    },
+  },
+  type: "object",
+  title: "WorkflowLayout",
+} as const
+
 export const $WorkflowMoveToFolder = {
   properties: {
     folder_path: {
@@ -32704,6 +33560,7 @@ export const $WorkflowMoveToFolder = {
       title: "Folder Path",
     },
   },
+  additionalProperties: false,
   type: "object",
   title: "WorkflowMoveToFolder",
 } as const
@@ -33187,6 +34044,95 @@ export const $WorkflowRunReadMinimal = {
     "trigger_type",
   ],
   title: "WorkflowRunReadMinimal",
+} as const
+
+export const $WorkflowSchedule = {
+  properties: {
+    status: {
+      type: "string",
+      enum: ["online", "offline"],
+      title: "Status",
+      default: "online",
+    },
+    inputs: {
+      anyOf: [
+        {
+          additionalProperties: true,
+          type: "object",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Inputs",
+    },
+    cron: {
+      anyOf: [
+        {
+          type: "string",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Cron",
+    },
+    every: {
+      anyOf: [
+        {
+          type: "string",
+          format: "duration",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Every",
+    },
+    offset: {
+      anyOf: [
+        {
+          type: "string",
+          format: "duration",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Offset",
+    },
+    start_at: {
+      anyOf: [
+        {
+          type: "string",
+          format: "date-time",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "Start At",
+    },
+    end_at: {
+      anyOf: [
+        {
+          type: "string",
+          format: "date-time",
+        },
+        {
+          type: "null",
+        },
+      ],
+      title: "End At",
+    },
+    timeout: {
+      type: "number",
+      title: "Timeout",
+      default: 0,
+    },
+  },
+  type: "object",
+  title: "WorkflowSchedule",
 } as const
 
 export const $WorkflowSummary = {
@@ -33719,6 +34665,13 @@ export const $WorkspaceRead = {
       type: "string",
       format: "uuid",
       title: "Organization Id",
+    },
+    unsafe_disable_secret_error_withholding_allowed: {
+      type: "boolean",
+      title: "Unsafe Disable Secret Error Withholding Allowed",
+      description:
+        "Whether the organization lets this workspace's actions opt into showing original error details when secrets are in scope.",
+      default: false,
     },
   },
   type: "object",

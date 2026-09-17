@@ -15,7 +15,7 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile
 
   api:
-    image: ghcr.io/tracecathq/tracecat:${TRACECAT__IMAGE_TAG:-1.0.0-beta.50}
+    image: ghcr.io/tracecathq/tracecat:${TRACECAT__IMAGE_TAG:-1.0.0}
     container_name: api
     restart: unless-stopped
     networks:
@@ -117,7 +117,7 @@ services:
       start_period: 10s
 
   worker:
-    image: ghcr.io/tracecathq/tracecat:${TRACECAT__IMAGE_TAG:-1.0.0-beta.50}
+    image: ghcr.io/tracecathq/tracecat:${TRACECAT__IMAGE_TAG:-1.0.0}
     restart: unless-stopped
     networks:
       - core
@@ -198,13 +198,15 @@ services:
         condition: service_healthy
 
   executor:
-    image: ghcr.io/tracecathq/tracecat:${TRACECAT__IMAGE_TAG:-1.0.0-beta.50}
+    image: ghcr.io/tracecathq/tracecat:${TRACECAT__IMAGE_TAG:-1.0.0}
     restart: unless-stopped
 
     # Container-level fork-bomb bound: in-jail RLIMIT_NPROC is bypassable
-    # via nested user namespaces (fresh per-userns fork counter), so the
-    # cgroup pids limit is the reliable bound. 4096 leaves headroom above
-    # the in-jail 64-process caps at executor default concurrency (16 x 64 = 1024).
+    # via nested user namespaces (fresh per-userns fork counter).
+    # All activities, loop iterations, and executor overhead share this cap.
+    # Defaults allow 32 activities x 4 for_each iterations x 64 in-jail
+    # processes = 8192, exceeding this intentional aggregate safety limit.
+    # Process-heavy workloads can hit the cap and fail to fork.
     pids_limit: 4096
     networks:
       - core
@@ -287,8 +289,8 @@ services:
       # Executor worker configuration
       TRACECAT__EXECUTOR_QUEUE: ${TRACECAT__EXECUTOR_QUEUE:-shared-action-queue}
       TRACECAT__EXECUTOR_BACKEND: ${TRACECAT__EXECUTOR_BACKEND:-direct}
-      TRACECAT__EXECUTOR_MAX_CONCURRENT_ACTIVITIES: ${TRACECAT__EXECUTOR_MAX_CONCURRENT_ACTIVITIES:-16}
-      TRACECAT__EXECUTOR_THREADPOOL_MAX_WORKERS: ${TRACECAT__EXECUTOR_THREADPOOL_MAX_WORKERS:-16}
+      TRACECAT__EXECUTOR_MAX_CONCURRENT_ACTIVITIES: ${TRACECAT__EXECUTOR_MAX_CONCURRENT_ACTIVITIES:-32}
+      TRACECAT__EXECUTOR_THREADPOOL_MAX_WORKERS: ${TRACECAT__EXECUTOR_THREADPOOL_MAX_WORKERS:-32}
       TRACECAT__EXECUTOR_FOR_EACH_MAX_CONCURRENCY: ${TRACECAT__EXECUTOR_FOR_EACH_MAX_CONCURRENCY:-4}
       # Sentry
       SENTRY_DSN: ${SENTRY_DSN:-}
@@ -317,7 +319,7 @@ services:
         condition: service_healthy
 
   agent-worker:
-      image: ghcr.io/tracecathq/tracecat:${TRACECAT__IMAGE_TAG:-1.0.0-beta.50}
+      image: ghcr.io/tracecathq/tracecat:${TRACECAT__IMAGE_TAG:-1.0.0}
       restart: unless-stopped
       networks:
         - core
@@ -372,6 +374,7 @@ services:
         TRACECAT__AGENT_EXECUTOR_QUEUE: ${TRACECAT__AGENT_EXECUTOR_QUEUE:-shared-agent-executor-queue}
         TRACECAT__EXECUTOR_QUEUE: ${TRACECAT__EXECUTOR_QUEUE:-shared-action-queue}
         TRACECAT__AGENT_MAX_CONCURRENT_ACTIVITIES: ${TRACECAT__AGENT_MAX_CONCURRENT_ACTIVITIES:-100}
+        TEMPORAL__THREADPOOL_MAX_WORKERS: ${TEMPORAL__THREADPOOL_MAX_WORKERS:-100}
         TRACECAT__EXECUTOR_CLIENT_TIMEOUT: ${TRACECAT__EXECUTOR_CLIENT_TIMEOUT:-300}
         TRACECAT__LITELLM_BASE_URL: ${TRACECAT__LITELLM_BASE_URL:-http://litellm:4000}
         TRACECAT__OUTBOUND_ALLOWED_PRIVATE_CIDRS: ${TRACECAT__OUTBOUND_ALLOWED_PRIVATE_CIDRS:-}
@@ -397,7 +400,7 @@ services:
           condition: service_healthy
 
   litellm:
-    image: ghcr.io/tracecathq/tracecat:${TRACECAT__IMAGE_TAG:-1.0.0-beta.50}
+    image: ghcr.io/tracecathq/tracecat:${TRACECAT__IMAGE_TAG:-1.0.0}
     restart: unless-stopped
     networks:
       - core
@@ -430,13 +433,13 @@ services:
       start_period: 10s
 
   agent-executor:
-      image: ghcr.io/tracecathq/tracecat:${TRACECAT__IMAGE_TAG:-1.0.0-beta.50}
+      image: ghcr.io/tracecathq/tracecat:${TRACECAT__IMAGE_TAG:-1.0.0}
       restart: unless-stopped
 
       # Container-level fork-bomb bound: in-jail RLIMIT_NPROC is bypassable
       # via nested user namespaces (fresh per-userns fork counter), so the
       # cgroup pids limit is the reliable bound. 4096 leaves headroom above
-      # the in-jail 64-process caps at executor default concurrency (16 x 64 = 1024).
+      # the in-jail 64-process caps at agent-executor default concurrency (8 x 64 = 512).
       pids_limit: 4096
       networks:
         - core
@@ -515,7 +518,9 @@ services:
         TRACECAT__AGENT_QUEUE: ${TRACECAT__AGENT_QUEUE:-shared-agent-queue}
         TRACECAT__AGENT_EXECUTOR_QUEUE: ${TRACECAT__AGENT_EXECUTOR_QUEUE:-shared-agent-executor-queue}
         TRACECAT__EXECUTOR_QUEUE: ${TRACECAT__EXECUTOR_QUEUE:-shared-action-queue}
-        TRACECAT__AGENT_EXECUTOR_MAX_CONCURRENT_ACTIVITIES: ${TRACECAT__AGENT_EXECUTOR_MAX_CONCURRENT_ACTIVITIES:-1}
+        TRACECAT__AGENT_EXECUTOR_MAX_CONCURRENT_ACTIVITIES: ${TRACECAT__AGENT_EXECUTOR_MAX_CONCURRENT_ACTIVITIES:-8}
+        # Keep the thread pool aligned with agent activity concurrency.
+        TEMPORAL__THREADPOOL_MAX_WORKERS: ${TRACECAT__AGENT_EXECUTOR_MAX_CONCURRENT_ACTIVITIES:-8}
         TRACECAT__LLM_PROXY_READ_TIMEOUT: ${TRACECAT__LLM_PROXY_READ_TIMEOUT:-600}
         TRACECAT__LLM_GATEWAY_CREDENTIAL_CACHE_TTL_SECONDS: ${TRACECAT__LLM_GATEWAY_CREDENTIAL_CACHE_TTL_SECONDS:-60}
         TRACECAT__LLM_GATEWAY_HEALTHCHECK_INTERVAL_SECONDS: ${TRACECAT__LLM_GATEWAY_HEALTHCHECK_INTERVAL_SECONDS:-30}
@@ -553,7 +558,7 @@ services:
           condition: service_healthy
 
   mcp:
-    image: ghcr.io/tracecathq/tracecat:${TRACECAT__IMAGE_TAG:-1.0.0-beta.50}
+    image: ghcr.io/tracecathq/tracecat:${TRACECAT__IMAGE_TAG:-1.0.0}
     restart: on-failure:3
     networks:
       - core
@@ -611,7 +616,7 @@ services:
         condition: service_healthy
 
   ui:
-    image: ghcr.io/tracecathq/tracecat-ui:${TRACECAT__IMAGE_TAG:-1.0.0-beta.50}
+    image: ghcr.io/tracecathq/tracecat-ui:${TRACECAT__IMAGE_TAG:-1.0.0}
     container_name: ui
     restart: unless-stopped
     networks:
@@ -648,7 +653,7 @@ services:
       start_period: 5s
 
   migrations:
-    image: ghcr.io/tracecathq/tracecat:${TRACECAT__IMAGE_TAG:-1.0.0-beta.50}
+    image: ghcr.io/tracecathq/tracecat:${TRACECAT__IMAGE_TAG:-1.0.0}
     container_name: migrations
     restart: "no"
     networks:

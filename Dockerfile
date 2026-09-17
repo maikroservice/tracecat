@@ -413,4 +413,8 @@ COPY --from=registry-manifest --chown=apiuser:apiuser /app/.registry-artifacts /
 RUN nsjail --help > /dev/null 2>&1 && echo "nsjail available"
 
 EXPOSE $PORT
-CMD ["sh", "-c", "python3 -m uvicorn tracecat.api.app:app --host $HOST --port $PORT"]
+# RUN_MIGRATIONS=true runs alembic before the API starts (api only: worker
+# services override this CMD). 'upgrade heads' tolerates a split migration
+# graph; a failed migration exits non-zero so the orchestrator keeps the old
+# container instead of running new code on an old schema.
+CMD ["sh", "-c", "if [ \"$RUN_MIGRATIONS\" = \"true\" ]; then echo 'Running database migrations' && python3 -m alembic upgrade heads || exit 1; fi; exec python3 -m uvicorn tracecat.api.app:app --host $HOST --port $PORT"]

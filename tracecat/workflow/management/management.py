@@ -13,10 +13,9 @@ from pydantic import ValidationError
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import selectinload
 from temporalio import activity
-from temporalio.exceptions import ApplicationError
 
 from tracecat.agent.catalog.service import AgentCatalogService
-from tracecat.audit.logger import audit_log
+from tracecat.audit.logger import AuditEventDetails, audit_log
 from tracecat.authz.controls import require_scope
 from tracecat.contexts import ctx_logical_time
 from tracecat.db.models import (
@@ -44,6 +43,7 @@ from tracecat.exceptions import (
     BuiltinRegistryHasNoSelectionError,
     TracecatNotFoundError,
     TracecatValidationError,
+    WorkflowAliasResolutionError,
 )
 from tracecat.expressions.eval import eval_templated_object
 from tracecat.identifiers import WorkflowID
@@ -59,7 +59,13 @@ from tracecat.pagination import (
 )
 from tracecat.registry.lock.service import RegistryLockService
 from tracecat.registry.lock.types import RegistryLock
+from tracecat.runtime.errors import (
+    RetryDisposition,
+    RuntimeErrorClassification,
+    RuntimeErrorKind,
+)
 from tracecat.service import BaseWorkspaceService
+from tracecat.temporal.errors import raise_application_error_from_classification
 from tracecat.validation.schemas import (
     DSLValidationResult,
     ValidationDetail,
@@ -129,6 +135,13 @@ class WorkflowsManagementService(BaseWorkspaceService):
     """Manages CRUD operations for Workflows."""
 
     service_name = "workflows"
+
+    def _workflow_update_audit_details(
+        self, workflow_id: WorkflowID, params: WorkflowUpdate
+    ) -> AuditEventDetails:
+        return AuditEventDetails(
+            data={"changed_fields": sorted(params.model_fields_set)}
+        )
 
     @staticmethod
     def _workflow_fields_from_dsl(dsl: DSLInput) -> dict[str, Any]:
@@ -765,17 +778,22 @@ class WorkflowsManagementService(BaseWorkspaceService):
         return WorkflowUUID.new(res) if res else None
 
     @require_scope("workflow:update")
+    @audit_log(
+        resource_type="workflow",
+        action="update",
+        attempt_metadata=_workflow_update_audit_details,
+    )
     async def update_workflow(
         self, workflow_id: WorkflowID, params: WorkflowUpdate
     ) -> Workflow:
         workflow_uuid = WorkflowUUID.new(workflow_id)
+        set_fields = params.model_dump(exclude_unset=True)
         statement = select(Workflow).where(
             Workflow.workspace_id == self.workspace_id,
             Workflow.id == workflow_uuid,
         )
         result = await self.session.execute(statement)
         workflow = result.scalar_one()
-        set_fields = params.model_dump(exclude_unset=True)
         if "object" in set_fields:
             graph = RFGraph.model_validate(set_fields["object"])
             normalized_graph = graph.normalize_action_ids()
@@ -834,7 +852,7 @@ class WorkflowsManagementService(BaseWorkspaceService):
         await self.session.commit()
 
     @require_scope("workflow:create")
-    @audit_log(resource_type="workflow", action="create")
+    @audit_log(resource_type="workflow", action="create", resource_id_attr="id")
     async def create_workflow(self, params: WorkflowCreate) -> Workflow:
         """Create a new workflow."""
         now = datetime.now().strftime("%b %d, %Y, %H:%M:%S")
@@ -929,6 +947,10 @@ class WorkflowsManagementService(BaseWorkspaceService):
             raise e
 
     @require_scope("workflow:update")
+    @audit_log(
+        resource_type="workflow",
+        action="publish",
+    )
     async def publish_workflow(self, workflow_id: WorkflowID) -> WorkflowPublishResult:
         """Publish (commit) a workflow's current draft as a new versioned definition.
 
@@ -943,6 +965,7 @@ class WorkflowsManagementService(BaseWorkspaceService):
         Raises:
             TracecatNotFoundError: If the workflow does not exist.
         """
+
         workflow = await self.get_workflow(workflow_id)
         if workflow is None:
             raise TracecatNotFoundError(f"Workflow {workflow_id} not found")
@@ -979,8 +1002,8 @@ class WorkflowsManagementService(BaseWorkspaceService):
         ):
             return WorkflowPublishResult(version=None, errors=list(val_errors))
 
-        # Phase 1: resolve a registry lock over the DSL's actions so the published
-        # definition is pinned to exact action versions.
+        # Phase 1: resolve a registry lock over the DSL's actions so the
+        # published definition is pinned to exact action versions.
         lock_service = RegistryLockService(self.session, self.role)
         action_names = {action.action for action in dsl.actions}
         try:
@@ -1156,6 +1179,11 @@ class WorkflowsManagementService(BaseWorkspaceService):
         )
 
     @require_scope("workflow:update")
+    @audit_log(
+        resource_type="workflow",
+        action="update",
+        resource_id_attr="id",
+    )
     async def restore_workflow_definition(
         self, workflow: Workflow, definition: WorkflowDefinition
     ) -> Workflow:
@@ -1226,8 +1254,8 @@ class WorkflowsManagementService(BaseWorkspaceService):
             if item["ref"] in ref_to_action_id
         ]
         graph_service = WorkflowGraphService(self.session, role=self.role)
-        await graph_service.apply_operations(
-            workflow_id=WorkflowUUID.new(workflow.id),
+        await graph_service.apply_operations_to_locked_workflow(
+            workflow,
             base_version=workflow.graph_version,
             operations=[
                 GraphOperation(
@@ -1322,7 +1350,9 @@ class WorkflowsManagementService(BaseWorkspaceService):
                 try:
                     parsed_id = uuid.UUID(catalog_id_str)
                 except (ValueError, TypeError):
-                    already_local[catalog_id_str] = False
+                    # Not a literal UUID (e.g. a template expression evaluated
+                    # at runtime): leave the selection untouched.
+                    already_local[catalog_id_str] = True
                 else:
                     already_local[
                         catalog_id_str
@@ -1378,6 +1408,11 @@ class WorkflowsManagementService(BaseWorkspaceService):
         return dsl.model_copy(update={"actions": new_actions})
 
     @require_scope("workflow:create")
+    @audit_log(
+        resource_type="workflow",
+        action="create",
+        resource_id_attr="id",
+    )
     async def create_workflow_from_external_definition(
         self,
         import_data: dict[str, Any],
@@ -1459,6 +1494,8 @@ class WorkflowsManagementService(BaseWorkspaceService):
                 commit=False,
             )
             await self.session.commit()
+            # Keep server-generated fields loaded for response serialization.
+            await self.session.refresh(workflow)
         return workflow
 
     @require_scope("workflow:create")
@@ -1560,6 +1597,7 @@ class WorkflowsManagementService(BaseWorkspaceService):
                 start_delay=act_stmt.start_delay,
                 wait_until=act_stmt.wait_until,
                 join_strategy=act_stmt.join_strategy,
+                environment=act_stmt.environment,
                 mask_output=act_stmt.mask_output,
             )
             pos = (action_positions or {}).get(act_stmt.ref)
@@ -1680,9 +1718,14 @@ class WorkflowsManagementService(BaseWorkspaceService):
                     id_or_alias, use_committed=use_committed
                 )
             if not handler_wf_id:
-                raise ApplicationError(
-                    f"Couldn't find matching workflow for alias {id_or_alias!r}",
-                    non_retryable=True,
-                    type="WorkflowAliasResolutionError",
+                error = WorkflowAliasResolutionError(
+                    "The configured workflow alias does not resolve"
                 )
+                classification = RuntimeErrorClassification.user(
+                    kind=RuntimeErrorKind.WORKFLOW_DEFINITION_NOT_FOUND,
+                    message="The configured error handler workflow could not be found",
+                    retry_disposition=RetryDisposition.NON_RETRYABLE,
+                    cause=error,
+                )
+                raise_application_error_from_classification(classification)
         return handler_wf_id

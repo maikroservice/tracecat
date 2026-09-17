@@ -10,6 +10,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
+from dataclasses import dataclass
 from time import monotonic
 from typing import Any
 
@@ -18,7 +19,6 @@ from pydantic_core import to_jsonable_python
 
 from tracecat.agent.common.stream_types import parse_vercel_frame_cursor
 from tracecat.agent.stream.events import (
-    AgentStreamEventTA,
     StreamConnected,
     StreamDelta,
     StreamEnd,
@@ -26,13 +26,18 @@ from tracecat.agent.stream.events import (
     StreamEvent,
     StreamFormat,
     StreamKeepAlive,
-    StreamMessage,
     UnifiedStreamEventTA,
 )
-from tracecat.agent.types import ModelMessageTA, StreamKey
+from tracecat.agent.types import StreamKey
 from tracecat.chat import tokens
 from tracecat.logger import logger
 from tracecat.redis.client import RedisClient, get_redis_client
+
+
+@dataclass(frozen=True)
+class ApprovalContinuationMarker:
+    submission_key: str | None
+    previous_stream_id: uuid.UUID | None
 
 
 class AgentStream:
@@ -46,6 +51,7 @@ class AgentStream:
 
     KEEPALIVE_INTERVAL_SECONDS = 10
     COMPLETED_STREAM_TTL_SECONDS = 5 * 60
+    CONTINUATION_START_KIND = "approval-continuation-start"
 
     def __init__(
         self,
@@ -95,6 +101,82 @@ class AgentStream:
     async def done(self) -> None:
         """Emit an end-of-turn marker."""
         await self.append({tokens.END_TOKEN: tokens.END_TOKEN_VALUE})
+
+    async def mark_approval_continuation(
+        self,
+        *,
+        submission_key: str,
+        previous_stream_id: uuid.UUID | None = None,
+    ) -> None:
+        """Mark a fresh stream as a live approval continuation.
+
+        The previous stream id lets a definitively rejected continuation restore
+        the session pointer even when a later HTTP retry is the request that
+        observes the rejection.
+        """
+        marker: dict[str, str] = {
+            "kind": self.CONTINUATION_START_KIND,
+            "submission_key": submission_key,
+        }
+        if previous_stream_id is not None:
+            marker["previous_stream_id"] = str(previous_stream_id)
+        await self.append(marker)
+
+    async def approval_continuation_marker(
+        self,
+    ) -> ApprovalContinuationMarker | None:
+        """Read the approval continuation marker, if this stream starts with one."""
+        first_entries = await self.client.xrange(self._stream_key, count=1)
+        if not first_entries:
+            return None
+        first_data = orjson.loads(first_entries[0][1][tokens.DATA_KEY])
+        if first_data.get("kind") != self.CONTINUATION_START_KIND:
+            return None
+        raw_submission_key = first_data.get("submission_key")
+        submission_key = (
+            raw_submission_key if isinstance(raw_submission_key, str) else None
+        )
+
+        previous_stream_id = first_data.get("previous_stream_id")
+        try:
+            previous_stream_id = (
+                uuid.UUID(previous_stream_id)
+                if isinstance(previous_stream_id, str)
+                else None
+            )
+        except ValueError:
+            previous_stream_id = None
+        return ApprovalContinuationMarker(
+            submission_key=submission_key,
+            previous_stream_id=previous_stream_id,
+        )
+
+    async def is_open_approval_continuation(self) -> bool:
+        """Return whether this is a marked continuation without a terminal frame."""
+        if await self.approval_continuation_marker() is None:
+            return False
+
+        last_entries = await self.client.xrevrange(self._stream_key, count=1)
+        if not last_entries:
+            return False
+        last_data = orjson.loads(last_entries[0][1][tokens.DATA_KEY])
+        return last_data != {tokens.END_TOKEN: tokens.END_TOKEN_VALUE}
+
+    async def finish_idle_segment(self) -> None:
+        """Emit a non-terminal boundary for a paused live turn.
+
+        Approval continuations can accept a partial decision set without resuming
+        the workflow. Current readers need a stream boundary so they can finish,
+        but future replay must not treat that boundary as the turn's terminal
+        frame once more output has been appended.
+        """
+        await self.append(
+            {
+                tokens.END_TOKEN: tokens.END_TOKEN_VALUE,
+                "terminal": False,
+                "reason": "approval_pending",
+            }
+        )
 
     async def clear_buffer(self) -> None:
         """Delete the stream buffer for this key.
@@ -149,7 +231,7 @@ class AgentStream:
                 frames; the adapter then drops frames already seen by the client.
 
         Yields:
-            StreamEvent: StreamDelta, StreamMessage, StreamError, or StreamEnd.
+            StreamEvent: StreamDelta, StreamError, or StreamEnd.
 
         Note:
             - Read-only: never writes last_stream_id (browser owns the cursor).
@@ -168,12 +250,18 @@ class AgentStream:
                 data = orjson.loads(fields[tokens.DATA_KEY])
                 current_id = msg_id
                 match data:
+                    case {tokens.END_TOKEN: tokens.END_TOKEN_VALUE, "terminal": False}:
+                        if await self._has_entry_after(msg_id):
+                            continue
+                        yield StreamEnd(id=msg_id)
                     case {tokens.END_TOKEN: tokens.END_TOKEN_VALUE}:
                         stream_completed = True
                         yield StreamEnd(id=msg_id)
-                    case {"event_kind": _}:
-                        legacy_event = AgentStreamEventTA.validate_python(data)
-                        yield StreamDelta(id=msg_id, event=legacy_event)
+                    case {"kind": AgentStream.CONTINUATION_START_KIND}:
+                        # Transport-only marker. It lets reconnect distinguish a
+                        # newly rotated suffix from the closed approval-pause
+                        # stream while approval decisions are still committing.
+                        yield StreamKeepAlive()
                     case {"type": _}:
                         unified_event = UnifiedStreamEventTA.validate_python(data)
                         yield StreamDelta(id=msg_id, event=unified_event)
@@ -184,9 +272,6 @@ class AgentStream:
                             message_id=msg_id,
                         )
                         yield StreamError(error=error_message)
-                    case {"kind": _}:
-                        message = ModelMessageTA.validate_python(data)
-                        yield StreamMessage(id=msg_id, message=message)
                     case _:
                         logger.warning(
                             "Invalid stream message",
@@ -242,6 +327,15 @@ class AgentStream:
             # cursor (Last-Event-ID). We only expire the buffer after terminal.
             if stream_completed:
                 await self._expire_completed_stream()
+
+    async def _has_entry_after(self, msg_id: str) -> bool:
+        """Return True when this Redis stream has an entry after ``msg_id``."""
+        entries = await self.client.xrange(
+            self._stream_key,
+            min_id=f"({msg_id}",
+            count=1,
+        )
+        return bool(entries)
 
     async def stream_events(
         self,
@@ -309,8 +403,9 @@ class AgentStream:
             case _:
                 raise ValueError(f"Invalid format: {format}")
 
+    @staticmethod
     def finished_sse(
-        self, format: StreamFormat, *, message_id: str | None
+        format: StreamFormat, *, message_id: str | None
     ) -> AsyncIterable[str]:
         """Emit an immediately-finishing stream (no live content).
 
@@ -354,8 +449,6 @@ class AgentStream:
                         yield event.sse()
                         break
                     case StreamDelta():
-                        yield event.sse()
-                    case StreamMessage():
                         yield event.sse()
                     case _:
                         logger.warning(

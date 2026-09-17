@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import uuid
 from collections.abc import Awaitable, Callable, Sequence
-from typing import cast
+from typing import Any, cast
 
 import pytest
+from fastapi import HTTPException
 
+from tracecat.agent.catalog import router as agent_catalog_router
 from tracecat.agent.folders import router as agent_folder_router
 from tracecat.agent.preset import router as agent_preset_router
 from tracecat.agent.tags import definitions_router as agent_tag_definitions_router
@@ -15,6 +18,7 @@ from tracecat.cases.rows import router as case_rows_router
 from tracecat.cases.tag_definitions import router as case_tag_definitions_router
 from tracecat.cases.tags import internal_router as internal_case_tags_router
 from tracecat.cases.tags import router as case_tags_router
+from tracecat.cases.versions import router as case_versions_router
 from tracecat.contexts import ctx_role
 from tracecat.exceptions import ScopeDeniedError
 from tracecat.inbox import router as inbox_router
@@ -215,6 +219,81 @@ async def test_agent_folder_scope_guards(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
+    "endpoint",
+    [
+        agent_catalog_router.list_catalog,
+        agent_catalog_router.get_catalog_entry,
+    ],
+)
+async def test_agent_catalog_read_scope_guards(endpoint: AsyncEndpoint) -> None:
+    await _assert_endpoint_requires_scope(endpoint, "agent:read")
+
+
+@pytest.mark.anyio
+async def test_agent_catalog_list_accepts_service_account_with_scope() -> None:
+    # Managed service-account key is authorized by its granted scopes.
+    endpoint = cast(AsyncEndpoint, agent_catalog_router.list_catalog)
+    organization_id = uuid.uuid4()
+    denied_role = Role(
+        type="service_account",
+        service_id="tracecat-api",
+        organization_id=organization_id,
+        service_account_id=uuid.uuid4(),
+        scopes=frozenset({"agent:create"}),
+    )
+    token = ctx_role.set(denied_role)
+    try:
+        with pytest.raises(ScopeDeniedError):
+            await endpoint()
+    finally:
+        ctx_role.reset(token)
+
+    allowed_role = Role(
+        type="service_account",
+        service_id="tracecat-api",
+        organization_id=organization_id,
+        service_account_id=uuid.uuid4(),
+        scopes=frozenset({"agent:read"}),
+    )
+    token = ctx_role.set(allowed_role)
+    try:
+        with pytest.raises(TypeError):
+            await endpoint()
+    finally:
+        ctx_role.reset(token)
+
+
+@pytest.mark.anyio
+async def test_agent_catalog_reads_reject_workspace_bound_service_accounts() -> None:
+    # A tc_ws_sk_ key resolves on org routes; it must not see the org-wide catalog.
+    workspace_id = uuid.uuid4()
+    bound_role = Role(
+        type="service_account",
+        service_id="tracecat-api",
+        organization_id=uuid.uuid4(),
+        workspace_id=workspace_id,
+        bound_workspace_id=workspace_id,
+        service_account_id=uuid.uuid4(),
+        scopes=frozenset({"agent:read"}),
+    )
+    session = cast(Any, None)  # Guard raises before the session is touched
+    token = ctx_role.set(bound_role)
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            await agent_catalog_router.list_catalog(role=bound_role, session=session)
+        assert exc_info.value.status_code == 403
+
+        with pytest.raises(HTTPException) as exc_info:
+            await agent_catalog_router.get_catalog_entry(
+                catalog_id=uuid.uuid4(), role=bound_role, session=session
+            )
+        assert exc_info.value.status_code == 403
+    finally:
+        ctx_role.reset(token)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
     ("endpoint", "required_scope"),
     [
         (agent_tag_definitions_router.list_agent_tags, "agent:read"),
@@ -283,6 +362,21 @@ async def test_workspace_collection_scope_guards(endpoint: AsyncEndpoint) -> Non
     ],
 )
 async def test_case_duration_scope_guards(
+    endpoint: AsyncEndpoint, required_scope: str
+) -> None:
+    await _assert_endpoint_requires_scope(endpoint, required_scope)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("endpoint", "required_scope"),
+    [
+        (case_versions_router.list_case_versions, "case:read"),
+        (case_versions_router.compare_case_version, "case:read"),
+        (case_versions_router.restore_case_version, "case:update"),
+    ],
+)
+async def test_case_version_scope_guards(
     endpoint: AsyncEndpoint, required_scope: str
 ) -> None:
     await _assert_endpoint_requires_scope(endpoint, required_scope)
@@ -454,6 +548,12 @@ async def test_workflow_execution_stop_scope_guards(
         (case_dropdowns_router.reorder_dropdown_options, "case:update"),
         (case_dropdowns_router.list_case_dropdown_values, "case:read"),
         (case_dropdowns_router.set_case_dropdown_value, "case:update"),
+        (case_rows_router.list_case_rows, "case:read"),
+        (case_rows_router.list_case_linked_tables, "case:read"),
+        (case_rows_router.link_case_row, "case:update"),
+        (case_rows_router.batch_link_case_rows, "case:update"),
+        (case_rows_router.batch_unlink_case_rows, "case:update"),
+        (case_rows_router.unlink_case_row, "case:update"),
     ],
 )
 async def test_case_scope_guards(endpoint: AsyncEndpoint, required_scope: str) -> None:
@@ -482,7 +582,6 @@ async def test_insert_case_row_requires_case_update_and_table_create() -> None:
         (integrations_router.create_custom_provider, "integration:create"),
         (integrations_router.list_providers, "integration:read"),
         (integrations_router.get_provider, "integration:read"),
-        (integrations_router.create_mcp_integration, "integration:create"),
         (integrations_router.list_mcp_integrations, "integration:read"),
         (integrations_router.get_mcp_integration, "integration:read"),
         (integrations_router.update_mcp_integration, "integration:update"),
@@ -493,6 +592,22 @@ async def test_integration_scope_guards(
     endpoint: AsyncEndpoint, required_scope: str
 ) -> None:
     await _assert_endpoint_requires_scope(endpoint, required_scope)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        integrations_router.create_mcp_integration,
+        integrations_router.connect_platform_mcp_catalog,
+        integrations_router.connect_mcp_integration,
+    ],
+)
+async def test_mcp_create_scope_guards(endpoint: AsyncEndpoint) -> None:
+    await _assert_endpoint_requires_all_scopes(
+        endpoint,
+        ("integration:create", "integration:read"),
+    )
 
 
 @pytest.mark.anyio

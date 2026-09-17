@@ -170,6 +170,19 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Container health can pass before the default namespace is available.
+          deadline=$((SECONDS + 60))
+          until docker compose -f docker-compose.dev.yml exec -T temporal \
+            tctl --address temporal:7233 --namespace default \
+            admin cluster get-search-attributes --print_json true > /dev/null; do
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "Timed out waiting for the default Temporal namespace"
+              exit 124
+            fi
+            echo "Waiting for the default Temporal namespace..."
+            sleep 2
+          done
+
           attrs=(
             TracecatTriggerType
             TracecatTriggeredByUserId
@@ -177,6 +190,7 @@ jobs:
             TracecatAlias
             TracecatCorrelationId
             TracecatExecutionType
+            TracecatErrorOwner
           )
 
           add_args=()
@@ -231,10 +245,12 @@ jobs:
             uv run pytest tests/temporal -m "not live_secret and not requires_api" -n auto -ra -o faulthandler_timeout=300
 
             # API-backed temporal tests start a local API process against the
-            # test DB. Run them serially to avoid startup races under xdist.
+            # test DB. Run them serially to avoid startup races under xdist,
+            # with enough pool headroom for concurrent gateway-backed actions.
             TRACECAT_TEST_API_MODE=inprocess \
             TRACECAT__CONTEXT_COMPRESSION_ENABLED=true \
             TRACECAT__CONTEXT_COMPRESSION_THRESHOLD_KB=0 \
+            TRACECAT__DB_MAX_OVERFLOW=9 \
             uv run pytest tests/temporal -m "requires_api and not live_secret" -ra -o faulthandler_timeout=300
           else
             # The nsjail sandbox smokes build Docker images inside the test and
@@ -248,6 +264,10 @@ jobs:
               --deselect "tests/unit/test_agent_sandbox_litellm.py::test_run_agent_activity_reproduces_mcp_compression_initialize_timeout_in_each_sandbox_mode[nsjail]" \
               --deselect "tests/unit/test_agent_sandbox_litellm.py::test_run_agent_activity_spawns_full_claude_harness_runtime_in_each_sandbox_mode[nsjail]" \
               --deselect tests/unit/test_agent_sandbox_litellm.py::test_run_agent_activity_spawns_full_claude_harness_runtime_with_pasta_in_nsjail \
+              --deselect tests/unit/test_agent_sandbox_litellm.py::test_run_agent_activity_spawns_full_claude_harness_runtime_with_nstun_in_nsjail \
+              --deselect tests/unit/test_agent_sandbox_litellm.py::test_agent_nsjail_handles_stdio_mcp_startup_and_bash_network_burst \
+              --deselect tests/unit/test_agent_sandbox_litellm.py::test_agent_nsjail_shim_enforces_nproc_cap \
+              --deselect tests/unit/test_executor_sandbox_nsjail.py::test_nstun_bounds_parent_udp_sockets \
               --deselect tests/unit/test_executor_sandbox_nsjail.py::test_action_runner_executes_registry_action_smoke
           fi
 

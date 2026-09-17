@@ -9,8 +9,9 @@ from packaging.version import Version
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from temporalio.client import WorkflowFailureError
-from temporalio.exceptions import ApplicationError
+from temporalio.exceptions import ActivityError
 
+from tests.shared import capture_application_error
 from tracecat import config
 from tracecat.auth.types import Role
 from tracecat.db.models import Organization, PlatformRegistryVersion, RegistryRepository
@@ -22,6 +23,7 @@ from tracecat.registry.actions.schemas import (
 )
 from tracecat.registry.artifact_keys import get_artifact_local_dir
 from tracecat.registry.constants import (
+    DEFAULT_LOCAL_REGISTRY_ORIGIN,
     DEFAULT_REGISTRY_ORIGIN,
     REGISTRY_GIT_SSH_KEY_SECRET_NAME,
 )
@@ -32,10 +34,14 @@ from tracecat.registry.sync.artifact import RegistryArtifactBuildResult
 from tracecat.registry.sync.base_service import ArtifactsBuildResult
 from tracecat.registry.sync.platform_service import PlatformRegistrySyncService
 from tracecat.registry.sync.prebuilt import write_prebuilt_registry_manifest
-from tracecat.registry.sync.runner import RegistrySyncValidationError
 from tracecat.registry.sync.service import RegistrySyncError, RegistrySyncService
 from tracecat.registry.versions.schemas import RegistryVersionManifest
 from tracecat.registry.versions.service import RegistryVersionsService
+from tracecat.runtime.errors import (
+    RetryDisposition,
+    RuntimeErrorClassification,
+    RuntimeErrorKind,
+)
 
 
 def _make_action(
@@ -197,6 +203,21 @@ def test_generate_collision_version_preserves_release_suffixes(
     else:
         assert collision_version.startswith(f"{base_version}+collision.")
     Version(collision_version)
+
+
+def test_local_origin_type_requires_enabled_local_repository(
+    mocker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = RegistrySyncService(mocker.Mock(spec=AsyncSession), role=mocker.Mock())
+    monkeypatch.setattr(config, "TRACECAT__LOCAL_REPOSITORY_ENABLED", False)
+
+    with pytest.raises(RegistrySyncError, match="Local repository is not enabled"):
+        service._get_origin_type(DEFAULT_LOCAL_REGISTRY_ORIGIN)
+
+    monkeypatch.setattr(config, "TRACECAT__LOCAL_REPOSITORY_ENABLED", True)
+
+    assert service._get_origin_type(DEFAULT_LOCAL_REGISTRY_ORIGIN) == "local"
 
 
 @pytest.mark.anyio
@@ -483,7 +504,7 @@ async def test_platform_builtin_sync_can_create_pending_version(
 
 
 @pytest.mark.anyio
-async def test_sync_via_temporal_matches_validation_application_error_before_cause_walk(
+async def test_sync_via_temporal_reads_validation_classification_through_activity_error(
     session: AsyncSession,
     mock_org_id: uuid.UUID,
     mocker,
@@ -514,19 +535,26 @@ async def test_sync_via_temporal_matches_validation_application_error_before_cau
         RegistryRepositoryCreate(origin=DEFAULT_REGISTRY_ORIGIN)
     )
 
-    validation_error = RegistrySyncValidationError(
-        {
-            "tracecat.examples.broken": [],
-        }
+    message = "Registry sync validation failed: invalid action definition"
+    app_error = capture_application_error(
+        RuntimeErrorClassification.user(
+            kind=RuntimeErrorKind.REGISTRY_SYNC_VALIDATION_FAILED,
+            message=message,
+            retry_disposition=RetryDisposition.NON_RETRYABLE,
+        )
     )
     try:
-        raise ApplicationError(
-            str(validation_error),
-            non_retryable=True,
-            type="RegistrySyncValidationError",
-        ) from validation_error
-    except ApplicationError as app_error:
-        workflow_error = WorkflowFailureError(cause=app_error)
+        raise ActivityError(
+            "Registry sync activity failed",
+            scheduled_event_id=1,
+            started_event_id=2,
+            identity="test-worker",
+            activity_type="sync_registry_activity",
+            activity_id="registry-sync-activity",
+            retry_state=None,
+        ) from app_error
+    except ActivityError as activity_error:
+        workflow_error = WorkflowFailureError(cause=activity_error)
 
     mock_client = mocker.Mock()
     mock_client.execute_workflow = mocker.AsyncMock(side_effect=workflow_error)
@@ -539,7 +567,7 @@ async def test_sync_via_temporal_matches_validation_application_error_before_cau
 
     with pytest.raises(
         RegistrySyncError,
-        match="RegistrySyncValidationError: Registry sync validation failed",
+        match=message,
     ) as exc_info:
         await sync_service.sync_repository_v2(repo, commit=False)
 

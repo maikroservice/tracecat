@@ -5,6 +5,8 @@ import { useForm } from "react-hook-form"
 import { z } from "zod"
 import { CenteredSpinner } from "@/components/loading/spinner"
 import { AlertNotification } from "@/components/notifications"
+import { OrgRegistryGitTokenSection } from "@/components/organization/org-registry-git-token"
+import { OrgRegistrySshKeySection } from "@/components/organization/org-registry-ssh-key"
 import { CustomTagInput } from "@/components/tags-input"
 import { Button } from "@/components/ui/button"
 import {
@@ -42,6 +44,13 @@ export const gitFormSchema = z.object({
 
 type GitFormValues = z.infer<typeof gitFormSchema>
 
+/**
+ * Lets the SSH key section sit between the form fields and the submit
+ * button without nesting its dialogs inside the Git settings form.
+ */
+const GIT_SETTINGS_FORM_ID = "org-git-settings-form"
+
+/** Git repository settings for the custom registry, plus the SSH key or git access token used to clone it. */
 export function OrgSettingsCustomRegistryForm() {
   const {
     gitSettings,
@@ -96,114 +105,106 @@ export function OrgSettingsCustomRegistryForm() {
   }
 
   return (
-    <Form {...form}>
-      <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-8">
-        <FormField
-          control={form.control}
-          name="git_repo_url"
-          render={({ field }) => (
-            <FormItem className="flex flex-col">
-              <FormLabel>Remote repository URL</FormLabel>
-              <FormControl>
-                <Input
-                  placeholder="git+ssh://someuser@git.example.com:2222/org/team/repo.git"
-                  {...field}
-                  value={field.value ?? ""}
-                />
-              </FormControl>
-              <FormDescription className="flex flex-col gap-2">
-                <span>
-                  The pip git URL of the remote repository, using the{" "}
-                  <span className="font-mono tracking-tighter">git+ssh</span> or{" "}
-                  <span className="font-mono tracking-tighter">git+https</span>{" "}
-                  scheme. Supports nested groups and custom ports.
-                </span>
-                <span>
-                  Formats:{" "}
-                  <span className="font-mono tracking-tight">
-                    {"git+ssh://<user>@<hostname>[:<port>]/<org>/<repo>.git"}
-                  </span>{" "}
-                  or{" "}
-                  <span className="font-mono tracking-tight">
-                    {"git+https://<hostname>[:<port>]/<org>/<repo>.git"}
+    <div className="space-y-8">
+      <Form {...form}>
+        <form
+          id={GIT_SETTINGS_FORM_ID}
+          onSubmit={form.handleSubmit(onSubmit)}
+          className="space-y-8"
+        >
+          <FormField
+            control={form.control}
+            name="git_repo_url"
+            render={({ field }) => (
+              <FormItem className="flex flex-col">
+                <FormLabel>Remote repository URL</FormLabel>
+                <FormControl>
+                  <Input
+                    placeholder="git+ssh://someuser@git.example.com:2222/org/team/repo.git"
+                    {...field}
+                    value={field.value ?? ""}
+                  />
+                </FormControl>
+                <FormDescription className="flex flex-col gap-2">
+                  <span>
+                    The pip git URL of the remote repository, using the{" "}
+                    <span className="font-mono tracking-tighter">git+ssh</span>{" "}
+                    or{" "}
+                    <span className="font-mono tracking-tighter">
+                      git+https
+                    </span>{" "}
+                    scheme. Supports nested groups and custom ports.
                   </span>
-                </span>
-                <span>
-                  With{" "}
-                  <span className="font-mono tracking-tighter">git+ssh</span>,
-                  authentication uses the{" "}
-                  <span className="font-mono tracking-tighter">
-                    github-ssh-key
-                  </span>{" "}
-                  organization credential. With{" "}
-                  <span className="font-mono tracking-tighter">git+https</span>,
-                  private repositories authenticate with an optional{" "}
-                  <span className="font-mono tracking-tighter">
-                    git-access-token
-                  </span>{" "}
-                  organization credential (keys:{" "}
-                  <span className="font-mono tracking-tighter">token</span> and
-                  optionally{" "}
-                  <span className="font-mono tracking-tighter">username</span>,
-                  e.g. a GitLab project access token with{" "}
-                  <span className="font-mono tracking-tighter">
-                    read_repository
-                  </span>{" "}
-                  scope).
-                </span>
-              </FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
-        <FormField
-          control={form.control}
-          name="git_repo_package_name"
-          render={({ field }) => (
-            <FormItem className="flex flex-col">
-              <FormLabel>Repository package name</FormLabel>
-              <FormControl>
-                <Input
-                  placeholder="package_name"
-                  {...field}
-                  value={field.value ?? ""}
-                />
-              </FormControl>
-              <FormDescription>
-                Name of the python package in the repository. If not provided,
-                the repository name from the Git URL will be used.
-              </FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+                  <span>
+                    Formats:{" "}
+                    <span className="font-mono tracking-tight">
+                      {"git+ssh://<user>@<hostname>[:<port>]/<org>/<repo>.git"}
+                    </span>{" "}
+                    or{" "}
+                    <span className="font-mono tracking-tight">
+                      {"git+https://<hostname>[:<port>]/<org>/<repo>.git"}
+                    </span>
+                  </span>
+                </FormDescription>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+          <FormField
+            control={form.control}
+            name="git_repo_package_name"
+            render={({ field }) => (
+              <FormItem className="flex flex-col">
+                <FormLabel>Repository package name</FormLabel>
+                <FormControl>
+                  <Input
+                    placeholder="package_name"
+                    {...field}
+                    value={field.value ?? ""}
+                  />
+                </FormControl>
+                <FormDescription>
+                  Name of the python package in the repository. If not provided,
+                  the repository name from the Git URL will be used.
+                </FormDescription>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
 
-        <FormField
-          control={form.control}
-          name="git_allowed_domains"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>Allowed Git domains</FormLabel>
-              <FormControl>
-                <CustomTagInput
-                  {...field}
-                  placeholder="Enter a domain..."
-                  tags={field.value}
-                  setTags={field.onChange}
-                />
-              </FormControl>
-              <FormDescription>
-                Add domains that are allowed for Git operations (e.g.,
-                github.com, gitlab.com, or gitlab.example.com:2222 with port)
-              </FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
-        <Button type="submit" disabled={updateGitSettingsIsPending}>
-          Update Git settings
-        </Button>
-      </form>
-    </Form>
+          <FormField
+            control={form.control}
+            name="git_allowed_domains"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Allowed Git domains</FormLabel>
+                <FormControl>
+                  <CustomTagInput
+                    {...field}
+                    placeholder="Enter a domain..."
+                    tags={field.value}
+                    setTags={field.onChange}
+                  />
+                </FormControl>
+                <FormDescription>
+                  Add domains that are allowed for Git operations (e.g.,
+                  github.com, gitlab.com, or gitlab.example.com:2222 with port)
+                </FormDescription>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+        </form>
+      </Form>
+      <OrgRegistrySshKeySection />
+      <OrgRegistryGitTokenSection />
+      <Button
+        type="submit"
+        form={GIT_SETTINGS_FORM_ID}
+        disabled={updateGitSettingsIsPending}
+      >
+        Save repository settings
+      </Button>
+    </div>
   )
 }

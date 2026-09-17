@@ -16,7 +16,6 @@ from tracecat_registry.sdk.agents import CursorPage
     display_group="Agent Skills",
     description="List workspace agent skills with cursor pagination.",
     namespace="ai.skill",
-    required_entitlements=["agent_addons"],
 )
 async def list_skills(
     limit: Annotated[int, Doc("Page size.")] = 20,
@@ -33,7 +32,6 @@ async def list_skills(
     display_group="Agent Skills",
     description="Create a workspace agent skill shell before publishing a version.",
     namespace="ai.skill",
-    required_entitlements=["agent_addons"],
 )
 async def create_skill(
     name: Annotated[str, Doc("Skill name in kebab-case (e.g., 'triage-assistant').")],
@@ -45,12 +43,11 @@ async def create_skill(
 @registry.register(
     default_title="Get agent skill",
     display_group="Agent Skills",
-    description="Get one workspace agent skill by skill ID, with an optional UUID override.",
+    description="Get one workspace agent skill by slug, with an optional UUID override.",
     namespace="ai.skill",
-    required_entitlements=["agent_addons"],
 )
 async def get_skill(
-    skill_id: Annotated[str, Doc("Skill ID/name in kebab-case.")],
+    skill_id: Annotated[str, Doc("Skill slug in kebab-case.")],
     skill_uuid: Annotated[
         uuid.UUID | None, Doc("Optional canonical skill UUID.")
     ] = None,
@@ -63,10 +60,9 @@ async def get_skill(
     display_group="Agent Skills",
     description="List immutable published versions for a workspace agent skill.",
     namespace="ai.skill",
-    required_entitlements=["agent_addons"],
 )
 async def list_skill_versions(
-    skill_id: Annotated[str, Doc("Skill ID/name in kebab-case.")],
+    skill_id: Annotated[str, Doc("Skill slug in kebab-case.")],
     skill_uuid: Annotated[
         uuid.UUID | None, Doc("Optional canonical skill UUID.")
     ] = None,
@@ -90,10 +86,9 @@ async def list_skill_versions(
     display_group="Agent Skills",
     description="Get one immutable published skill version by ID, including publish-compatible file contents.",
     namespace="ai.skill",
-    required_entitlements=["agent_addons"],
 )
 async def get_skill_version(
-    skill_id: Annotated[str, Doc("Skill ID/name in kebab-case.")],
+    skill_id: Annotated[str, Doc("Skill slug in kebab-case.")],
     version_id: Annotated[uuid.UUID, Doc("Skill version UUID.")],
     skill_uuid: Annotated[
         uuid.UUID | None, Doc("Optional canonical skill UUID.")
@@ -111,10 +106,9 @@ async def get_skill_version(
     display_group="Agent Skills",
     description="Publish a complete file set as a new immutable skill version.",
     namespace="ai.skill",
-    required_entitlements=["agent_addons"],
 )
 async def publish_skill_version(
-    skill_id: Annotated[str, Doc("Skill ID/name in kebab-case.")],
+    skill_id: Annotated[str, Doc("Skill slug in kebab-case.")],
     files: Annotated[
         list[dict[str, Any]],
         Doc(
@@ -144,10 +138,9 @@ async def publish_skill_version(
     display_group="Agent Skills",
     description="Restore a historical published version as the current skill version.",
     namespace="ai.skill",
-    required_entitlements=["agent_addons"],
 )
 async def restore_skill_version(
-    skill_id: Annotated[str, Doc("Skill ID/name in kebab-case.")],
+    skill_id: Annotated[str, Doc("Skill slug in kebab-case.")],
     version_id: Annotated[uuid.UUID, Doc("Skill version UUID.")],
     skill_uuid: Annotated[
         uuid.UUID | None, Doc("Optional canonical skill UUID.")
@@ -165,10 +158,9 @@ async def restore_skill_version(
     display_group="Agent Skills",
     description="Archive (delete) a workspace skill.",
     namespace="ai.skill",
-    required_entitlements=["agent_addons"],
 )
 async def archive_skill(
-    skill_id: Annotated[str, Doc("Skill ID/name in kebab-case.")],
+    skill_id: Annotated[str, Doc("Skill slug in kebab-case.")],
     skill_uuid: Annotated[
         uuid.UUID | None, Doc("Optional canonical skill UUID.")
     ] = None,

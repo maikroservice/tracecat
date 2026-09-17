@@ -1,13 +1,11 @@
 "use client"
 
-import { useQueryClient } from "@tanstack/react-query"
 import type { ChatOnDataCallback, ChatStatus, UIMessage } from "ai"
 import { ArrowRight, ChevronDown, Plus } from "lucide-react"
 import Link from "next/link"
 import { type ReactNode, useEffect, useState } from "react"
 import type {
   AgentPresetRead,
-  AgentPresetReadMinimal,
   AgentSessionEntity,
   AgentSessionsGetSessionVercelResponse,
 } from "@/client"
@@ -19,7 +17,9 @@ import {
   PromptInputTextarea,
   PromptInputTools,
 } from "@/components/ai-elements/prompt-input"
+import { useScopeCheck } from "@/components/auth/scope-guard"
 import { ChatEmptyHero } from "@/components/chat/chat-empty-hero"
+import type { ChatHistoryScope } from "@/components/chat/chat-history-dropdown"
 import { ChatHistoryDropdown } from "@/components/chat/chat-history-dropdown"
 import { ChatSessionPane } from "@/components/chat/chat-session-pane"
 import { NoMessages } from "@/components/chat/messages"
@@ -36,6 +36,7 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   Tooltip,
@@ -44,6 +45,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { toast } from "@/components/ui/use-toast"
+import { useAuth } from "@/hooks/use-auth"
 import {
   parseChatError,
   useCreateChat,
@@ -52,9 +54,9 @@ import {
   useUpdateChat,
 } from "@/hooks/use-chat"
 import { useChatPresetManager } from "@/hooks/use-chat-preset-manager"
-import { useEntitlements } from "@/hooks/use-entitlements"
 import { getApiErrorDetail } from "@/lib/errors"
 import { useChatReadiness } from "@/lib/hooks"
+import { useQueryClient } from "@/lib/query"
 import { cn } from "@/lib/utils"
 import { useWorkspaceId } from "@/providers/workspace-id"
 import type { ChatSurface } from "@/types/chat-surface"
@@ -111,8 +113,7 @@ export function ChatInterface({
 }: ChatInterfaceProps) {
   const workspaceId = useWorkspaceId()
   const queryClient = useQueryClient()
-  const { hasEntitlement } = useEntitlements()
-  const agentAddonsEnabled = hasEntitlement("agent_addons")
+  const { user } = useAuth()
   const [selectedChatId, setSelectedChatId] = useState<string | undefined>(
     chatId
   )
@@ -121,6 +122,7 @@ export function ChatInterface({
   const [isDraftChat, setIsDraftChat] = useState(false)
   const [pendingFirstMessage, setPendingFirstMessage] =
     useState<PendingFirstMessage | null>(null)
+  const [historyScope, setHistoryScope] = useState<ChatHistoryScope>("team")
 
   // Keep local selection aligned when a parent-driven chatId changes.
   useEffect(() => {
@@ -134,6 +136,7 @@ export function ChatInterface({
     workspaceId: workspaceId,
     entityType,
     entityId,
+    createdBy: historyScope === "mine" ? user?.id : undefined,
   })
 
   // Create chat mutation
@@ -149,9 +152,17 @@ export function ChatInterface({
     onChatChange?.(selectedChatId ? chat : undefined)
   }, [chat, onChatChange, selectedChatId])
 
-  const presetsEnabled =
-    agentAddonsEnabled && (entityType === "case" || entityType === "copilot")
-  const sessionMcpEnabled = agentAddonsEnabled && entityType === "copilot"
+  // Setting a session preset only means something where the session owns one;
+  // preset-builder, approval and workflow sessions get no `@` trigger at all.
+  const presetsSupported = entityType === "case" || entityType === "copilot"
+  const presetsEnabled = presetsSupported
+  // `integration:read` is folded in: the picker lists servers from the MCP
+  // integration endpoint, which is guarded by it. Without it the request 403s
+  // and the picker would offer to connect a server on a page the role cannot
+  // open.
+  const canReadIntegrations = useScopeCheck("integration:read")
+  const sessionMcpEnabled =
+    canReadIntegrations === true && entityType === "copilot"
   const inWorkspaceChat = surface === "workspace-chat"
   // Surfaces that defer server-side session creation until the first message,
   // showing a draft composer instead of an eagerly-created empty session.
@@ -173,9 +184,6 @@ export function ChatInterface({
   }, [inWorkspaceChat, workspaceId, selectedChatId])
 
   const {
-    presets: presetOptions,
-    presetsIsLoading,
-    presetsError,
     selectedPreset,
     selectedPresetConfig,
     selectedPresetConfigError,
@@ -183,6 +191,7 @@ export function ChatInterface({
     selectedPresetId: effectivePresetId,
     selectedPresetVersionId,
     handlePresetChange,
+    getPendingPresetSelection,
     presetMenuLabel,
     presetMenuDisabled,
     showPresetSpinner,
@@ -217,8 +226,10 @@ export function ChatInterface({
       !inWorkspaceChat &&
       !(entityType === "case" && isDraftChat)
     ) {
-      // Select first existing chat
-      const firstChatId = chats[0].id
+      // Prefer the current user's latest writable chat before falling back to
+      // the newest teammate session.
+      const firstChatId =
+        chats.find((candidate) => !candidate.is_readonly)?.id ?? chats[0].id
       setSelectedChatId(firstChatId)
       onChatSelect?.(firstChatId)
     } else if (
@@ -289,6 +300,10 @@ export function ChatInterface({
       return null
     }
 
+    // Read the selection through the manager: an `@Agent` mention sets the
+    // preset moments before this runs, and render state is still behind.
+    const pendingPreset = getPendingPresetSelection()
+
     try {
       const newChat = await createChat({
         title: `Chat ${(chats?.length || 0) + 1}`,
@@ -296,8 +311,8 @@ export function ChatInterface({
         entity_id: entityId,
         tools: selectedTools,
         mcp_integrations: selectedMcpIntegrations,
-        agent_preset_id: effectivePresetId,
-        agent_preset_version_id: selectedPresetVersionId,
+        agent_preset_id: pendingPreset.presetId,
+        agent_preset_version_id: pendingPreset.versionId,
       })
 
       // Prime the vercel chat cache with the freshly created (empty) session so
@@ -333,6 +348,13 @@ export function ChatInterface({
     onChatSelect?.(chatId)
   }
 
+  const handleHistoryScopeChange = (nextScope: ChatHistoryScope) => {
+    setHistoryScope(nextScope)
+    if (nextScope === "mine" && chat?.is_readonly) {
+      setSelectedChatId(undefined)
+    }
+  }
+
   // Show loading while chats are loading or being auto-created
   if (
     chatsLoading ||
@@ -362,15 +384,10 @@ export function ChatInterface({
   const presetSelector = presetsEnabled
     ? {
         label: presetMenuLabel,
-        presets: presetOptions,
-        presetsError,
-        presetsIsLoading,
         selectedPresetId: effectivePresetId,
         disabled: presetMenuDisabled,
         showSpinner: showPresetSpinner,
-        noPresetDescription: "Use workspace default case agent instructions.",
-        onSelect: (presetId: string | null) =>
-          void handlePresetChange(presetId),
+        onSelect: handlePresetChange,
       }
     : undefined
   const pendingMessageText =
@@ -398,7 +415,18 @@ export function ChatInterface({
               error={chatsError}
               selectedChatId={selectedChatId}
               onSelectChat={handleSelectChat}
+              workspaceId={workspaceId}
+              scope={historyScope}
+              onScopeChange={handleHistoryScopeChange}
             />
+            {chat?.is_readonly ? (
+              <Badge
+                variant="outline"
+                className="px-1.5 py-0 text-[10px] font-normal text-muted-foreground"
+              >
+                Read only
+              </Badge>
+            ) : null}
           </div>
 
           {/* Right-side actions */}
@@ -461,7 +489,7 @@ export function ChatInterface({
           selectedPreset={activePreset}
           selectedPresetConfigError={selectedPresetConfigError}
           toolsEnabled={toolsEnabled}
-          agentAddonsEnabled={agentAddonsEnabled}
+          agentMentionsSupported={presetsSupported}
           mcpEnabled={sessionMcpEnabled}
           draftMode={draftMode}
           presetSelector={presetSelector}
@@ -493,19 +521,16 @@ interface ChatBodyProps {
   selectedPreset?: PresetConfigLike
   selectedPresetConfigError?: unknown
   toolsEnabled: boolean
-  agentAddonsEnabled: boolean
+  /** Whether `@` offers agent presets on this surface. */
+  agentMentionsSupported: boolean
   mcpEnabled: boolean
   draftMode: boolean
   presetSelector?: {
     label: string
-    presets?: AgentPresetReadMinimal[]
-    presetsIsLoading: boolean
-    presetsError: unknown
     selectedPresetId: string | null
-    onSelect: (presetId: string | null) => void | Promise<void>
+    onSelect: (presetId: string | null) => Promise<boolean>
     disabled?: boolean
     showSpinner?: boolean
-    noPresetDescription?: string
   }
   onCreateSessionBeforeSend?: (
     messageText: string,
@@ -533,7 +558,7 @@ function ChatBody({
   selectedPreset,
   selectedPresetConfigError,
   toolsEnabled,
-  agentAddonsEnabled,
+  agentMentionsSupported,
   mcpEnabled,
   draftMode,
   presetSelector,
@@ -595,7 +620,7 @@ function ChatBody({
   }
 
   // Render active chat session when ready
-  if (!chatReady || !modelInfo) {
+  if ((!chatReady || !modelInfo) && !chat?.is_readonly) {
     // Render configuration required state
     if (surface === "workspace-chat") {
       return (
@@ -644,9 +669,9 @@ function ChatBody({
         entityId={entityId}
         placeholder={placeholder}
         className="flex-1 min-h-0"
-        modelInfo={modelInfo}
+        modelInfo={modelInfo ?? undefined}
         toolsEnabled={toolsEnabled}
-        agentAddonsEnabled={agentAddonsEnabled}
+        agentMentionsSupported={agentMentionsSupported}
         mcpEnabled={mcpEnabled}
         presetSelector={presetSelector}
         onBeforeSend={onCreateSessionBeforeSend}
@@ -677,9 +702,9 @@ function ChatBody({
       entityId={entityId}
       placeholder={placeholder}
       className="flex-1 min-h-0"
-      modelInfo={modelInfo}
+      modelInfo={modelInfo ?? undefined}
       toolsEnabled={toolsEnabled}
-      agentAddonsEnabled={agentAddonsEnabled}
+      agentMentionsSupported={agentMentionsSupported}
       mcpEnabled={mcpEnabled}
       presetSelector={presetSelector}
       pendingMessage={pendingMessage ?? undefined}

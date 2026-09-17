@@ -2,8 +2,10 @@ import logging
 import os
 import uuid
 from enum import StrEnum
+from ipaddress import IPv4Network, IPv6Network, ip_network
 from typing import Literal, cast
 
+from tracecat.agent.constants import AGENT_TIMEOUT_CLEANUP_BUFFER_SECONDS
 from tracecat.auth.enums import AuthType
 from tracecat.feature_flags.enums import FeatureFlag
 
@@ -86,6 +88,13 @@ TRACECAT__APP_ENV: Literal["development", "staging", "production"] = cast(
     Literal["development", "staging", "production"],
     os.environ.get("TRACECAT__APP_ENV", "development"),
 )
+TRACECAT__SERVICE_NAME = os.environ.get("TRACECAT__SERVICE_NAME") or "tracecat"
+"""Name of the Tracecat service running in this process.
+
+Used to attribute database connections in `pg_stat_activity` via the PostgreSQL
+`application_name` session setting.
+"""
+
 TRACECAT__API_URL = os.environ.get("TRACECAT__API_URL", "http://localhost:8000")
 TRACECAT__API_ROOT_PATH = os.environ.get("TRACECAT__API_ROOT_PATH", "/api")
 TRACECAT__PUBLIC_API_URL = os.environ.get(
@@ -94,6 +103,10 @@ TRACECAT__PUBLIC_API_URL = os.environ.get(
 TRACECAT__PUBLIC_APP_URL = os.environ.get(
     "TRACECAT__PUBLIC_APP_URL", "http://localhost"
 )
+TRACECAT__PLATFORM_OTEL_ENABLED = env_bool(
+    "TRACECAT__PLATFORM_OTEL_ENABLED", default=False
+)
+"""Enable Tracecat-operated platform tracing, separate from agent OTel export."""
 
 TRACECAT__LOOP_MAX_BATCH_SIZE = int(
     os.environ.get("TRACECAT__LOOP_MAX_BATCH_SIZE") or 64
@@ -158,6 +171,16 @@ TRACECAT__EXECUTOR_FOR_EACH_MAX_CONCURRENCY = int(
 )
 """Maximum concurrent iterations for a single executor-side action for_each loop."""
 
+TRACECAT__EXECUTOR_MAX_CONCURRENT_ACTIVITIES = int(
+    os.environ.get("TRACECAT__EXECUTOR_MAX_CONCURRENT_ACTIVITIES") or 16
+)
+"""Maximum concurrent activities for the ExecutorWorker Temporal worker."""
+
+TRACECAT__EXECUTOR_THREADPOOL_MAX_WORKERS = int(
+    os.environ.get("TRACECAT__EXECUTOR_THREADPOOL_MAX_WORKERS") or 16
+)
+"""Activity thread-pool size for the ExecutorWorker; bounds concurrent CPU-bound sync activities competing for the GIL."""
+
 TRACECAT__ACTIVITY_HEARTBEAT_TIMEOUT = int(
     os.environ.get("TRACECAT__ACTIVITY_HEARTBEAT_TIMEOUT") or 60
 )
@@ -183,10 +206,36 @@ TRACECAT__EXECUTOR_REGISTRY_SQUASHFS_ENABLED = env_bool(
 )
 """Prefer SquashFS registry artifacts when sidecars and mount support are available."""
 
+TRACECAT__EXECUTOR_REGISTRY_CACHE_MAX_ENTRIES = int(
+    os.environ.get("TRACECAT__EXECUTOR_REGISTRY_CACHE_MAX_ENTRIES") or 64
+)
+"""Maximum number of registry artifacts kept in the executor-local cache.
+
+Set to 0 to disable entry-count eviction."""
+
+TRACECAT__EXECUTOR_REGISTRY_CACHE_MAX_BYTES = int(
+    os.environ.get("TRACECAT__EXECUTOR_REGISTRY_CACHE_MAX_BYTES") or 10 * 1024**3
+)
+"""Maximum on-disk size of the executor-local registry artifact cache, in bytes.
+
+Cold downloads and extraction scratch are admitted within this bound. Mounted
+artifacts only account for their backing image file. Set to 0 to disable
+size-based eviction and materialization limits."""
+
 TRACECAT__AGENT_SKILL_CACHE_DIR = os.environ.get(
     "TRACECAT__AGENT_SKILL_CACHE_DIR", "/tmp/tracecat/agent-skill-cache"
 )
 """Directory for caching extracted published skills on executor workers."""
+
+TRACECAT__COPILOT_SKILLS_DIR = (
+    os.environ.get("TRACECAT__COPILOT_SKILLS_DIR") or "/var/lib/tracecat/copilot-skills"
+)
+"""Directory holding the built-in workspace-chat skills vendored from the public
+`tracecat-plugins` repository at image build time.
+
+Deliberately outside the Python package tree. These are markdown the agent reads,
+not code that gets imported, and keeping them out of `packages/` means neither the
+wheel build nor a development bind mount can serve a stale copy."""
 
 TRACECAT__AGENT_SKILL_CACHE_MAX_CONCURRENT_DOWNLOADS = int(
     os.environ.get("TRACECAT__AGENT_SKILL_CACHE_MAX_CONCURRENT_DOWNLOADS") or 8
@@ -201,6 +250,7 @@ TRACECAT__SERVICE_ROLES_WHITELIST = [
     "tracecat-runner",
     "tracecat-schedule-runner",
     "tracecat-case-triggers",
+    "tracecat-case-duration-sync",
     "tracecat-ui",
 ]
 TRACECAT__DEFAULT_USER_ID = uuid.UUID(int=0)
@@ -234,6 +284,16 @@ TRACECAT__DB_POOL_TIMEOUT = int(os.environ.get("TRACECAT__DB_POOL_TIMEOUT") or 3
 """The timeout for the connection pool."""
 TRACECAT__DB_POOL_RECYCLE = int(os.environ.get("TRACECAT__DB_POOL_RECYCLE") or 600)
 """The time to recycle the connection pool."""
+TRACECAT__DB_AUTH_POOL_SIZE = int(os.environ.get("TRACECAT__DB_AUTH_POOL_SIZE") or 5)
+"""The size of the dedicated connection pool for short authentication lookups.
+
+This pool is an operational bulkhead, not a database privilege boundary. It
+uses the same database role and URI as the main pool.
+"""
+TRACECAT__DB_AUTH_MAX_OVERFLOW = int(
+    os.environ.get("TRACECAT__DB_AUTH_MAX_OVERFLOW") or 5
+)
+"""The maximum number of overflow connections for the authentication pool."""
 
 
 # === Auth config === #
@@ -428,6 +488,15 @@ TRACECAT__UNSAFE_DISABLE_SM_MASKING = env_bool(
     development and should never be enabled in production.
 """
 
+TRACECAT__UNSAFE_DISABLE_SECRET_ERROR_WITHHOLDING = env_bool(
+    "TRACECAT__UNSAFE_DISABLE_SECRET_ERROR_WITHHOLDING", default=False
+)
+"""UNSAFE: surface original action and expression error details even when
+secrets are in scope, instead of the generic "Details withheld" message. The
+original text may echo transformed secret values that exact-string masking
+cannot catch. Not recommended outside debugging.
+"""
+
 # === M2M config === #
 TRACECAT__SERVICE_KEY = os.environ.get("TRACECAT__SERVICE_KEY")
 TRACECAT__EXECUTOR_TOKEN_TTL_SECONDS = int(
@@ -617,6 +686,150 @@ TRACECAT__SANDBOX_PYPI_EXTRA_INDEX_URLS = [
 ]
 """Additional PyPI index URLs (comma-separated). Used as fallback sources for package installation."""
 
+
+def env_networks(
+    name: str, *, default: tuple[IPv4Network | IPv6Network, ...] = ()
+) -> tuple[IPv4Network | IPv6Network, ...]:
+    """Parse a comma-separated environment variable into validated IP networks.
+
+    Args:
+        name: Environment variable name.
+        default: Networks returned when the variable is unset or blank.
+
+    Returns:
+        Parsed IPv4 and IPv6 networks in configured order.
+
+    Raises:
+        ValueError: If any configured value is not a valid CIDR or IP address.
+    """
+    raw_value = os.environ.get(name, "")
+    if not raw_value.strip():
+        return default
+    networks: list[IPv4Network | IPv6Network] = []
+    for value in raw_value.split(","):
+        stripped = value.strip()
+        if not stripped:
+            continue
+        try:
+            networks.append(ip_network(stripped))
+        except ValueError as exc:
+            raise ValueError(f"{name} contains an invalid CIDR: {stripped!r}") from exc
+    return tuple(networks)
+
+
+def env_ports(name: str, *, default: tuple[int, ...]) -> tuple[int, ...]:
+    """Parse unique TCP/UDP ports from a comma-separated environment variable."""
+    raw_value = os.environ.get(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+
+    ports: list[int] = []
+    for value in raw_value.split(","):
+        stripped = value.strip()
+        if not stripped:
+            continue
+        try:
+            port = int(stripped)
+        except ValueError as exc:
+            raise ValueError(f"{name} contains an invalid port: {stripped!r}") from exc
+        if not 1 <= port <= 65535:
+            raise ValueError(f"{name} contains an invalid port: {stripped!r}")
+        if port not in ports:
+            ports.append(port)
+    return tuple(ports)
+
+
+TRACECAT__OUTBOUND_ALLOWED_PRIVATE_CIDRS = env_networks(
+    "TRACECAT__OUTBOUND_ALLOWED_PRIVATE_CIDRS"
+)
+"""Operator-only exceptions for caller-controlled MCP and LLM HTTP destinations.
+
+Empty by default. Configure exact IPs or narrow CIDRs only for intentional private
+integrations. Every workspace using these clients can reach an allowed address.
+Set this in the process/container environment, not workspace or action inputs.
+"""
+
+TRACECAT__AUDIT_TRUSTED_PROXY_CIDRS = env_networks(
+    "TRACECAT__AUDIT_TRUSTED_PROXY_CIDRS",
+    default=(
+        ip_network("127.0.0.0/8"),
+        ip_network("::1/128"),
+        ip_network("10.0.0.0/8"),
+        ip_network("172.16.0.0/12"),
+        ip_network("192.168.0.0/16"),
+        ip_network("169.254.0.0/16"),
+        ip_network("fc00::/7"),
+    ),
+)
+"""CIDRs of proxies behind which the API runs (Caddy, the UI container, a load
+balancer). X-Forwarded-For entries from these hops are skipped when resolving
+the client IP for audit attribution."""
+
+TRACECAT__SANDBOX_INSTALL_ALLOWED_EGRESS_CIDRS = env_networks(
+    "TRACECAT__SANDBOX_INSTALL_ALLOWED_EGRESS_CIDRS"
+)
+"""Private CIDRs reachable only while installing sandbox dependencies."""
+
+TRACECAT__SANDBOX_INSTALL_ALLOWED_EGRESS_TCP_PORTS = env_ports(
+    "TRACECAT__SANDBOX_INSTALL_ALLOWED_EGRESS_TCP_PORTS",
+    default=(80, 443),
+)
+"""TCP ports allowed to install-only private CIDRs."""
+
+TRACECAT__SANDBOX_REGISTRY_ALLOWED_EGRESS_CIDRS = env_networks(
+    "TRACECAT__SANDBOX_REGISTRY_ALLOWED_EGRESS_CIDRS"
+)
+"""Private CIDRs reachable only while acquiring custom registry sources."""
+
+TRACECAT__SANDBOX_REGISTRY_ALLOWED_EGRESS_TCP_PORTS = env_ports(
+    "TRACECAT__SANDBOX_REGISTRY_ALLOWED_EGRESS_TCP_PORTS",
+    default=(22,),
+)
+"""TCP ports allowed to registry-only private CIDRs."""
+
+TRACECAT__SANDBOX_SCRIPT_ALLOWED_EGRESS_CIDRS = env_networks(
+    "TRACECAT__SANDBOX_SCRIPT_ALLOWED_EGRESS_CIDRS"
+)
+"""Private CIDRs reachable by network-enabled Python script sandboxes."""
+
+TRACECAT__SANDBOX_SCRIPT_ALLOWED_EGRESS_TCP_PORTS = env_ports(
+    "TRACECAT__SANDBOX_SCRIPT_ALLOWED_EGRESS_TCP_PORTS",
+    default=(443,),
+)
+"""TCP ports allowed to script-only private CIDRs."""
+
+TRACECAT__SANDBOX_ACTION_ALLOWED_EGRESS_CIDRS = env_networks(
+    "TRACECAT__SANDBOX_ACTION_ALLOWED_EGRESS_CIDRS"
+)
+"""Private CIDRs reachable by action sandboxes."""
+
+TRACECAT__SANDBOX_ACTION_ALLOWED_EGRESS_TCP_PORTS = env_ports(
+    "TRACECAT__SANDBOX_ACTION_ALLOWED_EGRESS_TCP_PORTS",
+    default=(443,),
+)
+"""TCP ports allowed to action-only private CIDRs."""
+
+TRACECAT__SANDBOX_AGENT_ALLOWED_EGRESS_CIDRS = env_networks(
+    "TRACECAT__SANDBOX_AGENT_ALLOWED_EGRESS_CIDRS"
+)
+"""Private CIDRs reachable by internet-enabled agent sandboxes."""
+
+TRACECAT__SANDBOX_AGENT_ALLOWED_EGRESS_TCP_PORTS = env_ports(
+    "TRACECAT__SANDBOX_AGENT_ALLOWED_EGRESS_TCP_PORTS",
+    default=(443,),
+)
+"""TCP ports allowed to agent-only private CIDRs."""
+
+TRACECAT__SANDBOX_BLOCKED_EGRESS_CIDRS = env_networks(
+    "TRACECAT__SANDBOX_BLOCKED_EGRESS_CIDRS"
+)
+"""Deployment-specific CIDRs blocked in addition to the filtered baseline."""
+
+TRACECAT__SANDBOX_ALLOW_PUBLIC_IPV6_EGRESS = env_bool(
+    "TRACECAT__SANDBOX_ALLOW_PUBLIC_IPV6_EGRESS", default=False
+)
+"""Allow filtered sandboxes to reach public IPv6 destinations."""
+
 TRACECAT__DISABLE_NSJAIL = env_bool("TRACECAT__DISABLE_NSJAIL", default=True)
 """Disable nsjail sandbox and use the unsafe PID executor instead.
 
@@ -635,14 +848,12 @@ TRACECAT__EXECUTOR_BACKEND = os.environ.get("TRACECAT__EXECUTOR_BACKEND", "direc
 """Executor backend for running actions.
 
 Supported values:
-- 'pool': Warm nsjail workers (single-tenant, high throughput, ~100-200ms)
 - 'ephemeral': Cold nsjail subprocess per action (multitenant, full isolation, ~4000ms)
 - 'direct': Direct subprocess execution (no warm workers, no in-process state sharing)
 - 'test': In-process execution for tests only (no isolation, no subprocess overhead)
-- 'auto': Auto-select based on environment (pool if nsjail available, else direct)
+- 'auto': Auto-select based on environment (ephemeral if nsjail available, else direct)
 
 Trust mode is derived from the backend type:
-- pool: untrusted (secrets pre-resolved, no DB creds)
 - ephemeral: untrusted (secrets pre-resolved, no DB creds)
 - direct: untrusted subprocess execution (secrets pre-resolved, no DB creds)
 - test: trusted in-process execution (no sandbox)
@@ -658,11 +869,6 @@ TRACECAT__EXECUTOR_CLIENT_TIMEOUT = float(
 """Default timeout in seconds for executor client operations (default: 300s)."""
 
 # === Action Gateway === #
-TRACECAT__ACTION_GATEWAY_ENABLED = env_bool(
-    "TRACECAT__ACTION_GATEWAY_ENABLED", default=True
-)
-"""Enable the executor-local action gateway for action SDK calls."""
-
 TRACECAT__ACTION_GATEWAY_SOCKET = (
     os.environ.get("TRACECAT__ACTION_GATEWAY_SOCKET")
     or "/var/run/tracecat/action-gateway.sock"
@@ -683,7 +889,7 @@ When True, actions run in an nsjail sandbox with:
 When False (default), actions run in direct subprocesses without sandboxing.
 
 Requires:
-- TRACECAT__EXECUTOR_BACKEND=pool, ephemeral, or direct
+- TRACECAT__EXECUTOR_BACKEND=ephemeral or direct
 - nsjail binary at TRACECAT__SANDBOX_NSJAIL_PATH
 - Sandbox rootfs at TRACECAT__SANDBOX_ROOTFS_PATH
 """
@@ -702,35 +908,23 @@ TRACECAT__EXECUTOR_SITE_PACKAGES_DIR = os.environ.get(
 If not set, will be auto-detected from a known dependency's location.
 """
 
-TRACECAT__EXECUTOR_POOL_METRICS_ENABLED = env_bool(
-    "TRACECAT__EXECUTOR_POOL_METRICS_ENABLED", default=False
-)
-"""Enable periodic metrics emission for the worker pool.
-
-When True, the pool emits metrics every 10 seconds including:
-- Pool utilization and capacity
-- Worker states (alive, dead, recycling)
-- Lock contention stats
-- Throughput metrics
-
-When False (default), metrics are not emitted to reduce log noise.
-"""
-
 # === Agent Sandbox (NSJail for ClaudeAgentRuntime) === #
 TRACECAT__AGENT_SANDBOX_TIMEOUT = int(
-    os.environ.get("TRACECAT__AGENT_SANDBOX_TIMEOUT") or 1800
+    os.environ.get("TRACECAT__AGENT_SANDBOX_TIMEOUT") or 3600
 )
-"""Default timeout for agent sandbox execution in seconds (30 minutes)."""
+"""Ceiling for agent execution timeouts in seconds (default one hour).
+
+Per-action agent timeouts clamp to [AGENT_TIMEOUT_SECONDS_DEFAULT, this].
+"""
 
 TRACECAT__AGENT_EXECUTOR_GRACEFUL_SHUTDOWN_TIMEOUT = int(
     os.environ.get("TRACECAT__AGENT_EXECUTOR_GRACEFUL_SHUTDOWN_TIMEOUT")
-    or (TRACECAT__AGENT_SANDBOX_TIMEOUT + 60)
+    or (TRACECAT__AGENT_SANDBOX_TIMEOUT + AGENT_TIMEOUT_CLEANUP_BUFFER_SECONDS)
 )
 """Agent executor worker drain timeout in seconds.
 
-Defaults to the agent sandbox timeout plus a small buffer so planned worker
-shutdowns can let active agent activities finish instead of interrupting the
-sandbox.
+Defaults to the agent timeout ceiling plus the cleanup buffer so planned
+worker shutdowns can let active agent activities finish.
 """
 
 TRACECAT__AGENT_SANDBOX_MEMORY_MB = int(
@@ -752,9 +946,9 @@ TRACECAT__LITELLM_BASE_URL = os.environ.get(
 """Internal base URL for the managed LiteLLM service."""
 
 TRACECAT__LLM_PROXY_READ_TIMEOUT = float(
-    os.environ.get("TRACECAT__LLM_PROXY_READ_TIMEOUT") or 300.0
+    os.environ.get("TRACECAT__LLM_PROXY_READ_TIMEOUT") or 600.0
 )
-"""Read timeout for the LLM socket proxy in seconds (default: 5 minutes)."""
+"""Read timeout for the LLM socket proxy in seconds (default: 10 minutes)."""
 
 
 TRACECAT__LLM_GATEWAY_CREDENTIAL_CACHE_TTL_SECONDS = float(
@@ -846,9 +1040,25 @@ TRACECAT__RATE_LIMIT_BY_ENDPOINT = env_bool(
 """Whether to rate limit by endpoint."""
 
 TRACECAT__EXECUTOR_PAYLOAD_MAX_SIZE_BYTES = int(
-    os.environ.get("TRACECAT__EXECUTOR_PAYLOAD_MAX_SIZE_BYTES") or 1024 * 1024
+    os.environ.get("TRACECAT__EXECUTOR_PAYLOAD_MAX_SIZE_BYTES") or 5 * 1024**3
 )
-"""The maximum size of a payload in bytes the executor can return. Defaults to 1MB"""
+"""The maximum size of a payload in bytes the executor can return.
+
+Defaults to 5 GiB, the largest single-object upload S3 and MinIO accept.
+Results above ``TRACECAT__RESULT_EXTERNALIZATION_THRESHOLD_BYTES`` are
+externalized to blob storage with a single PUT, so the object store's
+single-upload cap is the effective ceiling on an action's result.
+"""
+
+TRACECAT__SANDBOX_PACKAGE_CACHE_MAX_BYTES = int(
+    os.environ.get("TRACECAT__SANDBOX_PACKAGE_CACHE_MAX_BYTES") or 5 * 1024**3
+)
+"""Maximum aggregate bytes promoted from a sandbox package cache."""
+
+TRACECAT__SANDBOX_PACKAGE_CACHE_MAX_ENTRIES = int(
+    os.environ.get("TRACECAT__SANDBOX_PACKAGE_CACHE_MAX_ENTRIES") or 200_000
+)
+"""Maximum entries promoted from a sandbox package cache."""
 
 TRACECAT__MAX_FILE_SIZE_BYTES = int(
     os.environ.get("TRACECAT__MAX_FILE_SIZE_BYTES") or 20 * 1024 * 1024  # Default 20MB
@@ -870,6 +1080,31 @@ TRACECAT__MAX_AGGREGATE_UPLOAD_SIZE_BYTES = int(
 )
 """The maximum size of the aggregate upload size in bytes. Defaults to 100MB."""
 
+TRACECAT__MAX_SKILL_FILE_SIZE_BYTES = int(
+    os.environ.get("TRACECAT__MAX_SKILL_FILE_SIZE_BYTES") or 20 * 1024 * 1024
+)
+"""Maximum size of one skill file in bytes. Defaults to 20 MiB."""
+
+TRACECAT__MAX_SKILL_FILES_COUNT = int(
+    os.environ.get("TRACECAT__MAX_SKILL_FILES_COUNT") or 1_000
+)
+"""Maximum number of files in one skill draft. Defaults to 1,000."""
+
+TRACECAT__MAX_SKILL_TRANSFER_FILES_COUNT = int(
+    os.environ.get("TRACECAT__MAX_SKILL_TRANSFER_FILES_COUNT") or 64
+)
+"""Maximum number of files in one staged skill transfer. Defaults to 64."""
+
+TRACECAT__MAX_SKILL_TOTAL_SIZE_BYTES = int(
+    os.environ.get("TRACECAT__MAX_SKILL_TOTAL_SIZE_BYTES") or 100 * 1024 * 1024
+)
+"""Maximum aggregate size of one skill draft in bytes. Defaults to 100 MiB."""
+
+TRACECAT__MAX_SKILL_MANIFEST_SIZE_BYTES = int(
+    os.environ.get("TRACECAT__MAX_SKILL_MANIFEST_SIZE_BYTES") or 256 * 1024
+)
+"""Maximum size of a root skill SKILL.md manifest. Defaults to 256 KiB."""
+
 # === System PATH config === #
 TRACECAT__SYSTEM_PATH = os.environ.get(
     "TRACECAT__SYSTEM_PATH", "/usr/local/bin:/usr/bin:/bin"
@@ -885,6 +1120,32 @@ TRACECAT__S3_CONCURRENCY_LIMIT = int(
 # === API List/Search Limits === #
 TRACECAT__LIMIT_MIN = 1
 """Minimum list/search page size."""
+
+TRACECAT__LIMIT_AGG_GROUPS_MAX = bound_env(
+    "TRACECAT__LIMIT_AGG_GROUPS_MAX",
+    1000,
+    lower=1,
+)
+"""Maximum number of groups returned by an aggregation query."""
+
+TRACECAT__LIMIT_AGG_GROUPS_DEFAULT = bound_env(
+    "TRACECAT__LIMIT_AGG_GROUPS_DEFAULT",
+    100,
+    lower=1,
+    upper=TRACECAT__LIMIT_AGG_GROUPS_MAX,
+)
+"""Default number of groups returned by an aggregation query."""
+
+POSTGRES_STATEMENT_TIMEOUT_MAX_MS = 2_147_483_647
+"""Largest PostgreSQL statement timeout accepted in milliseconds."""
+
+TRACECAT__AGG_STATEMENT_TIMEOUT_MS = bound_env(
+    "TRACECAT__AGG_STATEMENT_TIMEOUT_MS",
+    30_000,
+    lower=1,
+    upper=POSTGRES_STATEMENT_TIMEOUT_MAX_MS,
+)
+"""PostgreSQL statement timeout for aggregation queries, in milliseconds."""
 
 TRACECAT__LIMIT_DEFAULT = 20
 """Default list/search page size."""
@@ -918,6 +1179,20 @@ TRACECAT__LIMIT_TABLE_DOWNLOAD_MAX = 1000
 
 TRACECAT__LIMIT_TABLE_DOWNLOAD_DEFAULT = TRACECAT__LIMIT_TABLE_DOWNLOAD_MAX
 """Default row count for internal table download."""
+
+# === API Lifecycle === #
+TRACECAT__API_TASK_DRAIN_TIMEOUT = float(
+    os.environ.get("TRACECAT__API_TASK_DRAIN_TIMEOUT") or 10.0
+)
+"""Seconds to let finite in-process API tasks finish during shutdown.
+
+Stoppable consumers (e.g. case triggers) are signalled to finish in-flight
+work and are awaited alongside finite startup tasks (e.g. registry sync) for
+this duration. Stragglers are then cancelled and get the same duration again
+for cleanup; non-stoppable long-running tasks are cancelled immediately. The
+deployment's termination grace period must exceed twice this value for full
+coverage.
+"""
 
 # === Context Compression === #
 TRACECAT__CONTEXT_COMPRESSION_ENABLED = env_bool(
@@ -997,6 +1272,36 @@ TRACECAT__CASE_TRIGGERS_LOCK_TTL_SECONDS = int(
     os.environ.get("TRACECAT__CASE_TRIGGERS_LOCK_TTL_SECONDS") or 300
 )
 """TTL for case trigger lock keys in seconds."""
+
+TRACECAT__CASE_DURATION_SYNC_STREAM_KEY = os.environ.get(
+    "TRACECAT__CASE_DURATION_SYNC_STREAM_KEY", "case-duration-sync"
+)
+"""Redis stream key for case duration sync jobs."""
+
+TRACECAT__CASE_DURATION_SYNC_GROUP = os.environ.get(
+    "TRACECAT__CASE_DURATION_SYNC_GROUP", "case-duration-sync"
+)
+"""Redis consumer group for case duration sync processing."""
+
+TRACECAT__CASE_DURATION_SYNC_BLOCK_MS = int(
+    os.environ.get("TRACECAT__CASE_DURATION_SYNC_BLOCK_MS") or 2000
+)
+"""XREADGROUP block timeout in milliseconds for duration sync jobs."""
+
+TRACECAT__CASE_DURATION_SYNC_BATCH = int(
+    os.environ.get("TRACECAT__CASE_DURATION_SYNC_BATCH") or 100
+)
+"""Maximum number of duration sync jobs to read per batch."""
+
+TRACECAT__CASE_DURATION_SYNC_CLAIM_IDLE_MS = int(
+    os.environ.get("TRACECAT__CASE_DURATION_SYNC_CLAIM_IDLE_MS") or 300000
+)
+"""Idle time before claiming pending duration sync jobs."""
+
+TRACECAT__CASE_DURATION_SYNC_BACKFILL_BATCH = int(
+    os.environ.get("TRACECAT__CASE_DURATION_SYNC_BACKFILL_BATCH") or 250
+)
+"""Number of cases to enqueue per duration definition backfill job."""
 
 # === File limits === #
 TRACECAT__MAX_ATTACHMENT_SIZE_BYTES = int(
@@ -1156,16 +1461,19 @@ TRACECAT__MODEL_CONTEXT_LIMITS = {
 TRACECAT__REGISTRY_SYNC_SANDBOX_ENABLED = env_bool(
     "TRACECAT__REGISTRY_SYNC_SANDBOX_ENABLED", default=True
 )
-"""Enable sandboxed registry sync via Temporal workflow on ExecutorWorker.
+"""Enable executor-hosted registry sync via Temporal.
 
-When True (default), registry sync operations run on the ExecutorWorker with:
-- Git clone in subprocess with SSH credentials
-- Package installation with network access
-- Action discovery (currently subprocess, future: nsjail without network)
-- Tarball build and upload to S3
+When True (default), registry sync operations run on the ExecutorWorker.
+NsJail isolation on that worker is controlled separately by
+TRACECAT__DISABLE_NSJAIL.
 
 When False, uses the existing subprocess approach from the API service.
 """
+
+TRACECAT__REGISTRY_SYNC_CLONE_TIMEOUT = int(
+    os.environ.get("TRACECAT__REGISTRY_SYNC_CLONE_TIMEOUT") or 120
+)
+"""Timeout for Git clone/fetch/checkout during registry sync in seconds."""
 
 TRACECAT__REGISTRY_SYNC_INSTALL_TIMEOUT = int(
     os.environ.get("TRACECAT__REGISTRY_SYNC_INSTALL_TIMEOUT") or 600

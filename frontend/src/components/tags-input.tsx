@@ -14,6 +14,11 @@ import {
   CommandItem,
   CommandList,
 } from "@/components/ui/command"
+import {
+  HoverCard,
+  HoverCardContent,
+  HoverCardTrigger,
+} from "@/components/ui/hover-card"
 import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { cn } from "@/lib/utils"
@@ -57,6 +62,23 @@ export interface Suggestion {
   value: string
   description?: string
   group?: string
+  /**
+   * When true, the selected chip shows a hover card with the provider,
+   * display name, and description. Omit for values that don't warrant a
+   * hover card (raw UUIDs, slugs).
+   */
+  showHoverCard?: boolean
+  /**
+   * Optional display name for the selected chip when the dropdown `label`
+   * isn't chip-friendly (e.g. a full dotted action id). Falls back to `label`.
+   */
+  tagLabel?: string
+  /**
+   * Optional provider/vendor display name for the selected chip's prefix
+   * (e.g. "PagerDuty") when the dropdown `group` is a raw namespace. Falls
+   * back to `group`.
+   */
+  tagGroup?: string
   icon?: React.ReactNode
   locked?: boolean
   onSelect?: () => void
@@ -68,7 +90,11 @@ export interface MultiTagCommandInputProps {
   suggestions?: Suggestion[]
   placeholder?: string
   className?: string
+  /** Layout classes applied only to the container holding tags and the input. */
+  inputClassName?: string
   disabled?: boolean
+  /** ID applied to the underlying text input for accessible labels. */
+  inputId?: string
   maxTags?: number
   searchKeys: (keyof Suggestion)[]
   /**
@@ -87,13 +113,20 @@ export function MultiTagCommandInput({
   suggestions = [],
   placeholder = "Add tags...",
   className,
+  inputClassName,
   disabled = false,
+  inputId,
   maxTags,
   searchKeys,
   allowCustomTags = false,
   disableSuggestions = false,
 }: MultiTagCommandInputProps) {
-  const [open, setOpen] = useState(false)
+  const [requestedOpen, setOpen] = useState(false)
+  const open = requestedOpen && !disabled && !disableSuggestions
+  // Disabling dismisses the request; re-enabling requires a new user action.
+  if (requestedOpen && (disabled || disableSuggestions)) {
+    setOpen(false)
+  }
   const [inputValue, setInputValue] = useState("")
   const inputRef = useRef<HTMLInputElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -116,9 +149,12 @@ export function MultiTagCommandInput({
         const suggestion = suggestions.find((s) => s.value === val)
         return {
           id: `${index}`,
-          text: suggestion?.label || val,
+          text: suggestion?.tagLabel || suggestion?.label || val,
           value: val,
           icon: suggestion?.icon,
+          group: suggestion?.tagGroup || suggestion?.group,
+          description: suggestion?.description,
+          showHoverCard: suggestion?.showHoverCard ?? false,
         }
       }) || []
     )
@@ -154,6 +190,7 @@ export function MultiTagCommandInput({
   const rowCount = filteredSuggestions.length + (showCustomRow ? 1 : 0)
 
   const handleSelect = (suggestion: Suggestion) => {
+    if (disabled || disableSuggestions) return
     if (suggestion.locked) {
       suggestion.onSelect?.()
       return
@@ -259,45 +296,91 @@ export function MultiTagCommandInput({
               "flex min-h-10 w-full flex-wrap items-center gap-1 rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm ring-offset-background",
               "focus-within:ring-1 focus-within:ring-inset focus-within:ring-ring",
               disabled && "cursor-not-allowed opacity-50",
-              className
+              className,
+              inputClassName
             )}
             onClick={() => inputRef.current?.focus()}
           >
             {/* Render tags */}
-            {tags.map((tag) => (
-              <Badge
-                key={tag.id}
-                variant="secondary"
-                className="gap-1 pr-1 text-xs"
-              >
-                {tag.icon ? (
-                  <span className="flex items-center gap-1">
-                    <span className="flex items-center justify-center rounded-sm bg-transparent">
-                      {tag.icon}
+            {tags.map((tag) => {
+              const label = tag.group ? (
+                <span>
+                  <span className="text-muted-foreground">{tag.group}</span> ·{" "}
+                  {tag.text}
+                </span>
+              ) : (
+                <span>{tag.text}</span>
+              )
+              const badge = (
+                <Badge
+                  key={tag.id}
+                  variant="secondary"
+                  className="gap-1 pr-1 text-xs"
+                >
+                  {tag.icon ? (
+                    <span className="flex items-center gap-1">
+                      <span className="flex items-center justify-center rounded-sm bg-transparent">
+                        {tag.icon}
+                      </span>
+                      {label}
                     </span>
-                    <span>{tag.text}</span>
-                  </span>
-                ) : (
-                  tag.text
-                )}
-                {!disabled && (
-                  <button
-                    type="button"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      handleRemoveTag(tag.value)
-                    }}
-                    className="ml-1 rounded-full hover:bg-muted-foreground/20"
-                  >
-                    <X className="size-3" />
-                  </button>
-                )}
-              </Badge>
-            ))}
+                  ) : (
+                    label
+                  )}
+                  {!disabled && (
+                    <button
+                      type="button"
+                      aria-label={`Remove ${tag.group ? `${tag.group} · ` : ""}${tag.text}`}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        handleRemoveTag(tag.value)
+                      }}
+                      className="ml-1 rounded-full hover:bg-muted-foreground/20"
+                    >
+                      <X className="size-3" />
+                    </button>
+                  )}
+                </Badge>
+              )
+              // The remove button lives inside the hover card trigger; its
+              // click handler still fires and removes the tag.
+              if (tag.showHoverCard) {
+                return (
+                  <HoverCard key={tag.id} openDelay={200}>
+                    <HoverCardTrigger asChild>{badge}</HoverCardTrigger>
+                    <HoverCardContent
+                      className="w-[300px] p-4 text-xs"
+                      align="start"
+                    >
+                      <div className="flex items-center gap-2">
+                        {tag.icon}
+                        <div className="flex flex-col">
+                          {tag.group && (
+                            <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                              {tag.group}
+                            </span>
+                          )}
+                          <span className="text-sm font-medium">
+                            {tag.text}
+                          </span>
+                        </div>
+                      </div>
+                      {tag.description && (
+                        <p className="mt-2 text-muted-foreground">
+                          {tag.description}
+                        </p>
+                      )}
+                    </HoverCardContent>
+                  </HoverCard>
+                )
+              }
+              return badge
+            })}
 
             {/* Input */}
             <input
               ref={inputRef}
+              id={inputId}
               type="text"
               value={inputValue}
               onChange={(e) => handleInputChange(e.target.value)}

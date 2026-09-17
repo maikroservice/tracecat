@@ -6,7 +6,6 @@ import {
   ExternalLink,
   Globe2,
   Loader2,
-  MoreHorizontal,
   PlayCircle,
   Plus,
   Server,
@@ -14,13 +13,7 @@ import {
 } from "lucide-react"
 import React, { useState } from "react"
 import { type Resolver, useFieldArray, useForm } from "react-hook-form"
-import {
-  integrationsGetIntegration,
-  mcpIntegrationsConnectPlatformMcpCatalog,
-  providersCreateCustomProvider,
-} from "@/client/services.gen"
 import type {
-  MCPCatalogConnectResponse,
   MCPConnectionSpec,
   MCPHttpIntegrationCreate,
   MCPIntegrationRead,
@@ -40,8 +33,8 @@ import {
   isAllowedCommand,
   MCP_INTEGRATION_FORM_DEFAULTS,
   type MCPIntegrationFormValues,
+  missingRequiredHttpHeaderCredentials,
   missingRequiredOAuthClientCredentials,
-  normalizeOAuthClientKey,
   SERVER_TYPES,
   urlTypedStdioEnvKeys,
 } from "@/components/integrations/mcp-integration-schema"
@@ -74,12 +67,6 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog"
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu"
-import {
   Form,
   FormControl,
   FormDescription,
@@ -98,6 +85,11 @@ import {
 } from "@/components/ui/select"
 import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
 import { toast } from "@/components/ui/use-toast"
 import { getMcpOAuthConnectErrorDetail } from "@/lib/errors"
 import {
@@ -127,27 +119,58 @@ function optionIcon(
   return spec?.server_type === "stdio" ? Server : Globe2
 }
 
+/**
+ * Whether a catalog HTTP recipe delegates its server URI to the user.
+ *
+ * Mirrors the backend resolver: a recipe declaring a `server_uri`-targeted
+ * credential (or shipping no URI) accepts any user URI.
+ */
+function serverUriIsUserSupplied(spec: MCPConnectionSpec) {
+  if (spec.server_type !== "http") {
+    return false
+  }
+  if (
+    (spec.credentials ?? []).some(
+      (credential) => credential.target === "server_uri"
+    )
+  ) {
+    return true
+  }
+  return !spec.server_uri
+}
+
+/**
+ * Best-effort catalog option id for a stored integration.
+ *
+ * The option id is not persisted, so edit mode re-derives it with the same
+ * rules the backend resolver applies; an ambiguous row resolves to "" and lets
+ * the backend bind it.
+ */
 function catalogOptionIdForIntegration(
   entry: PlatformMCPCatalogRead | null | undefined,
   integration: MCPIntegrationRead
 ) {
   const options = entry?.connection_options ?? []
-  const match = options.find((option) => {
+  const matches = options.filter((option) => {
     const spec = option.connection_spec
     if (!spec || spec.server_type !== integration.server_type) {
       return false
     }
-    if (spec.server_type === "http") {
-      return (
-        spec.auth_type === integration.auth_type &&
-        (!integration.server_uri ||
-          !("server_uri" in spec) ||
-          spec.server_uri === integration.server_uri)
-      )
+    if (spec.server_type !== "http") {
+      return true
     }
-    return true
+    if (spec.auth_type !== integration.auth_type) {
+      return false
+    }
+    if (!integration.server_uri || serverUriIsUserSupplied(spec)) {
+      return true
+    }
+    return spec.server_uri === integration.server_uri
   })
-  return match?.id ?? ""
+  if (matches.length !== 1) {
+    return ""
+  }
+  return matches[0].id
 }
 
 function catalogSpecForOption(
@@ -175,47 +198,6 @@ function hasOAuthClientConfig(spec: MCPConnectionSpec | null | undefined) {
       (credential) => credential.target === "oauth_client"
     )
   )
-}
-
-function isClientSecretKey(key: string) {
-  const normalized = normalizeOAuthClientKey(key)
-  return (
-    normalized === "client_secret" ||
-    normalized === "oauth_client_secret" ||
-    normalized.endsWith("_client_secret")
-  )
-}
-
-function isClientIdKey(key: string) {
-  const normalized = normalizeOAuthClientKey(key)
-  return (
-    normalized === "client_id" ||
-    normalized === "oauth_client_id" ||
-    normalized.endsWith("_client_id")
-  )
-}
-
-function readOAuthClientCredentials(value: string) {
-  const parsed = JSON.parse(value) as Record<string, string>
-  const entries = Object.entries(parsed)
-  const clientIdEntry =
-    entries.find(([key]) => isClientIdKey(key)) ??
-    entries.find(([key]) => !isClientSecretKey(key))
-  const clientSecretEntry = entries.find(([key]) => isClientSecretKey(key))
-  const clientId = clientIdEntry?.[1]?.trim() ?? ""
-  const clientSecret = clientSecretEntry?.[1]?.trim() ?? ""
-  if (!clientId) {
-    throw new Error("OAuth client ID is required")
-  }
-  return { clientId, clientSecret: clientSecret || undefined }
-}
-
-function catalogMcpProviderId(
-  entry: PlatformMCPCatalogRead,
-  optionId: string | null | undefined
-) {
-  const suffix = optionId ? `-${optionId}` : ""
-  return `custom_mcp_${entry.slug}${suffix}`.replace(/[^a-zA-Z0-9_]+/g, "_")
 }
 
 function CatalogEntrySummary({
@@ -280,13 +262,24 @@ type MCPToolPolicyPatch = {
   requires_approval?: boolean
 }
 
+const STDIO_APPROVAL_UNSUPPORTED_HINT =
+  "Approvals are not supported for local (stdio) MCP servers."
+
 function MCPToolPolicyList({
   tools,
   canUpdate,
+  approvalsSupported,
   onPolicyChange,
 }: {
   tools: MCPToolSummary[]
   canUpdate: boolean
+  /**
+   * Whether per-tool approval can be enabled for this integration. Stdio
+   * (local) MCP servers cannot support approvals because the subprocess lives
+   * inside the per-turn sandbox and is gone by the time the approval
+   * continuation runs, so the approval toggle is rendered disabled.
+   */
+  approvalsSupported: boolean
   onPolicyChange: (tool: MCPToolSummary, patch: MCPToolPolicyPatch) => void
 }) {
   return (
@@ -341,14 +334,33 @@ function MCPToolPolicyList({
               </label>
               <label className="flex items-center justify-between gap-2 text-xs text-muted-foreground sm:justify-start">
                 Approval
-                <Switch
-                  checked={requiresApproval}
-                  disabled={disabled || !enabled}
-                  onCheckedChange={(checked) =>
-                    onPolicyChange(tool, { requires_approval: checked })
-                  }
-                  aria-label={`Require approval for ${tool.name}`}
-                />
+                {approvalsSupported ? (
+                  <Switch
+                    checked={requiresApproval}
+                    disabled={disabled || !enabled}
+                    onCheckedChange={(checked) =>
+                      onPolicyChange(tool, { requires_approval: checked })
+                    }
+                    aria-label={`Require approval for ${tool.name}`}
+                  />
+                ) : (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      {/* Wrap in a span so the tooltip still fires while the
+                          disabled Switch swallows pointer events. */}
+                      <span className="inline-flex">
+                        <Switch
+                          checked={false}
+                          disabled
+                          aria-label={`Require approval for ${tool.name}`}
+                        />
+                      </span>
+                    </TooltipTrigger>
+                    <TooltipContent>
+                      {STDIO_APPROVAL_UNSUPPORTED_HINT}
+                    </TooltipContent>
+                  </Tooltip>
+                )}
               </label>
             </div>
           </li>
@@ -450,14 +462,39 @@ export function MCPIntegrationDialog({
   const oauthSetup = form.watch("oauth_setup")
   const connectionOptionId = form.watch("connection_option_id")
 
+  const dirtyFields = form.formState.dirtyFields
+  const stdioConnectionFieldsAreDirty = Boolean(
+    dirtyFields.server_type ||
+      dirtyFields.connection_option_id ||
+      dirtyFields.stdio_command ||
+      dirtyFields.stdio_args ||
+      dirtyFields.stdio_env ||
+      dirtyFields.timeout
+  )
+  const stdioTestRequiresSave =
+    serverType === "stdio" &&
+    (!isEditMode || !mcpIntegrationId || stdioConnectionFieldsAreDirty)
+  const stdioTestHint = stdioTestRequiresSave
+    ? isEditMode
+      ? "Save before testing stdio changes."
+      : "Save before testing stdio servers."
+    : null
+
   /**
-   * Test the form's current (possibly unsaved) values against the server.
-   * Ephemeral — nothing is persisted; saving runs its own verification.
+   * Test the connection. Stdio tests always use the saved integration-scoped
+   * endpoint; HTTP can still test dirty form values through the config endpoint.
    */
   async function handleTestConnection() {
     const values = form.getValues()
+    if (values.server_type === "stdio") {
+      if (mcpIntegrationId && !stdioConnectionFieldsAreDirty) {
+        await testMcpIntegrationConnection(mcpIntegrationId)
+      }
+      return
+    }
+
     const serverUri = values.server_uri?.trim()
-    if (values.server_type !== "http" || !serverUri) {
+    if (!serverUri) {
       void form.trigger("server_uri")
       return
     }
@@ -468,9 +505,10 @@ export function MCPIntegrationDialog({
     // stored config no longer reflects what would be saved, so test the form
     // values through the ephemeral config-test endpoint instead; it back-fills
     // secrets the form leaves blank from the saved integration.
-    const dirtyFields = form.formState.dirtyFields
     const connectionFieldsAreDirty = Boolean(
-      dirtyFields.server_uri ||
+      dirtyFields.server_type ||
+        dirtyFields.connection_option_id ||
+        dirtyFields.server_uri ||
         dirtyFields.auth_type ||
         dirtyFields.oauth_setup ||
         dirtyFields.oauth_integration_id ||
@@ -491,6 +529,7 @@ export function MCPIntegrationDialog({
     }
     await testMcpConnectionConfig({
       mcp_integration_id: mcpIntegrationId ?? null,
+      server_type: "http",
       server_uri: serverUri,
       auth_type: values.auth_type,
       oauth_integration_id:
@@ -546,6 +585,22 @@ export function MCPIntegrationDialog({
   }, [urlEnvKeysKey, form])
 
   const hasCatalogOAuthClient = hasOAuthClientConfig(selectedCatalogSpec)
+  // The headers editor lives inside Advanced; open it up front when the
+  // catalog row cannot connect without a header value.
+  const catalogRequiresHttpHeaders = (
+    selectedCatalogSpec?.credentials ?? []
+  ).some(
+    (credential) => credential.target === "http_header" && credential.required
+  )
+  const [openSections, setOpenSections] = React.useState<string[]>([])
+  React.useEffect(() => {
+    if (!open || !catalogRequiresHttpHeaders) {
+      return
+    }
+    setOpenSections((sections) =>
+      sections.includes("advanced") ? sections : [...sections, "advanced"]
+    )
+  }, [open, catalogRequiresHttpHeaders])
   const catalogOptions = catalogEntry?.connection_options ?? []
   const connectedOAuthIntegrations =
     integrations?.filter(
@@ -754,7 +809,7 @@ export function MCPIntegrationDialog({
           await createMcpIntegration(params)
           hookHandledError = false
         } else {
-          let params: MCPHttpIntegrationCreate = {
+          const params: MCPHttpIntegrationCreate = {
             ...createBaseParams,
             server_type: "http",
             server_uri: values.server_uri?.trim() ?? "",
@@ -802,60 +857,28 @@ export function MCPIntegrationDialog({
               })
               return
             }
-            setCatalogOAuthClientIsPending(true)
-            // Without advertised endpoints, the backend does dynamic registration
-            // from the pasted credentials; otherwise create the OAuth client here.
-            let result: MCPCatalogConnectResponse
-            if (
-              !spec.oauth_authorization_endpoint ||
-              !spec.oauth_token_endpoint
-            ) {
-              hookHandledError = true
-              result = await connectMcpIntegration({
-                ...params,
-                custom_credentials: oauthClientCredentials,
+            // Rows like Google SecOps also need required headers alongside
+            // the OAuth client; those live in the separate headers editor.
+            const missingHeaders = missingRequiredHttpHeaderCredentials(
+              spec,
+              customCredentialsForCreate ?? ""
+            )
+            if (missingHeaders.length > 0) {
+              form.setError("custom_credentials", {
+                type: "manual",
+                message: `Missing required values: ${missingHeaders.join(", ")}`,
               })
-              hookHandledError = false
-            } else {
-              const { clientId, clientSecret } = readOAuthClientCredentials(
-                oauthClientCredentials
-              )
-              const provider = await providersCreateCustomProvider({
-                workspaceId,
-                requestBody: {
-                  provider_id: catalogMcpProviderId(
-                    catalogEntry,
-                    values.connection_option_id
-                  ),
-                  name: `${values.name} OAuth`,
-                  description:
-                    values.description?.trim() ||
-                    `OAuth client for ${values.name}`,
-                  grant_type: "authorization_code",
-                  authorization_endpoint: spec.oauth_authorization_endpoint,
-                  token_endpoint: spec.oauth_token_endpoint,
-                  scopes: spec.scopes ?? [],
-                  client_id: clientId,
-                  client_secret: clientSecret,
-                },
-              })
-              const oauthIntegration = await integrationsGetIntegration({
-                workspaceId,
-                providerId: provider.id,
-                grantType: "authorization_code",
-              })
-              params = {
-                ...params,
-                oauth_integration_id: oauthIntegration.id,
-              }
-              hookHandledError = true
-              await createMcpIntegration(params)
-              hookHandledError = false
-              result = await mcpIntegrationsConnectPlatformMcpCatalog({
-                workspaceId,
-                catalogSlug: catalogEntry.slug,
-              })
+              return
             }
+            setCatalogOAuthClientIsPending(true)
+            hookHandledError = true
+            // custom_credentials stays the headers JSON; the OAuth client
+            // travels in its own field so both can be sent together.
+            const result = await connectMcpIntegration({
+              ...params,
+              oauth_client_credentials: oauthClientCredentials,
+            })
+            hookHandledError = false
             if (result.auth_url) {
               window.location.href = result.auth_url
               return
@@ -874,6 +897,22 @@ export function MCPIntegrationDialog({
               return
             }
           } else {
+            // Reusing an existing OAuth integration skips /connect entirely,
+            // so this is the only place a catalog row's required headers get
+            // checked before the row is persisted.
+            const missingHeaders = selectedCatalogSpec
+              ? missingRequiredHttpHeaderCredentials(
+                  selectedCatalogSpec,
+                  customCredentialsForCreate ?? ""
+                )
+              : []
+            if (missingHeaders.length > 0) {
+              form.setError("custom_credentials", {
+                type: "manual",
+                message: `Missing required values: ${missingHeaders.join(", ")}`,
+              })
+              return
+            }
             hookHandledError = true
             await createMcpIntegration(params)
             hookHandledError = false
@@ -905,43 +944,36 @@ export function MCPIntegrationDialog({
     createMcpIntegrationIsPending ||
     updateMcpIntegrationIsPending
 
-  // Connection actions menu mirroring the OAuth integration details dialog.
-  // Tests the form's current values; with unsaved connection edits the probe
-  // is ephemeral, otherwise it persists the discovered tools.
-  const connectionActions =
-    isEditMode && mcpIntegrationId && canUpdate ? (
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="size-8 shrink-0 text-muted-foreground"
-            disabled={testConnectionIsPending}
-            aria-label="Connection actions"
-          >
-            {testConnectionIsPending ? (
-              <Loader2 className="size-4 animate-spin" />
-            ) : (
-              <MoreHorizontal className="size-4" />
-            )}
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="w-44">
-          <DropdownMenuItem
-            disabled={serverType === "stdio" || testConnectionIsPending}
-            title={
-              serverType === "stdio"
-                ? "Stdio servers can't be tested"
-                : undefined
-            }
-            onClick={() => void handleTestConnection()}
-          >
-            <PlayCircle className="mr-2 size-4 text-muted-foreground" />
-            Test
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
+  // Saved configs persist discovered tools. HTTP can test dirty form values;
+  // stdio must be saved before testing because verification runs by row ID.
+  const connectionActions = canUpdate ? (
+    <div className="flex flex-col items-end gap-1">
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        className="h-8 shrink-0"
+        disabled={testConnectionIsPending || stdioTestRequiresSave}
+        title={stdioTestHint ?? undefined}
+        onClick={() => void handleTestConnection()}
+      >
+        {testConnectionIsPending ? (
+          <Loader2 className="mr-2 size-4 animate-spin" />
+        ) : (
+          <PlayCircle className="mr-2 size-4" />
+        )}
+        Test
+      </Button>
+      {stdioTestHint ? (
+        <p className="text-right text-xs text-muted-foreground">
+          {stdioTestHint}
+        </p>
+      ) : null}
+    </div>
+  ) : null
+  const createConnectionActions =
+    !catalogEntry && !isEditMode && connectionActions ? (
+      <div className="flex justify-end">{connectionActions}</div>
     ) : null
   const availableToolCount =
     mcpIntegration?.tools?.filter((tool) => tool.status !== "missing").length ??
@@ -964,7 +996,7 @@ export function MCPIntegrationDialog({
           <Button
             size="sm"
             variant="outline"
-            className={cn("h-7 bg-white", triggerClassName)}
+            className={cn("h-7 bg-background", triggerClassName)}
             {...restTriggerProps}
           >
             <Plus className="mr-1 h-3.5 w-3.5" />
@@ -1016,7 +1048,7 @@ export function MCPIntegrationDialog({
                 mcpIntegrationIsLoading ||
                 mcpIntegration?.id !== mcpIntegrationId))) && (
             <div className="flex items-center justify-center py-8">
-              <Loader2 className="h-6 w-6 animate-spin text-gray-400" />
+              <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
             </div>
           )}
           {!integrationsIsLoading &&
@@ -1030,6 +1062,8 @@ export function MCPIntegrationDialog({
                   onSubmit={form.handleSubmit(onSubmit)}
                   noValidate
                 >
+                  {createConnectionActions}
+
                   {catalogEntry && catalogOptions.length > 1 ? (
                     <FormField
                       control={form.control}
@@ -1049,7 +1083,7 @@ export function MCPIntegrationDialog({
                                     className={cn(
                                       "flex min-h-20 items-start gap-3 rounded-md border bg-background p-3 text-left transition-colors hover:border-foreground/30",
                                       selected &&
-                                        "border-blue-500 bg-blue-50/60 ring-1 ring-blue-500"
+                                        "border-blue-500 bg-blue-50/60 ring-1 ring-blue-500 dark:border-blue-400 dark:bg-blue-950/30 dark:ring-blue-400/70"
                                     )}
                                     onClick={() => {
                                       if (selected) {
@@ -1071,7 +1105,14 @@ export function MCPIntegrationDialog({
                                             currentValues.catalog_slug ||
                                             values.catalog_slug,
                                         }
-                                        form.reset(nextValues)
+                                        // Keep the saved integration as the
+                                        // baseline so switching options marks
+                                        // connection fields dirty and Test
+                                        // probes the form values, not the
+                                        // saved config.
+                                        form.reset(nextValues, {
+                                          keepDefaultValues: true,
+                                        })
                                         replaceStdioArgs(nextValues.stdio_args)
                                       } else {
                                         form.reset(values)
@@ -1100,7 +1141,7 @@ export function MCPIntegrationDialog({
                                           </Badge>
                                         ) : null}
                                         {selected ? (
-                                          <Check className="ml-auto size-4 text-blue-600" />
+                                          <Check className="ml-auto size-4 text-blue-600 dark:text-blue-300" />
                                         ) : null}
                                       </span>
                                       {option.description ? (
@@ -1443,19 +1484,19 @@ export function MCPIntegrationDialog({
                     </>
                   )}
 
-                  {isEditMode &&
-                  serverType === "http" &&
-                  !mcpIntegration?.tools?.length ? (
+                  {isEditMode && mcpIntegration?.tools == null ? (
                     <p className="text-xs text-muted-foreground">
                       Connection not verified — test the connection to discover
                       tools.
                     </p>
                   ) : null}
 
-                  <Accordion type="multiple">
-                    {isEditMode &&
-                    serverType === "http" &&
-                    mcpIntegration?.tools?.length ? (
+                  <Accordion
+                    type="multiple"
+                    value={openSections}
+                    onValueChange={setOpenSections}
+                  >
+                    {isEditMode && mcpIntegration?.tools != null ? (
                       <AccordionItem value="tools" className="border-t">
                         <AccordionTrigger className="py-3 hover:no-underline">
                           <span className="flex items-center gap-2">
@@ -1475,6 +1516,9 @@ export function MCPIntegrationDialog({
                           <MCPToolPolicyList
                             tools={mcpIntegration.tools}
                             canUpdate={canUpdate}
+                            approvalsSupported={
+                              mcpIntegration.server_type !== "stdio"
+                            }
                             onPolicyChange={(tool, patch) =>
                               void handleToolPolicyChange(tool, patch)
                             }
@@ -1486,9 +1530,7 @@ export function MCPIntegrationDialog({
                       value="advanced"
                       className={cn(
                         "border-b-0",
-                        isEditMode &&
-                          serverType === "http" &&
-                          mcpIntegration?.tools?.length
+                        isEditMode && mcpIntegration?.tools != null
                           ? undefined
                           : "border-t"
                       )}

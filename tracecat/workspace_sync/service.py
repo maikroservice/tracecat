@@ -22,6 +22,7 @@ from tracecat.db.models import (
     Workspace,
     WorkspaceSyncResourceMapping,
 )
+from tracecat.db.session_events import AfterCommitQueue
 from tracecat.dsl.common import DSLInput
 from tracecat.exceptions import (
     EntitlementRequired,
@@ -35,6 +36,8 @@ from tracecat.git.utils import parse_git_url
 from tracecat.identifiers.workflow import WorkflowUUID
 from tracecat.registry.repositories.schemas import GitBranchInfo, GitCommitInfo
 from tracecat.sync import (
+    CatalogMappingRequirement,
+    McpIntegrationMappingRequirement,
     PullDiagnostic,
     PullOptions,
     PullResourceDiff,
@@ -54,7 +57,6 @@ from tracecat.workspace_sync.adapters import (
     CASE_TAG_RESOURCE_ADAPTER,
     NON_WORKFLOW_RESOURCE_ADAPTERS,
     RESOURCE_ADAPTERS_BY_TYPE,
-    SKILL_RESOURCE_ADAPTER,
     WORKFLOW_RESOURCE_ADAPTER,
     WORKSPACE_RESOURCE_ADAPTERS,
     ResourceAdapter,
@@ -64,7 +66,6 @@ from tracecat.workspace_sync.adapters.base import (
     DirectoryManifestAdapter,
     ResourceDependencyRefs,
     SyncMappingService,
-    VersionedSlug,
 )
 from tracecat.workspace_sync.enums import SyncResourceType, VcsProvider
 from tracecat.workspace_sync.importer import (
@@ -87,9 +88,7 @@ from tracecat.workspace_sync.schemas import (
     AgentPresetResourceSpec,
     AgentPresetSkillBinding,
     AgentPresetSubagentRef,
-    AgentPresetVersionResourceSpec,
     ResourceRef,
-    SkillResourceSpec,
     WorkflowResourceSpec,
     WorkspaceManifest,
     WorkspaceManifestResources,
@@ -110,6 +109,7 @@ from tracecat.workspace_sync.transport import (
     VcsTreeSnapshot,
     vcs_transport_for_provider,
 )
+from tracecat.workspace_sync.types import PreparedSnapshot
 from tracecat.workspace_sync.workflow import (
     workflow_source_path,
     workflow_spec_from_orm,
@@ -216,6 +216,13 @@ class WorkspaceSyncService(SyncMappingService):
             include_schedules=params.include_schedules,
             create_missing_mappings=True,
         )
+        self.logger.info(
+            "Projected workspace sync export",
+            operation="export",
+            full_workspace_export=resource_ids is None,
+            projected_file_count=len(projection.files),
+            projected_resource_counts=projection.spec.resource_count_map(),
+        )
         self._require_projected_export_scopes(projection.spec)
         self._validate_projected_workspace_dependencies(projection.spec)
         delete_missing_paths_under = await self._export_delete_roots(
@@ -256,6 +263,13 @@ class WorkspaceSyncService(SyncMappingService):
             resource_ids=resource_ids,
             include_schedules=params.include_schedules,
             create_missing_mappings=False,
+        )
+        self.logger.info(
+            "Projected workspace sync export",
+            operation="preview",
+            full_workspace_export=resource_ids is None,
+            projected_file_count=len(projection.files),
+            projected_resource_counts=projection.spec.resource_count_map(),
         )
         self._require_projected_export_scopes(projection.spec)
         self._validate_projected_workspace_dependencies(projection.spec)
@@ -379,26 +393,31 @@ class WorkspaceSyncService(SyncMappingService):
         self._require_pull_scopes(snapshot.spec, dry_run=options.dry_run)
         # A dry run previews the diff and validates workflows but never writes.
         if options.dry_run:
-            resource_diffs = await self._resource_diffs_for_pull(
+            prepared = await self._prepare_snapshot_for_import(
                 snapshot,
-                sync_schedules=sync_schedules,
+                requested_catalog_mappings=options.catalog_mappings,
+                requested_mcp_integration_mappings=options.mcp_integration_mappings,
             )
-            workflow_diagnostics = await self._validate_workflow_import(snapshot)
-            if workflow_diagnostics:
-                return PullResult(
-                    success=False,
-                    commit_sha=snapshot.commit_sha,
-                    workflows_found=len(snapshot.spec.workflows),
-                    workflows_imported=0,
-                    diagnostics=workflow_diagnostics,
-                    message=(
-                        f"Import failed: {len(workflow_diagnostics)} validation "
-                        "error(s) found"
-                    ),
+            resource_diffs: list[PullResourceDiff] = []
+            diagnostics = prepared.diagnostics
+            if not diagnostics:
+                resource_diffs = await self._resource_diffs_for_pull(
+                    prepared.snapshot,
+                    sync_schedules=sync_schedules,
+                )
+                diagnostics = await self._validate_workflow_import(prepared.snapshot)
+            if diagnostics:
+                return self._failed_pull_result(
+                    snapshot,
+                    diagnostics,
                     resource_counts=resource_counts,
                     resource_diffs=resource_diffs,
-                    files=sorted(snapshot.files),
-                    resources=_sync_preview_resources_from_spec(snapshot.spec),
+                    catalog_mapping_requirements=(
+                        prepared.catalog_mapping_requirements
+                    ),
+                    mcp_integration_mapping_requirements=(
+                        prepared.mcp_integration_mapping_requirements
+                    ),
                 )
             return PullResult(
                 success=True,
@@ -419,6 +438,8 @@ class WorkspaceSyncService(SyncMappingService):
         return await self._import_snapshot(
             snapshot,
             sync_schedules=sync_schedules,
+            requested_catalog_mappings=options.catalog_mappings,
+            requested_mcp_integration_mappings=options.mcp_integration_mappings,
         )
 
     async def project_workspace(
@@ -625,6 +646,29 @@ class WorkspaceSyncService(SyncMappingService):
                     ),
                     diagnostics,
                 )
+        elif files:
+            diagnostics.append(
+                PullDiagnostic(
+                    workflow_path=MANIFEST_FILENAME,
+                    workflow_title=None,
+                    error_type="parse",
+                    message=(
+                        "This Git repository uses an outdated workspace format. "
+                        "Run a new Push from an updated Tracecat instance before "
+                        "Pulling."
+                    ),
+                    details={"code": "workspace_format_outdated"},
+                )
+            )
+            return (
+                WorkspaceRemoteSnapshot(
+                    commit_sha=commit_sha,
+                    tree_sha=tree_sha,
+                    files=files,
+                    spec=WorkspaceSpec(),
+                ),
+                diagnostics,
+            )
 
         spec, resource_diagnostics = parse_workspace_spec_files(
             files,
@@ -863,20 +907,74 @@ class WorkspaceSyncService(SyncMappingService):
         ]
         return remote_workflows, local_ids
 
+    async def _prepare_snapshot_for_import(
+        self,
+        snapshot: WorkspaceRemoteSnapshot,
+        *,
+        requested_catalog_mappings: Mapping[uuid.UUID, uuid.UUID] | None = None,
+        requested_mcp_integration_mappings: Mapping[uuid.UUID, uuid.UUID] | None = None,
+    ) -> PreparedSnapshot:
+        """Resolve deployment-local references before validating or importing."""
+        correlated = await AGENT_PRESET_RESOURCE_ADAPTER.correlate_catalog_ids(
+            self,
+            snapshot.spec.agent_presets,
+            snapshot.spec.workflows,
+            requested_catalog_mappings=requested_catalog_mappings,
+        )
+        correlated_mcp = (
+            await AGENT_PRESET_RESOURCE_ADAPTER.correlate_mcp_integration_refs(
+                self,
+                correlated.presets,
+                correlated.workflows,
+                requested_mcp_integration_mappings=requested_mcp_integration_mappings,
+            )
+        )
+        correlated_spec = snapshot.spec.model_copy(
+            update={
+                "agent_presets": correlated_mcp.presets,
+                "workflows": correlated_mcp.workflows,
+            }
+        )
+        return PreparedSnapshot(
+            snapshot=snapshot.model_copy(update={"spec": correlated_spec}),
+            diagnostics=[*correlated.diagnostics, *correlated_mcp.diagnostics],
+            catalog_mapping_requirements=correlated.requirements,
+            mcp_integration_mapping_requirements=correlated_mcp.requirements,
+        )
+
     async def _import_snapshot(
         self,
         snapshot: WorkspaceRemoteSnapshot,
         *,
         sync_schedules: bool,
+        requested_catalog_mappings: Mapping[uuid.UUID, uuid.UUID] | None = None,
+        requested_mcp_integration_mappings: Mapping[uuid.UUID, uuid.UUID] | None = None,
     ) -> PullResult:
         """Reconcile a validated snapshot into the database within one transaction.
 
-        Validates the workflows, then imports non-workflow resources and
-        workflows inside a nested transaction and upserts every sync mapping. Any
-        failure rolls the transaction back and surfaces a transaction
+        Correlates deployment-local references and validates workflows before
+        importing non-workflow resources and workflows inside a nested transaction.
+        Any write failure rolls the transaction back and surfaces a transaction
         diagnostic. The returned :class:`PullResult` reports found and imported
         counts per resource type.
         """
+        prepared = await self._prepare_snapshot_for_import(
+            snapshot,
+            requested_catalog_mappings=requested_catalog_mappings,
+            requested_mcp_integration_mappings=requested_mcp_integration_mappings,
+        )
+        snapshot, resource_diagnostics = prepared.snapshot, prepared.diagnostics
+        if resource_diagnostics:
+            return self._failed_pull_result(
+                snapshot,
+                resource_diagnostics,
+                resource_counts=self._resource_counts_from_spec(snapshot.spec),
+                catalog_mapping_requirements=prepared.catalog_mapping_requirements,
+                mcp_integration_mapping_requirements=(
+                    prepared.mcp_integration_mapping_requirements
+                ),
+            )
+
         remote_workflows, local_ids = await self._remote_workflows(snapshot)
 
         # Validate before writing anything; bail out on the first set of errors.
@@ -917,41 +1015,44 @@ class WorkspaceSyncService(SyncMappingService):
         # resources first (workflows may reference them), then workflows, then
         # refresh the sync mappings. Any failure rolls the whole batch back.
         imported_resources: list[ImportedResource] = []
+        queue = AfterCommitQueue.of(self.session)
         try:
-            async with self.session.begin_nested():
-                if has_non_workflow_resources:
-                    imported_resources = await WorkspaceResourceImportService(
-                        session=self.session,
-                        role=self.role,
-                        mapping_provider=self._mapping_provider,
-                    ).import_non_workflow_resources(snapshot.spec)
-                await workflow_importer.import_workflows(
-                    remote_workflows,
-                    sync_schedules=sync_schedules,
-                )
-                await self._upsert_mappings(
-                    [
-                        *(
-                            SyncMappingTarget(
-                                resource_type=SyncResourceType.WORKFLOW.value,
-                                source_id=source_id,
-                                source_path=workflow_source_path(source_id),
-                                local_id=local_ids[source_id],
-                            )
-                            for source_id in sorted(snapshot.spec.workflows)
-                        ),
-                        *(
-                            SyncMappingTarget(
-                                resource_type=imported.resource_type.value,
-                                source_id=imported.source_id,
-                                source_path=imported.source_path,
-                                local_id=imported.local_id,
-                            )
-                            for imported in imported_resources
-                        ),
-                    ]
-                )
-            await self.session.commit()
+            with queue.checkpointed():
+                with queue.deferred():
+                    async with self.session.begin_nested():
+                        if has_non_workflow_resources:
+                            imported_resources = await WorkspaceResourceImportService(
+                                session=self.session,
+                                role=self.role,
+                                mapping_provider=self._mapping_provider,
+                            ).import_non_workflow_resources(snapshot.spec)
+                        await workflow_importer.import_workflows(
+                            remote_workflows,
+                            sync_schedules=sync_schedules,
+                        )
+                        await self._upsert_mappings(
+                            [
+                                *(
+                                    SyncMappingTarget(
+                                        resource_type=SyncResourceType.WORKFLOW.value,
+                                        source_id=source_id,
+                                        source_path=workflow_source_path(source_id),
+                                        local_id=local_ids[source_id],
+                                    )
+                                    for source_id in sorted(snapshot.spec.workflows)
+                                ),
+                                *(
+                                    SyncMappingTarget(
+                                        resource_type=imported.resource_type.value,
+                                        source_id=imported.source_id,
+                                        source_path=imported.source_path,
+                                        local_id=imported.local_id,
+                                    )
+                                    for imported in imported_resources
+                                ),
+                            ]
+                        )
+                await self.session.commit()
         except Exception as e:
             await self.session.rollback()
             return PullResult(
@@ -1339,15 +1440,11 @@ class WorkspaceSyncService(SyncMappingService):
     ) -> WorkspaceResourceProjection:
         """Project non-workflow resources reached by the export dependency graph."""
         if full_workspace_export:
-            projection = await WorkspaceResourceProjector(
+            return await WorkspaceResourceProjector(
                 session=self.session,
                 role=self.role,
                 mapping_provider=self._mapping_provider,
             ).project_non_workflow_resources(resource_types=entitled_resource_types)
-            return await self._augment_full_workspace_version_closure(
-                projection,
-                workflow_specs=workflow_specs,
-            )
 
         specs_by_attr: dict[str, dict[str, BaseModel]] = {
             adapter.spec_attr: {} for adapter in NON_WORKFLOW_RESOURCE_ADAPTERS
@@ -1428,39 +1525,6 @@ class WorkspaceSyncService(SyncMappingService):
                 if resource := resources_by_source_id.get(source_id):
                     resources_by_key[key] = resource
                 if key in seen:
-                    existing = specs_by_attr[adapter.spec_attr].get(source_id)
-                    if (
-                        resource_type == SyncResourceType.AGENT_PRESET
-                        and existing is not None
-                    ):
-                        incoming_preset = cast(AgentPresetResourceSpec, spec)
-                        existing_preset = cast(AgentPresetResourceSpec, existing)
-                        missing_versions = _missing_agent_preset_versions(
-                            existing_preset, incoming_preset
-                        )
-                        if missing_versions:
-                            specs_by_attr[adapter.spec_attr][source_id] = (
-                                _merge_agent_preset_versions(
-                                    existing_preset, incoming_preset
-                                )
-                            )
-                            new_presets.append(
-                                _agent_preset_version_scan_spec(
-                                    incoming_preset, missing_versions
-                                )
-                            )
-                    elif (
-                        resource_type == SyncResourceType.SKILL and existing is not None
-                    ):
-                        incoming_skill = cast(SkillResourceSpec, spec)
-                        existing_skill = cast(SkillResourceSpec, existing)
-                        if any(
-                            version_number not in existing_skill.versions
-                            for version_number in incoming_skill.versions
-                        ):
-                            specs_by_attr[adapter.spec_attr][source_id] = (
-                                _merge_skill_versions(existing_skill, incoming_skill)
-                            )
                     continue
                 seen.add(key)
                 specs_by_attr[adapter.spec_attr][source_id] = spec
@@ -1479,13 +1543,6 @@ class WorkspaceSyncService(SyncMappingService):
                         subagent.slug
                         for preset in new_presets
                         for subagent in _agent_preset_subagent_refs(preset)
-                        if subagent.version is None
-                    },
-                    versioned_slugs={
-                        VersionedSlug(subagent.slug, subagent.version)
-                        for preset in new_presets
-                        for subagent in _agent_preset_subagent_refs(preset)
-                        if subagent.version is not None
                     },
                 ),
             )
@@ -1496,148 +1553,13 @@ class WorkspaceSyncService(SyncMappingService):
                         binding.slug
                         for preset in new_presets
                         for binding in _agent_preset_skill_refs(preset)
-                        if binding.version is None
-                    },
-                    versioned_slugs={
-                        VersionedSlug(binding.slug, binding.version)
-                        for preset in new_presets
-                        for binding in _agent_preset_skill_refs(preset)
-                        if binding.version is not None
                     },
                 ),
             )
             self._enqueue_payload_dependency_refs(
                 queue,
-                [
-                    payload
-                    for preset in new_presets
-                    for payload in (preset, *preset.versions.values())
-                ],
+                list(new_presets),
             )
-
-        return WorkspaceResourceProjection(
-            spec=workspace_spec_from_maps(specs_by_attr),
-            resources=[
-                resources_by_key[key]
-                for key in sorted(
-                    resources_by_key,
-                    key=lambda item: (item[0].value, item[1]),
-                )
-            ],
-        )
-
-    async def _augment_full_workspace_version_closure(
-        self,
-        projection: WorkspaceResourceProjection,
-        *,
-        workflow_specs: dict[str, WorkflowResourceSpec],
-    ) -> WorkspaceResourceProjection:
-        """Add workflow-pinned preset/skill versions to a full-workspace export.
-
-        A full export already includes every live resource, but versioned
-        workflow refs can point at non-current preset versions. Pull those
-        exact preset versions into the projected specs, then pull the exact
-        skill versions those preset snapshots bind.
-        """
-        projected_presets = list(projection.spec.agent_presets.values())
-        pending_preset_refs = deque(
-            sorted(
-                {
-                    ref
-                    for workflow in workflow_specs.values()
-                    for ref in workflow_references(
-                        workflow.definition
-                    ).versioned_preset_slugs
-                }
-                | {
-                    VersionedSlug(subagent.slug, subagent.version)
-                    for preset in projected_presets
-                    for subagent in _agent_preset_subagent_refs(preset)
-                    if subagent.version is not None
-                }
-            )
-        )
-        skill_refs: set[VersionedSlug] = {
-            VersionedSlug(binding.slug, binding.version)
-            for preset in projected_presets
-            for binding in _agent_preset_skill_refs(preset)
-            if binding.version is not None
-        }
-        if not pending_preset_refs and not skill_refs:
-            return projection
-
-        specs_by_attr: dict[str, dict[str, BaseModel]] = {
-            adapter.spec_attr: dict(adapter.specs(projection.spec))
-            for adapter in NON_WORKFLOW_RESOURCE_ADAPTERS
-        }
-        resources_by_key = {
-            (resource.resource_type, resource.source_id): resource
-            for resource in projection.resources
-        }
-        seen_preset_refs: set[VersionedSlug] = set()
-
-        while pending_preset_refs:
-            batch: set[VersionedSlug] = set()
-            while pending_preset_refs:
-                ref = pending_preset_refs.popleft()
-                if ref in seen_preset_refs:
-                    continue
-                seen_preset_refs.add(ref)
-                batch.add(ref)
-            if not batch:
-                continue
-
-            preset_projection = (
-                await AGENT_PRESET_RESOURCE_ADAPTER.project_dependency_refs(
-                    self,
-                    ResourceDependencyRefs(versioned_slugs=batch),
-                )
-            )
-            for resource in preset_projection.resources:
-                resources_by_key[(resource.resource_type, resource.source_id)] = (
-                    resource
-                )
-
-            for source_id, projected_spec in preset_projection.specs.items():
-                incoming = cast(AgentPresetResourceSpec, projected_spec)
-                existing = cast(
-                    AgentPresetResourceSpec | None,
-                    specs_by_attr[AGENT_PRESET_RESOURCE_ADAPTER.spec_attr].get(
-                        source_id
-                    ),
-                )
-                merged = _merge_agent_preset_versions(existing, incoming)
-                specs_by_attr[AGENT_PRESET_RESOURCE_ADAPTER.spec_attr][source_id] = (
-                    merged
-                )
-
-                for version in incoming.versions.values():
-                    for subagent in version.subagents:
-                        if subagent.version is not None:
-                            pending_preset_refs.append(
-                                VersionedSlug(subagent.slug, subagent.version)
-                            )
-                    for binding in version.skills:
-                        if binding.version is not None:
-                            skill_refs.add(VersionedSlug(binding.slug, binding.version))
-
-        if skill_refs:
-            skill_projection = await SKILL_RESOURCE_ADAPTER.project_dependency_refs(
-                self,
-                ResourceDependencyRefs(versioned_slugs=skill_refs),
-            )
-            for resource in skill_projection.resources:
-                resources_by_key[(resource.resource_type, resource.source_id)] = (
-                    resource
-                )
-            for source_id, projected_spec in skill_projection.specs.items():
-                incoming = cast(SkillResourceSpec, projected_spec)
-                existing = cast(
-                    SkillResourceSpec | None,
-                    specs_by_attr[SKILL_RESOURCE_ADAPTER.spec_attr].get(source_id),
-                )
-                merged = _merge_skill_versions(existing, incoming)
-                specs_by_attr[SKILL_RESOURCE_ADAPTER.spec_attr][source_id] = merged
 
         return WorkspaceResourceProjection(
             spec=workspace_spec_from_maps(specs_by_attr),
@@ -1966,6 +1888,34 @@ class WorkspaceSyncService(SyncMappingService):
             for resource_type, found in spec.resource_count_map().items()
         }
 
+    def _failed_pull_result(
+        self,
+        snapshot: WorkspaceRemoteSnapshot,
+        diagnostics: list[PullDiagnostic],
+        *,
+        resource_counts: dict[str, ResourcePullCount],
+        resource_diffs: list[PullResourceDiff] | None = None,
+        catalog_mapping_requirements: list[CatalogMappingRequirement] | None = None,
+        mcp_integration_mapping_requirements: (
+            list[McpIntegrationMappingRequirement] | None
+        ) = None,
+    ) -> PullResult:
+        """Build a failed pull result for a validated workspace snapshot."""
+        return PullResult(
+            success=False,
+            commit_sha=snapshot.commit_sha,
+            workflows_found=len(snapshot.spec.workflows),
+            workflows_imported=0,
+            diagnostics=diagnostics,
+            message=(f"Import failed: {len(diagnostics)} validation error(s) found"),
+            resource_counts=resource_counts,
+            resource_diffs=resource_diffs,
+            files=sorted(snapshot.files),
+            resources=_sync_preview_resources_from_spec(snapshot.spec),
+            catalog_mapping_requirements=catalog_mapping_requirements,
+            mcp_integration_mapping_requirements=(mcp_integration_mapping_requirements),
+        )
+
     def _resource_counts_from_imported(
         self,
         spec: WorkspaceSpec,
@@ -2055,69 +2005,15 @@ def _has_dependency_refs(refs: ResourceDependencyRefs) -> bool:
 def _agent_preset_skill_refs(
     preset: AgentPresetResourceSpec,
 ) -> list[AgentPresetSkillBinding]:
-    """Return skill refs from the head preset and any projected versions."""
-    refs = list(preset.skills)
-    for version in preset.versions.values():
-        refs.extend(version.skills)
-    return refs
+    """Return skill-head refs from a preset's desired head topology."""
+    return list(preset.skills)
 
 
 def _agent_preset_subagent_refs(
     preset: AgentPresetResourceSpec,
 ) -> list[AgentPresetSubagentRef]:
-    """Return subagent refs from the head preset and any projected versions."""
-    refs = list(preset.subagents)
-    for version in preset.versions.values():
-        refs.extend(version.subagents)
-    return refs
-
-
-def _merge_agent_preset_versions(
-    existing: AgentPresetResourceSpec | None,
-    incoming: AgentPresetResourceSpec,
-) -> AgentPresetResourceSpec:
-    """Return ``existing`` with any incoming preset versions added."""
-    if existing is None:
-        return incoming
-    versions = {**existing.versions, **incoming.versions}
-    return existing.model_copy(update={"versions": versions})
-
-
-def _missing_agent_preset_versions(
-    existing: AgentPresetResourceSpec,
-    incoming: AgentPresetResourceSpec,
-) -> dict[int, AgentPresetVersionResourceSpec]:
-    """Return preset versions carried only by ``incoming``."""
-    return {
-        version_number: version
-        for version_number, version in incoming.versions.items()
-        if version_number not in existing.versions
-    }
-
-
-def _agent_preset_version_scan_spec(
-    preset: AgentPresetResourceSpec,
-    versions: Mapping[int, AgentPresetVersionResourceSpec],
-) -> AgentPresetResourceSpec:
-    """Build a synthetic spec for scanning newly merged version payloads."""
-    return preset.model_copy(
-        update={
-            "skills": [],
-            "subagents": [],
-            "versions": dict(versions),
-        }
-    )
-
-
-def _merge_skill_versions(
-    existing: SkillResourceSpec | None,
-    incoming: SkillResourceSpec,
-) -> SkillResourceSpec:
-    """Return ``existing`` with any incoming skill versions added."""
-    if existing is None:
-        return incoming
-    versions = {**existing.versions, **incoming.versions}
-    return existing.model_copy(update={"versions": versions})
+    """Return child-head refs from a preset's desired head topology."""
+    return list(preset.subagents)
 
 
 def _preview_resources_from_spec(

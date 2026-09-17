@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
+from tracecat import config
 from tracecat.authz.controls import require_scope
 from tracecat.db.models import RegistryRepository, RegistryVersion
 from tracecat.exceptions import RegistryError, RegistryNotFound
@@ -163,18 +164,25 @@ class RegistryReposService(BaseOrgService):
             allowed_domains = allowed_domains_setting or {"github.com"}
             git_url = parse_git_url(repository.origin, allowed_domains=allowed_domains)
 
-            async with ssh_context(
-                role=self.role, git_url=git_url, session=self.session
-            ) as ssh_env:
-                (
-                    commit_sha,
-                    version,
-                ) = await actions_service.sync_actions_from_repository(
+            if config.TRACECAT__REGISTRY_SYNC_SANDBOX_ENABLED:
+                # The ExecutorWorker fetches the organization key and acquires
+                # host keys inside the registry-sync activity. Avoid creating a
+                # redundant API-side agent or running an API-side keyscan.
+                sync_outcome = await actions_service.sync_actions_from_repository(
                     repository,
                     target_commit_sha=target_commit_sha,
                     git_repo_package_name=git_repo_package_name,
-                    ssh_env=ssh_env,
                 )
+            else:
+                async with ssh_context(
+                    role=self.role, git_url=git_url, session=self.session
+                ) as ssh_env:
+                    sync_outcome = await actions_service.sync_actions_from_repository(
+                        repository,
+                        target_commit_sha=target_commit_sha,
+                        git_repo_package_name=git_repo_package_name,
+                        ssh_env=ssh_env,
+                    )
         elif is_git_https:
             allowed_domains_setting = await get_setting(
                 "git_allowed_domains", role=self.role
@@ -182,20 +190,26 @@ class RegistryReposService(BaseOrgService):
             allowed_domains = allowed_domains_setting or {"github.com"}
             git_url = parse_git_url(repository.origin, allowed_domains=allowed_domains)
 
-            async with https_token_context(
-                role=self.role, git_url=git_url, session=self.session
-            ) as token_env:
-                (
-                    commit_sha,
-                    version,
-                ) = await actions_service.sync_actions_from_repository(
+            if config.TRACECAT__REGISTRY_SYNC_SANDBOX_ENABLED:
+                # The registry-sync activity fetches the git access token
+                # inside the worker; no API-side token context is needed.
+                sync_outcome = await actions_service.sync_actions_from_repository(
                     repository,
                     target_commit_sha=target_commit_sha,
                     git_repo_package_name=git_repo_package_name,
-                    ssh_env=token_env,
                 )
+            else:
+                async with https_token_context(
+                    role=self.role, git_url=git_url, session=self.session
+                ) as token_env:
+                    sync_outcome = await actions_service.sync_actions_from_repository(
+                        repository,
+                        target_commit_sha=target_commit_sha,
+                        git_repo_package_name=git_repo_package_name,
+                        ssh_env=token_env,
+                    )
         else:
-            commit_sha, version = await actions_service.sync_actions_from_repository(
+            sync_outcome = await actions_service.sync_actions_from_repository(
                 repository,
                 target_commit_sha=target_commit_sha,
                 git_repo_package_name=git_repo_package_name,
@@ -204,8 +218,8 @@ class RegistryReposService(BaseOrgService):
         self.logger.info(
             "Synced repository",
             repository_id=str(repository.id),
-            commit_sha=commit_sha,
-            version=version,
+            commit_sha=sync_outcome.commit_sha,
+            version=sync_outcome.version,
             target_commit_sha=target_commit_sha,
             last_synced_at=last_synced_at,
             force=force,
@@ -215,7 +229,7 @@ class RegistryReposService(BaseOrgService):
         await self.update_repository(
             repository,
             RegistryRepositoryUpdate(
-                last_synced_at=last_synced_at, commit_sha=commit_sha
+                last_synced_at=last_synced_at, commit_sha=sync_outcome.commit_sha
             ),
         )
         self.logger.info("Updated repository", repository_id=str(repository.id))
@@ -227,8 +241,8 @@ class RegistryReposService(BaseOrgService):
             success=True,
             repository_id=repository.id,
             origin=repository.origin,
-            version=version,
-            commit_sha=commit_sha,
+            version=sync_outcome.version,
+            commit_sha=sync_outcome.commit_sha,
             actions_count=len(index_actions),
             forced=force,
         )

@@ -1,6 +1,5 @@
 "use client"
 
-import { useQueryClient } from "@tanstack/react-query"
 import { formatDistanceToNow } from "date-fns"
 import {
   AlertTriangle,
@@ -28,13 +27,7 @@ import {
 import dynamic from "next/dynamic"
 import Link from "next/link"
 import { usePathname, useRouter, useSearchParams } from "next/navigation"
-import {
-  Fragment,
-  type ReactNode,
-  useCallback,
-  useEffect,
-  useState,
-} from "react"
+import { type ReactNode, useCallback, useEffect, useState } from "react"
 import {
   type CaseStatus,
   casesAddTag,
@@ -42,6 +35,7 @@ import {
   casesGetCase,
   casesUpdateCase,
 } from "@/client"
+import { AgentPresetDetailHeaderActions } from "@/components/agents/agent-preset-detail-actions"
 import {
   AgentsCatalogViewMode,
   AgentsCatalogViewToggle,
@@ -53,6 +47,7 @@ import { AddCaseDropdown } from "@/components/cases/add-case-dropdown"
 import { AddCaseDuration } from "@/components/cases/add-case-duration"
 import { AddCaseTag } from "@/components/cases/add-case-tag"
 import { AddCustomField } from "@/components/cases/add-custom-field"
+import { CaseAgentRunsAction } from "@/components/cases/case-agent-runs-action"
 import {
   PRIORITIES,
   SEVERITIES,
@@ -63,6 +58,7 @@ import { CreateCaseDialog } from "@/components/cases/case-create-dialog"
 import { CaseDurationMetrics } from "@/components/cases/case-duration-metrics"
 import { UNASSIGNED } from "@/components/cases/case-panel-selectors"
 import { useCaseSelection } from "@/components/cases/case-selection-context"
+import { CaseVersionHistory } from "@/components/cases/case-version-history"
 import {
   CasesViewMode,
   CasesViewToggle,
@@ -80,17 +76,17 @@ import {
   MembersViewMode,
   MembersViewToggle,
 } from "@/components/members/members-view-toggle"
+import { FolderPathBreadcrumb } from "@/components/nav/folder-path-breadcrumb"
 import { CreateGroupButton } from "@/components/rbac/create-group-button"
 import { CreateRoleButton } from "@/components/rbac/create-role-button"
-import { RegistryActionsControls } from "@/components/registry/workspace-actions-controls"
 import { CreateSkillButton } from "@/components/skills/create-skill-button"
 import { SkillsDetailActions } from "@/components/skills/skills-detail-actions"
 import { TableSelectionActionsBar } from "@/components/tables/ag-grid-bulk-actions"
 import { CreateTableDialog } from "@/components/tables/table-create-dialog"
 import { TableImportTableDialog } from "@/components/tables/table-import-table-dialog"
 import { TableInsertButton } from "@/components/tables/table-insert-button"
-import { TableLinkRowsToCaseCommand } from "@/components/tables/table-link-rows-to-case-command"
 import { CreateTagDialog } from "@/components/tags/create-tag-dialog"
+import { useQueryClient } from "@/lib/query"
 
 const SimpleEditor = dynamic(
   () =>
@@ -155,7 +151,11 @@ import {
   NewVariableDialogTrigger,
 } from "@/components/workspaces/add-workspace-variable"
 import { CreateCredentialDialog } from "@/components/workspaces/create-credential-dialog"
-import { useAgentPreset, useAgentTagCatalog } from "@/hooks/use-agent-presets"
+import {
+  useAgentFolders,
+  useAgentPreset,
+  useAgentTagCatalog,
+} from "@/hooks/use-agent-presets"
 import { useEntitlements } from "@/hooks/use-entitlements"
 import { useSkill } from "@/hooks/use-skills"
 import { useWorkspaceDetails, useWorkspaceMembers } from "@/hooks/use-workspace"
@@ -179,16 +179,6 @@ interface PageConfig {
 interface ControlsHeaderProps {
   /** Callback to toggle the chat sidebar */
   onToggleChat?: () => void
-}
-
-const CASE_STATUS_TINTS: Record<CaseStatus, string> = {
-  new: "bg-yellow-500/[0.03] dark:bg-yellow-500/[0.08]",
-  in_progress: "bg-blue-500/[0.03] dark:bg-blue-500/[0.08]",
-  on_hold: "bg-orange-500/[0.03] dark:bg-orange-500/[0.08]",
-  resolved: "bg-green-500/[0.03] dark:bg-green-500/[0.08]",
-  closed: "bg-violet-500/[0.03] dark:bg-violet-500/[0.08]",
-  other: "bg-muted/5 dark:bg-muted/[0.12]",
-  unknown: "bg-slate-500/[0.03] dark:bg-slate-500/[0.08]",
 }
 
 const CHAT_TOGGLE_KEY = "c"
@@ -237,59 +227,12 @@ function WorkflowsBreadcrumb({
   workspaceId: string
   path: string | null
 }) {
-  const normalizePath = (folderPath: string | null) => {
-    if (!folderPath || folderPath === "/") return "/"
-    const pathWithLeadingSlash = folderPath.startsWith("/")
-      ? folderPath
-      : `/${folderPath}`
-    return pathWithLeadingSlash.endsWith("/") && pathWithLeadingSlash !== "/"
-      ? pathWithLeadingSlash.slice(0, -1)
-      : pathWithLeadingSlash
-  }
-
-  const normalizedPath = normalizePath(path)
-  const segments = normalizedPath.split("/").filter(Boolean)
-  const baseHref = `/workspaces/${workspaceId}/workflows`
-  const getFolderHref = (folderPath: string) => {
-    if (folderPath === "/") return `${baseHref}?view=folders&path=%2F`
-    return `${baseHref}?view=folders&path=${encodeURIComponent(folderPath)}`
-  }
-
   return (
-    <Breadcrumb>
-      <BreadcrumbList className="relative z-10 flex items-center gap-2 text-sm flex-nowrap overflow-hidden whitespace-nowrap min-w-0 bg-transparent pr-1">
-        <BreadcrumbItem>
-          <BreadcrumbLink asChild className="font-semibold hover:no-underline">
-            <Link href={baseHref}>Workflows</Link>
-          </BreadcrumbLink>
-        </BreadcrumbItem>
-        {segments.map((segment, index) => {
-          const folderPath = `/${segments.slice(0, index + 1).join("/")}`
-          const isLast = index === segments.length - 1
-          return (
-            <Fragment key={folderPath}>
-              <BreadcrumbSeparator className="shrink-0">
-                <span className="text-muted-foreground">/</span>
-              </BreadcrumbSeparator>
-              <BreadcrumbItem>
-                {isLast ? (
-                  <BreadcrumbPage className="font-semibold">
-                    {segment}
-                  </BreadcrumbPage>
-                ) : (
-                  <BreadcrumbLink
-                    asChild
-                    className="font-semibold hover:no-underline"
-                  >
-                    <Link href={getFolderHref(folderPath)}>{segment}</Link>
-                  </BreadcrumbLink>
-                )}
-              </BreadcrumbItem>
-            </Fragment>
-          )
-        })}
-      </BreadcrumbList>
-    </Breadcrumb>
+    <FolderPathBreadcrumb
+      rootLabel="Workflows"
+      rootHref={`/workspaces/${workspaceId}/workflows`}
+      folderPath={path}
+    />
   )
 }
 
@@ -307,7 +250,7 @@ function TablesActions() {
       />
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button variant="outline" size="sm" className="h-7 bg-white">
+          <Button variant="outline" size="sm" className="h-7 bg-background">
             <Plus className="mr-1 h-3.5 w-3.5" />
             New table
             <ChevronDown className="ml-1 h-3.5 w-3.5" />
@@ -362,7 +305,7 @@ function IntegrationsActions() {
     <>
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
-          <Button variant="outline" size="sm" className="h-7 bg-white">
+          <Button variant="outline" size="sm" className="h-7 bg-background">
             <Plus className="mr-1 h-3.5 w-3.5" />
             Add integration
             <ChevronDown className="ml-1 h-3.5 w-3.5" />
@@ -488,51 +431,14 @@ function AgentFoldersBreadcrumb({
   workspaceId: string
   path: string | null
 }) {
-  const normalizedPath = normalizeAgentActionPath(path)
-  const segments = normalizedPath.split("/").filter(Boolean)
-  const baseHref = `/workspaces/${workspaceId}/agents`
-  const getFolderHref = (folderPath: string) => {
-    if (folderPath === "/") {
-      return `${baseHref}?view=folders&path=%2F`
-    }
-    return `${baseHref}?view=folders&path=${encodeURIComponent(folderPath)}`
-  }
-
+  const { hasEntitlement } = useEntitlements()
+  const organizationEnabled = hasEntitlement("agent_addons")
   return (
-    <Breadcrumb>
-      <BreadcrumbList className="relative z-10 flex items-center gap-2 text-sm flex-nowrap overflow-hidden whitespace-nowrap min-w-0 bg-transparent pr-1">
-        <BreadcrumbItem>
-          <BreadcrumbLink asChild className="font-semibold hover:no-underline">
-            <Link href={baseHref}>Agents</Link>
-          </BreadcrumbLink>
-        </BreadcrumbItem>
-        {segments.map((segment, index) => {
-          const folderPath = `/${segments.slice(0, index + 1).join("/")}`
-          const isLast = index === segments.length - 1
-          return (
-            <Fragment key={folderPath}>
-              <BreadcrumbSeparator className="shrink-0">
-                <span className="text-muted-foreground">/</span>
-              </BreadcrumbSeparator>
-              <BreadcrumbItem>
-                {isLast ? (
-                  <BreadcrumbPage className="font-semibold">
-                    {segment}
-                  </BreadcrumbPage>
-                ) : (
-                  <BreadcrumbLink
-                    asChild
-                    className="font-semibold hover:no-underline"
-                  >
-                    <Link href={getFolderHref(folderPath)}>{segment}</Link>
-                  </BreadcrumbLink>
-                )}
-              </BreadcrumbItem>
-            </Fragment>
-          )
-        })}
-      </BreadcrumbList>
-    </Breadcrumb>
+    <FolderPathBreadcrumb
+      rootLabel="Agents"
+      rootHref={`/workspaces/${workspaceId}/agents`}
+      folderPath={organizationEnabled ? path : "/"}
+    />
   )
 }
 
@@ -540,8 +446,10 @@ function AgentsActions() {
   const pathname = usePathname()
   const workspaceId = useWorkspaceId()
   const searchParams = useSearchParams()
-  const { hasEntitlement, isLoading: entitlementsLoading } = useEntitlements()
   const canCreateAgent = useScopeCheck("agent:create")
+  const { hasEntitlement } = useEntitlements()
+  // Folders and tags are agent add-ons; core preset creation is not.
+  const organizationEnabled = hasEntitlement("agent_addons")
   const [createDialogOpen, setCreateDialogOpen] = useState(false)
   const [createTagDialogOpen, setCreateTagDialogOpen] = useState(false)
   const [folderDialogOpen, setFolderDialogOpen] = useState(false)
@@ -551,29 +459,30 @@ function AgentsActions() {
     : AgentsCatalogViewMode.Agents
   const agentsHref = `/workspaces/${workspaceId}/agents`
   const tagsHref = `/workspaces/${workspaceId}/agents/tags`
-  const isFoldersView = searchParams?.get("view") !== "list"
+  const isFoldersView =
+    organizationEnabled && searchParams?.get("view") !== "list"
   const currentPath = normalizeAgentActionPath(
     searchParams?.get("path") ?? null
   )
-  const agentAddonsEnabled = hasEntitlement("agent_addons")
-  const canUseAgentActions =
-    !entitlementsLoading && agentAddonsEnabled && canCreateAgent === true
+  const canUseAgentActions = canCreateAgent === true
   let agentActionControls: ReactNode = null
 
   if (canUseAgentActions) {
     if (catalogView === AgentsCatalogViewMode.Tags) {
-      agentActionControls = (
-        <AddAgentTag
-          open={createTagDialogOpen}
-          onOpenChange={setCreateTagDialogOpen}
-        />
-      )
+      if (organizationEnabled) {
+        agentActionControls = (
+          <AddAgentTag
+            open={createTagDialogOpen}
+            onOpenChange={setCreateTagDialogOpen}
+          />
+        )
+      }
     } else {
       agentActionControls = (
         <>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <Button variant="outline" size="sm" className="h-7 bg-white">
+              <Button variant="outline" size="sm" className="h-7 bg-background">
                 <Plus className="mr-1 h-3.5 w-3.5" />
                 Create new
                 <ChevronDown className="ml-1 h-3.5 w-3.5" />
@@ -614,11 +523,13 @@ function AgentsActions() {
             onOpenChange={setCreateDialogOpen}
             currentPath={isFoldersView ? currentPath : null}
           />
-          <AgentFolderCreateDialog
-            open={folderDialogOpen}
-            onOpenChange={setFolderDialogOpen}
-            currentPath={currentPath}
-          />
+          {organizationEnabled ? (
+            <AgentFolderCreateDialog
+              open={folderDialogOpen}
+              onOpenChange={setFolderDialogOpen}
+              currentPath={currentPath}
+            />
+          ) : null}
         </>
       )
     }
@@ -626,11 +537,13 @@ function AgentsActions() {
 
   return (
     <>
-      <AgentsCatalogViewToggle
-        view={catalogView}
-        agentsHref={agentsHref}
-        tagsHref={tagsHref}
-      />
+      {organizationEnabled ? (
+        <AgentsCatalogViewToggle
+          view={catalogView}
+          agentsHref={agentsHref}
+          tagsHref={tagsHref}
+        />
+      ) : null}
       <WorkspaceResourceSyncActions
         label="agents"
         branchSlug="agents"
@@ -658,7 +571,7 @@ function AddAgentTag({
       <Button
         variant="outline"
         size="sm"
-        className="h-7 bg-white"
+        className="h-7 bg-background"
         onClick={() => onOpenChange(true)}
       >
         <Plus className="mr-1 h-3.5 w-3.5" />
@@ -771,7 +684,7 @@ function CasesActions() {
           <Button
             variant="outline"
             size="sm"
-            className="h-7 bg-white"
+            className="h-7 bg-background"
             onClick={() => setDialogOpen(true)}
           >
             <Plus className="mr-1 h-3.5 w-3.5" />
@@ -1681,7 +1594,7 @@ function CredentialsActions() {
           <Button
             variant="outline"
             size="sm"
-            className="h-7 bg-white"
+            className="h-7 bg-background"
             onClick={() => setDialogOpen(true)}
           >
             <Plus className="mr-1 h-3.5 w-3.5" />
@@ -1713,7 +1626,7 @@ function ServiceAccountsActions() {
     <Button
       variant="outline"
       size="sm"
-      className="h-7 bg-white"
+      className="h-7 bg-background"
       onClick={() => {
         const params = new URLSearchParams(searchParams?.toString())
         params.set("createServiceAccount", Date.now().toString())
@@ -1742,7 +1655,7 @@ function McpServersActions() {
     <Button
       variant="outline"
       size="sm"
-      className="h-7 bg-white"
+      className="h-7 bg-background"
       onClick={() => {
         const params = new URLSearchParams(searchParams?.toString())
         params.set("createMcpServer", Date.now().toString())
@@ -1771,7 +1684,7 @@ function McpAccessActions() {
     <Button
       variant="outline"
       size="sm"
-      className="h-7 bg-white"
+      className="h-7 bg-background"
       onClick={() => {
         const params = new URLSearchParams(searchParams?.toString())
         params.set("createMcpToken", Date.now().toString())
@@ -1796,7 +1709,7 @@ function VariablesActions() {
       />
       <NewVariableDialog>
         <NewVariableDialogTrigger asChild>
-          <Button variant="outline" size="sm" className="h-7 bg-white">
+          <Button variant="outline" size="sm" className="h-7 bg-background">
             <Plus className="mr-1 h-3.5 w-3.5" />
             Add variable
           </Button>
@@ -1902,9 +1815,9 @@ function CaseStatusControl({
     useCaseDurationDefinitions(workspaceId, caseAddonsEnabled)
 
   return (
-    <div className="min-w-0">
+    <div className="flex min-w-0 items-center">
       {caseAddonsEnabled ? (
-        <div className="max-w-[min(48vw,36rem)] overflow-x-auto">
+        <div className="no-scrollbar max-w-[min(48vw,36rem)] overflow-x-auto">
           <CaseDurationMetrics
             durations={caseDurations}
             definitions={caseDurationDefinitions}
@@ -1916,6 +1829,30 @@ function CaseStatusControl({
         </div>
       ) : null}
     </div>
+  )
+}
+
+function CaseDetailActions({
+  caseId,
+  workspaceId,
+}: {
+  caseId: string
+  workspaceId: string
+}) {
+  const { caseData } = useGetCase({ caseId, workspaceId })
+
+  return (
+    <>
+      <CaseStatusControl caseId={caseId} workspaceId={workspaceId} />
+      <CaseAgentRunsAction caseId={caseId} workspaceId={workspaceId} />
+      {caseData ? (
+        <CaseVersionHistory
+          workspaceId={workspaceId}
+          caseId={caseId}
+          caseLabel={caseData.short_id}
+        />
+      ) : null}
+    </>
   )
 }
 
@@ -1959,7 +1896,6 @@ function TableDetailsActions() {
         resources={["table"]}
       />
       <TableSelectionActionsBar />
-      <TableLinkRowsToCaseCommand />
       <TableInsertButton />
     </>
   )
@@ -1972,27 +1908,26 @@ function AgentPresetBreadcrumb({
   presetId: string
   workspaceId: string
 }) {
+  const { workspace } = useWorkspaceDetails()
   const { preset } = useAgentPreset(workspaceId, presetId)
+  const { hasEntitlement } = useEntitlements()
+  const organizationEnabled = hasEntitlement("agent_addons")
+  const { folders } = useAgentFolders(workspaceId, {
+    enabled: organizationEnabled && Boolean(preset?.folder_id),
+  })
+  const folderPath =
+    organizationEnabled && preset?.folder_id
+      ? folders?.find((folder) => folder.id === preset.folder_id)?.path
+      : null
 
   return (
-    <Breadcrumb>
-      <BreadcrumbList className="relative z-10 flex items-center gap-2 text-sm flex-nowrap overflow-hidden whitespace-nowrap min-w-0 bg-transparent pr-1">
-        <BreadcrumbItem>
-          <BreadcrumbLink asChild className="font-semibold hover:no-underline">
-            <Link href={`/workspaces/${workspaceId}/agents`}>Agents</Link>
-          </BreadcrumbLink>
-        </BreadcrumbItem>
-        <BreadcrumbSeparator className="shrink-0">
-          <span className="text-muted-foreground">/</span>
-        </BreadcrumbSeparator>
-        <BreadcrumbItem>
-          <BreadcrumbEntityPage
-            label={preset?.name}
-            skeletonClassName="h-4 w-32"
-          />
-        </BreadcrumbItem>
-      </BreadcrumbList>
-    </Breadcrumb>
+    <FolderPathBreadcrumb
+      rootLabel={workspace?.name ?? <Skeleton className="h-4 w-20" />}
+      rootHref={`/workspaces/${workspaceId}/agents`}
+      folderPath={folderPath}
+      currentPage={preset?.name}
+      currentPageFallback={<Skeleton className="h-4 w-32" />}
+    />
   )
 }
 
@@ -2058,11 +1993,14 @@ function getPageConfig(
           />
         ),
         actions: (
-          <WorkspaceResourceSyncActions
-            label="agents"
-            branchSlug="agents"
-            resources={["agent_preset"]}
-          />
+          <>
+            <WorkspaceResourceSyncActions
+              label="agents"
+              branchSlug="agents"
+              resources={["agent_preset"]}
+            />
+            <AgentPresetDetailHeaderActions />
+          </>
         ),
       }
     }
@@ -2138,7 +2076,6 @@ function getPageConfig(
   if (pagePath.startsWith("/actions")) {
     return {
       title: "Actions",
-      actions: <RegistryActionsControls />,
     }
   }
 
@@ -2248,10 +2185,6 @@ export function ControlsHeader({ onToggleChat }: ControlsHeaderProps = {}) {
   const pageConfig = pathname
     ? getPageConfig(pathname, workspaceId, searchParams ?? null)
     : null
-  const { caseData } = useGetCase(
-    { caseId: caseId ?? "", workspaceId },
-    { enabled: Boolean(caseId) }
-  )
 
   useEffect(() => {
     if (!onToggleChat) {
@@ -2313,15 +2246,6 @@ export function ControlsHeader({ onToggleChat }: ControlsHeaderProps = {}) {
     return null
   }
 
-  // Check if this is a case detail page to show timestamp
-  // Only apply background for case detail pages with status tints.
-  // Non-case pages should be transparent to avoid painting over SidebarInset's rounded corners.
-  const headerBackgroundClass = caseId
-    ? caseData?.status
-      ? CASE_STATUS_TINTS[caseData.status]
-      : "bg-muted/5 dark:bg-muted/[0.12]"
-    : ""
-
   const titleContent =
     typeof pageConfig.title === "string" ? (
       <h1 className="text-sm font-semibold">{pageConfig.title}</h1>
@@ -2330,12 +2254,11 @@ export function ControlsHeader({ onToggleChat }: ControlsHeaderProps = {}) {
     )
 
   return (
-    <header
-      className={cn(
-        "flex h-10 items-center border-b px-3 overflow-hidden transition-colors",
-        headerBackgroundClass
-      )}
-    >
+    // Transparent at every route, cases included: a status-tinted band read as
+    // a colour wash across the top of the app and fought the duration pills
+    // sitting in it. The status already has three homes — the pill in this
+    // header, the Properties rail, and the case list.
+    <header className="flex h-10 items-center overflow-hidden border-b px-3">
       {/* Left section: sidebar toggle + title */}
       <div className="flex items-center gap-3 min-w-0">
         <SidebarTrigger className="h-7 w-7 flex-shrink-0" />
@@ -2363,7 +2286,7 @@ export function ControlsHeader({ onToggleChat }: ControlsHeaderProps = {}) {
         {pageConfig.actions
           ? pageConfig.actions
           : caseId && (
-              <CaseStatusControl caseId={caseId} workspaceId={workspaceId} />
+              <CaseDetailActions caseId={caseId} workspaceId={workspaceId} />
             )}
 
         {onToggleChat && (

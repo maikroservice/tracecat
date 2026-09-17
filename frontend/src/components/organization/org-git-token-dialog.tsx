@@ -61,8 +61,12 @@ export function CreateGitTokenDialog({
   children,
   className,
   existingSecret,
+  open,
+  onOpenChange,
 }: CreateGitTokenDialogProps) {
-  const [showDialog, setShowDialog] = React.useState(false)
+  const [internalOpen, setInternalOpen] = React.useState(false)
+  const showDialog = open ?? internalOpen
+  const setShowDialog = onOpenChange ?? setInternalOpen
   const { createSecret, updateSecretById } = useOrgSecrets()
 
   const methods = useForm<GitTokenForm>({

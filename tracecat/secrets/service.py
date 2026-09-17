@@ -257,7 +257,7 @@ class SecretsService(BaseOrgService):
 
     @require_scope("secret:create")
     @audit_log(resource_type="secret", action="create")
-    async def create_secret(self, params: SecretCreate) -> None:
+    async def create_secret(self, params: SecretCreate) -> Secret:
         """Create a workspace secret."""
         workspace_id = self._require_workspace_id()
         if params.type == SecretType.SSH_KEY:
@@ -277,6 +277,7 @@ class SecretsService(BaseOrgService):
         )
         self.session.add(secret)
         await self.session.commit()
+        return secret
 
     @require_scope("secret:update")
     @audit_log(resource_type="secret", action="update")
@@ -388,7 +389,7 @@ class SecretsService(BaseOrgService):
         await self._create_org_secret(params)
 
     @audit_log(resource_type="organization_secret", action="create")
-    async def _create_org_secret(self, params: SecretCreate) -> None:
+    async def _create_org_secret(self, params: SecretCreate) -> OrganizationSecret:
         """Create an organization secret for callers with their own access gate."""
         if params.type == SecretType.SSH_KEY:
             validate_ssh_key_values(params.keys)
@@ -407,6 +408,7 @@ class SecretsService(BaseOrgService):
         )
         self.session.add(secret)
         await self.session.commit()
+        return secret
 
     @require_scope("org:secret:update")
     async def update_org_secret(
@@ -464,8 +466,8 @@ class SecretsService(BaseOrgService):
             return SecretStr(raw_value)
         except TracecatNotFoundError as e:
             raise TracecatCredentialsNotFoundError(
-                f"SSH key {key_name} not found. Please check whether this key exists.\n\n"
-                " If not, please create a key in your organization's credentials page and try again."
+                f"SSH key {key_name} not found. "
+                "Add one under Organization settings -> Custom registry -> Repository."
             ) from e
 
     @require_scope("org:secret:read")

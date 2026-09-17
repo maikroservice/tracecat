@@ -342,6 +342,14 @@ async def pull_workflows(
         pull_options = PullOptions(
             commit_sha=params.commit_sha,
             dry_run=params.dry_run,
+            catalog_mappings={
+                mapping.source_catalog_id: mapping.target_catalog_id
+                for mapping in params.catalog_mappings
+            },
+            mcp_integration_mappings={
+                mapping.source_mcp_integration_id: mapping.target_mcp_integration_id
+                for mapping in params.mcp_integration_mappings
+            },
         )
         # Custom (non-EE) GitLab sync path
         if gitlab_sync := await GitLabWorkflowSyncService.if_gitlab_workspace(

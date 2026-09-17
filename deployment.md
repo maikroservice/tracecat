@@ -110,8 +110,12 @@ docker exec <db-container> pg_dumpall -U postgres --clean > backup_$(date +%F).s
 
 ### 4.2 Run migrations
 
-Migrations do **not** run automatically: the image entrypoint only runs
-`alembic upgrade head` when `RUN_MIGRATIONS=true`, and our compose files don't set it.
+Migrations run automatically when the api service sets `RUN_MIGRATIONS=true`
+(implemented in the image CMD since the 1.0.0 sync; it runs
+`alembic upgrade heads`, which also tolerates a temporarily split migration
+graph). Set it in the compose file uncloud deploys and routine deploys migrate
+themselves; a CI test (`tests/unit/test_alembic_migration_graph.py`) fails any
+PR that leaves the migration graph with multiple heads.
 
 For a **big/risky jump** (like beta.50's ~100 migrations), run it as a controlled
 manual step with the app stopped, watching the output (it must end at the expected head):
